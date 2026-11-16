@@ -20,7 +20,7 @@ export interface AgyFixtureEnvelope {
 }
 
 export class AgyExecutionFixture implements ExecutionAdapter {
-  readonly identity = { id: 'agy-fixture', provider: 'agy' };
+  readonly identity = { id: 'agy-fixture', provider: 'agy', version: '1' };
   constructor(readonly envelope: AgyFixtureEnvelope, readonly capabilities = fixtureCapabilities) {}
 
   async execute(request: ExecutionRequest): Promise<ExecutionResult> {

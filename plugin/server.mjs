@@ -35057,7 +35057,8 @@ function extractAgentMessages(text) {
 function clientTask(task2) {
   if (task2.deliveryMode === "messages")
     return compactTask(task2);
-  const { messages, messageCursor, inbox, dispatching, sourceMessage, peerRequests, peerRequestsTruncated, ...metadata } = task2;
+  const { execution, messages, messageCursor, inbox, dispatching, sourceMessage, peerRequests, peerRequestsTruncated, ...metadata } = task2;
+  void execution;
   void messages;
   void messageCursor;
   void inbox;
@@ -38129,11 +38130,12 @@ function toResultError(err, fallbackCode = "AGY_PROCESS_FAILED") {
 function explicitNonEmptyString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : void 0;
 }
+var AGY_ADAPTER_VERSION = "1";
 var AgyExecutionAdapter = class {
   cli;
   config;
   explicitCapabilities;
-  identity = { id: "agy", provider: "agy" };
+  identity = { id: "agy", provider: "agy", version: AGY_ADAPTER_VERSION };
   observedDiscovery;
   constructor(cli, config2, explicitCapabilities) {
     this.cli = cli;
@@ -38300,6 +38302,8 @@ var AgyExecutionAdapter = class {
           sessionId = raw.conversation_id;
           hooks?.onSession?.(raw.conversation_id);
         }
+        const initPayload = raw.init && typeof raw.init === "object" && !Array.isArray(raw.init) ? raw.init : {};
+        hooks?.onInit?.(initPayload);
         hooks?.onEvent?.("agent.started", raw.init || {}, raw);
         return;
       }
@@ -48082,6 +48086,19 @@ var blockedMetadataSchema = external_exports.object({
   path: external_exports.string(),
   reason: external_exports.enum(["SECRET_FILE", "SECRET_CONTENT", "SECRET_EXCLUSION", "UNSAFE_PATH"])
 }).strict();
+var executionIdentitySchema = external_exports.object({
+  provider: external_exports.string().min(1).max(128),
+  adapterId: external_exports.string().min(1).max(128),
+  adapterVersion: external_exports.string().min(1).max(128),
+  requested: external_exports.object({
+    model: external_exports.string().min(1).max(256).nullable(),
+    effort: effortSchema.nullable()
+  }).strict(),
+  observed: external_exports.object({
+    model: external_exports.string().min(1).max(256).nullable(),
+    status: external_exports.enum(["observed", "not-observable"])
+  }).strict()
+}).strict();
 var snapshotSchema = external_exports.object({
   version: external_exports.literal(1),
   ownerPid: external_exports.number().int().positive(),
@@ -48104,6 +48121,7 @@ var snapshotSchema = external_exports.object({
     messages: external_exports.array(persistedBridgeMessageSchema).max(100).optional(),
     messageCursor: external_exports.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     effort: effortSchema.optional(),
+    execution: executionIdentitySchema.optional(),
     roleDefinition: roleDefinitionSchema.optional(),
     providedSkills: stagedSkillsSchema.optional(),
     agentPolicyReceipt: external_exports.object({ sha256: external_exports.string().regex(/^[a-f0-9]{64}$/), decisionCount: external_exports.number().int().nonnegative(), deniedCount: external_exports.number().int().nonnegative() }).strict().optional(),
@@ -54687,6 +54705,27 @@ var TaskManager = class {
       this.nativeRecoveryError = error62;
     });
   }
+  initialExecutionIdentity(model, effort) {
+    return {
+      provider: this.executor.identity.provider,
+      adapterId: this.executor.identity.id,
+      adapterVersion: this.executor.identity.version,
+      requested: {
+        model: model ?? null,
+        effort: effort ?? null
+      },
+      observed: {
+        model: null,
+        status: "not-observable"
+      }
+    };
+  }
+  assertResumeProvider(record2) {
+    const expectedProvider = record2.execution?.provider ?? "agy";
+    if (expectedProvider !== this.executor.identity.provider) {
+      throw new BridgeError("INVALID_SESSION", `Cannot resume ${expectedProvider} session with ${this.executor.identity.provider} executor`);
+    }
+  }
   pendingSnapshots;
   persist(taskId) {
     if (this.degraded)
@@ -55026,6 +55065,9 @@ var TaskManager = class {
       if (options.sessionId && (!previous || previous.record.status !== "completed" && previous.record.error?.code !== "TEST_FAILED" || previous.record.integratedAt)) {
         throw new BridgeError("INVALID_SESSION", RESUME_REFUSED);
       }
+      if (previous) {
+        this.assertResumeProvider(previous.record);
+      }
       if (previous?.record.group)
         options.parentTaskId = previous.record.taskId;
       if (previous?.record.group && new GroupStore(this.config.stateDirectory).read(previous.record.group.groupId).state !== "running")
@@ -55244,6 +55286,7 @@ var TaskManager = class {
         sessionId: options.sessionId,
         model,
         effort: options.effort,
+        execution: this.initialExecutionIdentity(model, options.effort),
         mode,
         role,
         roleDefinition,
@@ -55320,7 +55363,8 @@ var TaskManager = class {
   }
   result(taskId) {
     this.assertStateDirectoryUsable();
-    const task2 = this.status(taskId);
+    const { execution, ...task2 } = this.status(taskId);
+    void execution;
     return { task: task2, ready: terminal3.has(task2.status) };
   }
   readResult(taskId, offset = 0, limit = 1e4, expectedContentSha256) {
@@ -55685,6 +55729,7 @@ var TaskManager = class {
       if (!current?.project || !current.record.sessionId || current.record.mode === "read-only" || !terminal3.has(current.record.status) || !isCompleted && !isTestFailed && !isLocalExecutorFailure || current.record.integratedAt) {
         throw new BridgeError("TASK_NOT_READY", "Tests require a completed write task with an isolated copy and CLI conversation");
       }
+      this.assertResumeProvider(current.record);
       if ([...this.tasks.values()].filter((candidate) => candidate.project === current.project).at(-1) !== current) {
         throw new BridgeError("TASK_NOT_READY", "Run tests from the latest retained task for this isolated copy");
       }
@@ -55723,6 +55768,7 @@ var TaskManager = class {
         sessionId: current.record.sessionId,
         model: current.record.model,
         effort: current.record.effort,
+        execution: this.initialExecutionIdentity(current.record.model, current.record.effort),
         mode: "write",
         role: current.record.role,
         roleDefinition: current.record.roleDefinition,
@@ -56843,6 +56889,12 @@ var TaskManager = class {
           },
           onEvent: (type, data, raw) => {
             this.events.append(record2.taskId, type, data, raw);
+          },
+          onInit: (init) => {
+            const observedModel = typeof init.model === "string" ? init.model.trim() : "";
+            if (observedModel && record2.execution) {
+              record2.execution.observed = { model: observedModel.slice(0, 256), status: "observed" };
+            }
           },
           onSession: (sessionId) => {
             record2.sessionId = sessionId;

@@ -8,7 +8,7 @@ import { PassThrough } from 'node:stream';
 import test from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
-import { AgyExecutionAdapter, type AgyExecutionHooks } from '../src/agy-execution-adapter.js';
+import { AGY_ADAPTER_VERSION, AgyExecutionAdapter, type AgyExecutionHooks } from '../src/agy-execution-adapter.js';
 import { CliAdapter, taskPrompt } from '../src/cli-adapter.js';
 import { loadConfig } from '../src/config.js';
 import {
@@ -253,7 +253,7 @@ test('AgyExecutionAdapter exposes neutral identity, discovery capabilities, and 
     const cli = new CliAdapter(config, [MOCK_AGY]);
     const adapter = new AgyExecutionAdapter(cli, config);
 
-    assert.deepEqual(adapter.identity, { id: 'agy', provider: 'agy' });
+    assert.deepEqual(adapter.identity, { id: 'agy', provider: 'agy', version: AGY_ADAPTER_VERSION });
     assert.equal(adapter.capabilities.read, 'unknown');
     assert.equal(adapter.capabilities.write, 'unknown');
     assert.equal(adapter.capabilities.structuredOutput, 'unknown');
@@ -698,7 +698,7 @@ test('TaskManager supports pure E02 ExecutionAdapter fixtures and rejects incomp
 
     // 4. Read-only mode still verifies no copy files changed even behind a custom ExecutionAdapter.
     const mutatingAdapter: ExecutionAdapter = {
-      identity: { id: 'mutator', provider: 'test' },
+      identity: { id: 'mutator', provider: 'test', version: '1' },
       capabilities: { read: 'supported', write: 'supported', sandbox: 'supported', structuredOutput: 'supported', resume: 'supported' },
       async execute(request) {
         writeFileSync(path.join(request.workingDirectory, 'app.txt'), 'mutated in read-only\n', 'utf8');
@@ -1376,7 +1376,7 @@ test('TaskManager treats unsolicited provider cancelled/timeout/interrupted as f
     assert.match(deadline.error?.message ?? '', /Fixture timed out/i);
 
     const customReasonAdapter: ExecutionAdapter = {
-      identity: { id: 'custom-unsolicited', provider: 'custom' },
+      identity: { id: 'custom-unsolicited', provider: 'custom', version: '1' },
       capabilities: {
         read: 'supported', write: 'supported', sandbox: 'unknown', network: 'unknown',
         skills: 'unknown', resources: 'unknown', structuredOutput: 'supported',
@@ -1415,7 +1415,7 @@ test('TaskManager bounds hanging pure ExecutionAdapter against cancel and deadli
     let signalCancelStarted!: () => void;
     const cancelStarted = new Promise<void>(resolve => { signalCancelStarted = resolve; });
     const adapter: ExecutionAdapter = {
-      identity: { id: 'hanging-pure', provider: 'synthetic' },
+      identity: { id: 'hanging-pure', provider: 'synthetic', version: '1' },
       capabilities: {
         read: 'supported', write: 'supported', sandbox: 'unknown', network: 'unknown',
         skills: 'unknown', resources: 'unknown', structuredOutput: 'supported',

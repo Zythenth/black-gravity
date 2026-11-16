@@ -15,6 +15,7 @@ import type { SandboxSelection } from './sandbox-policy.js';
 import type { PortableNodeIdentity } from './portable-node.js';
 import type { ArtifactReference } from './artifacts.js';
 import type { AgentPolicySelection, ResolvedAgentPolicy } from './agent-policy.js';
+import type { ExecutionIdentity } from './execution-contract.js';
 
 export type { ArtifactReference } from './artifacts.js';
 
@@ -43,6 +44,7 @@ export interface TaskRecord {
   pid?: number;
   model?: string;
   effort?: Effort;
+  execution?: ExecutionIdentity;
   prompt: string;
   workingDirectory: string;
   status: TaskStatus;

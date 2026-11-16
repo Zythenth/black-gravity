@@ -15,6 +15,21 @@ export function isCapabilitySupported(capabilities: ExecutionCapabilities, key: 
 export interface ExecutionAdapterIdentity {
   readonly id: string;
   readonly provider: string;
+  readonly version: string;
+}
+
+export interface ExecutionIdentity {
+  provider: string;
+  adapterId: string;
+  adapterVersion: string;
+  requested: {
+    model: string | null;
+    effort: Effort | null;
+  };
+  observed: {
+    model: string | null;
+    status: 'observed' | 'not-observable';
+  };
 }
 
 export interface ExecutionRequest {

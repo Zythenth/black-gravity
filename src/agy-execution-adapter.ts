@@ -59,6 +59,7 @@ export interface AgyExecutionHooks {
   readonly onProcessCleanup?: (cleanup: NonNullable<TaskRecord['processCleanup']>) => void;
   readonly onAfterProcessExit?: (cleanup: TaskRecord['processCleanup'] | undefined, spawnedPid: number | undefined) => Promise<void> | void;
   readonly onEvent?: (type: string, data: unknown, raw?: unknown) => void;
+  readonly onInit?: (init: Record<string, unknown>) => void;
   readonly onSession?: (sessionId: string) => void;
   readonly onStreaming?: () => void;
   readonly onUsage?: (usage: unknown, normalized?: UsageCounters) => void;
@@ -274,8 +275,11 @@ function explicitNonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 }
 
+// Bump when the adapter's persisted identity semantics change.
+export const AGY_ADAPTER_VERSION = '1';
+
 export class AgyExecutionAdapter implements ExecutionAdapter {
-  readonly identity: ExecutionAdapterIdentity = { id: 'agy', provider: 'agy' };
+  readonly identity: ExecutionAdapterIdentity = { id: 'agy', provider: 'agy', version: AGY_ADAPTER_VERSION };
   private observedDiscovery?: Discovery;
 
   constructor(
@@ -454,6 +458,10 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
           sessionId = raw.conversation_id;
           hooks?.onSession?.(raw.conversation_id);
         }
+        const initPayload = raw.init && typeof raw.init === 'object' && !Array.isArray(raw.init)
+          ? raw.init as Record<string, unknown>
+          : {};
+        hooks?.onInit?.(initPayload);
         hooks?.onEvent?.('agent.started', raw.init || {}, raw);
         return;
       }

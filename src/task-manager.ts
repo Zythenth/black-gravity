@@ -17,7 +17,7 @@ import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { appendMessage, deliveryModeSchema, extractAgentMessages, readMessages, resultReference, type DeliveryMode } from './messages.js';
 import { CliAdapter, taskPrompt } from './cli-adapter.js';
 import { AgyExecutionAdapter, type AgyExecutionHooks, type AgyExecutionResult } from './agy-execution-adapter.js';
-import type { ExecutionAdapter, ExecutionRequest, ExecutionResult } from './execution-contract.js';
+import type { ExecutionAdapter, ExecutionIdentity, ExecutionRequest, ExecutionResult } from './execution-contract.js';
 import { terminateSubprocess, redactDiagnostic, redactionContextDigest, containsCredential } from './subprocess.js';
 import { reconcileOwnedProcesses } from './process-tree.js';
 import { sanitizePayload } from './payload-safety.js';
@@ -33,7 +33,7 @@ import { processAlive, StateStore, StateStoreLinkError, stateDirectoryProblem } 
 import { criteriaSchema, verifyCriteria, type ReviewEvidence } from './verification.js';
 import { prepareNativeTest, readNativeReceipt, readNativeSandboxError, testCommandSchema, type NativeTestReceipt, type TestCommand, type WindowsNativeTestRequest } from './native-tests.js';
 import { textChunk } from './chunks.js';
-import { roleSchema, validateRoleReport, resolveRole, listRoles, applyRoleDefaults, effortSchema } from './roles.js';
+import { roleSchema, validateRoleReport, resolveRole, listRoles, applyRoleDefaults, effortSchema, type Effort } from './roles.js';
 import { aggregateUsage, normalizeUsage, taskTokenUsage } from './usage.js';
 import { profileReadOnly } from './tool-profiles.js';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -175,6 +175,29 @@ export class TaskManager {
     this.degraded = false;
     this.nativeRecovery = (config.testExecutor === 'windows-lpac' ? recoverWindowsExecutions(config.stateDirectory) : Promise.resolve())
       .catch(error => { this.nativeRecoveryError = error; });
+  }
+
+  private initialExecutionIdentity(model: string | undefined, effort: Effort | undefined): ExecutionIdentity {
+    return {
+      provider: this.executor.identity.provider,
+      adapterId: this.executor.identity.id,
+      adapterVersion: this.executor.identity.version,
+      requested: {
+        model: model ?? null,
+        effort: effort ?? null,
+      },
+      observed: {
+        model: null,
+        status: 'not-observable',
+      },
+    };
+  }
+
+  private assertResumeProvider(record: TaskRecord): void {
+    const expectedProvider = record.execution?.provider ?? 'agy';
+    if (expectedProvider !== this.executor.identity.provider) {
+      throw new BridgeError('INVALID_SESSION', `Cannot resume ${expectedProvider} session with ${this.executor.identity.provider} executor`);
+    }
   }
 
   private pendingSnapshots?: Map<string, string>;
@@ -494,6 +517,9 @@ export class TaskManager {
       if (options.sessionId && (!previous || (previous.record.status !== 'completed' && previous.record.error?.code !== 'TEST_FAILED') || previous.record.integratedAt)) {
         throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
       }
+      if (previous) {
+        this.assertResumeProvider(previous.record);
+      }
       if (previous?.record.group) options.parentTaskId = previous.record.taskId;
       if (previous?.record.group && new GroupStore(this.config.stateDirectory).read(previous.record.group.groupId).state !== 'running') throw new BridgeError('GROUP_CLOSED', 'Start or resume the group coordinator before another conversation turn');
       if (previous?.record.group) {
@@ -654,7 +680,7 @@ export class TaskManager {
       const taskId = randomUUID();
       options.group = options.groupAdmission ? { ...options.groupAdmission, rootTaskId: taskId } : previous?.record.group && structuredClone(previous.record.group);
       delete options.groupAdmission;
-      const record: TaskRecord = { group: options.group, memory: summarizeMemory(options.memorySnapshots), ...(options.craft ? { craft: { revision: options.craft.revision, manifestSha256: options.craft.manifestSha256, permanent: options.craft.permanent, catalog: options.craft.catalog.map(entry => entry.name) } } : {}), parentTaskId: options.parentTaskId, sourceMessage: options.sourceMessage, deliveryMode: options.deliveryMode, providedSkills: options.providedSkills, taskId, sessionId: options.sessionId, model, effort: options.effort, mode, role, roleDefinition, prompt: options.prompt,
+      const record: TaskRecord = { group: options.group, memory: summarizeMemory(options.memorySnapshots), ...(options.craft ? { craft: { revision: options.craft.revision, manifestSha256: options.craft.manifestSha256, permanent: options.craft.permanent, catalog: options.craft.catalog.map(entry => entry.name) } } : {}), parentTaskId: options.parentTaskId, sourceMessage: options.sourceMessage, deliveryMode: options.deliveryMode, providedSkills: options.providedSkills, taskId, sessionId: options.sessionId, model, effort: options.effort, execution: this.initialExecutionIdentity(model, options.effort), mode, role, roleDefinition, prompt: options.prompt,
         acceptanceCriteria, handoff: options.handoff ?? previous?.record.handoff, comparison: options.comparison,
         tests: previous?.record.tests ?? contextSource?.record.tests, usageIsResume: Boolean(previous),
         usageBaseline: previous ? this.latestObservedUsage(previous.record.sessionId, workingDirectory) : undefined,
@@ -711,7 +737,8 @@ export class TaskManager {
 
   result(taskId: string) {
     this.assertStateDirectoryUsable();
-    const task = this.status(taskId);
+    const { execution, ...task } = this.status(taskId);
+    void execution;
     return { task, ready: terminal.has(task.status) };
   }
 
@@ -994,6 +1021,7 @@ export class TaskManager {
         current.record.integratedAt) {
         throw new BridgeError('TASK_NOT_READY', 'Tests require a completed write task with an isolated copy and CLI conversation');
       }
+      this.assertResumeProvider(current.record);
       if ([...this.tasks.values()].filter(candidate => candidate.project === current.project).at(-1) !== current) {
         throw new BridgeError('TASK_NOT_READY', 'Run tests from the latest retained task for this isolated copy');
       }
@@ -1018,6 +1046,7 @@ export class TaskManager {
         this.state.drop(oldestFinished.record.taskId);
       }
       const record: TaskRecord = { parentTaskId: current.record.taskId, group: structuredClone(current.record.group), memory: structuredClone(current.record.memory), craft: current.record.craft, deliveryMode: current.record.deliveryMode, providedSkills: current.project.providedSkills, taskId: randomUUID(), sessionId: current.record.sessionId, model: current.record.model, effort: current.record.effort,
+        execution: this.initialExecutionIdentity(current.record.model, current.record.effort),
         mode: 'write', role: current.record.role, roleDefinition: current.record.roleDefinition, prompt: 'Run the requested tests in the Windows sandbox.',
         acceptanceCriteria: current.record.acceptanceCriteria, handoff: current.record.handoff, tests: current.record.tests,
         usageIsResume: true, usageBaseline: this.latestObservedUsage(current.record.sessionId, current.record.workingDirectory),
@@ -1906,6 +1935,12 @@ export class TaskManager {
           },
           onEvent: (type, data, raw) => {
             this.events.append(record.taskId, type, data, raw);
+          },
+          onInit: init => {
+            const observedModel = typeof init.model === 'string' ? init.model.trim() : '';
+            if (observedModel && record.execution) {
+              record.execution.observed = { model: observedModel.slice(0, 256), status: 'observed' };
+            }
           },
           onSession: sessionId => {
             record.sessionId = sessionId;

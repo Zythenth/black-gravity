@@ -33,6 +33,19 @@ const blockedMetadataSchema = z.object({
   path: z.string(),
   reason: z.enum(['SECRET_FILE', 'SECRET_CONTENT', 'SECRET_EXCLUSION', 'UNSAFE_PATH']),
 }).strict();
+const executionIdentitySchema = z.object({
+  provider: z.string().min(1).max(128),
+  adapterId: z.string().min(1).max(128),
+  adapterVersion: z.string().min(1).max(128),
+  requested: z.object({
+    model: z.string().min(1).max(256).nullable(),
+    effort: effortSchema.nullable(),
+  }).strict(),
+  observed: z.object({
+    model: z.string().min(1).max(256).nullable(),
+    status: z.enum(['observed', 'not-observable']),
+  }).strict(),
+}).strict();
 const snapshotSchema = z.object({
   version: z.literal(1), ownerPid: z.number().int().positive(),
   record: z.object({ taskId: z.string().uuid(), workingDirectory: z.string(), prompt: z.string(),
@@ -42,7 +55,7 @@ const snapshotSchema = z.object({
     usageIsResume: z.boolean().optional(), usageBaseline: usageCountersSchema.optional(),
     lastObservedCliUsage: usageCountersSchema.optional(), usageProvenance: z.literal('local-executor').optional(),
     deliveryMode: deliveryModeSchema.optional(), messages: z.array(persistedBridgeMessageSchema).max(100).optional(), messageCursor: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
-    effort: effortSchema.optional(), roleDefinition: roleDefinitionSchema.optional(), providedSkills: stagedSkillsSchema.optional(),
+    effort: effortSchema.optional(), execution: executionIdentitySchema.optional(), roleDefinition: roleDefinitionSchema.optional(), providedSkills: stagedSkillsSchema.optional(),
     agentPolicyReceipt: z.object({ sha256: z.string().regex(/^[a-f0-9]{64}$/), decisionCount: z.number().int().nonnegative(), deniedCount: z.number().int().nonnegative() }).strict().optional(),
     peerRequests: z.array(z.lazy(() => peerMessageInputSchema)).max(20).optional(),
     peerRequestsTruncated: z.boolean().optional(),

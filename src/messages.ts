@@ -61,8 +61,8 @@ export function extractAgentMessages(text: string): z.infer<typeof agentMessageI
 
 export function clientTask(task: TaskRecord): TaskRecord | CompactTask {
   if (task.deliveryMode === 'messages') return compactTask(task);
-  const { messages, messageCursor, inbox, dispatching, sourceMessage, peerRequests, peerRequestsTruncated, ...metadata } = task;
-  void messages; void messageCursor; void inbox; void dispatching; void sourceMessage; void peerRequests; void peerRequestsTruncated;
+  const { execution, messages, messageCursor, inbox, dispatching, sourceMessage, peerRequests, peerRequestsTruncated, ...metadata } = task;
+  void execution; void messages; void messageCursor; void inbox; void dispatching; void sourceMessage; void peerRequests; void peerRequestsTruncated;
   return metadata;
 }
 

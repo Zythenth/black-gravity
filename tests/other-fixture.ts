@@ -19,7 +19,7 @@ const fixtureCapabilities: ExecutionCapabilities = {
 };
 
 export class OtherProviderExecutionFixture implements ExecutionAdapter {
-  readonly identity = { id: 'other-fixture', provider: 'synthetic-provider' };
+  readonly identity = { id: 'other-fixture', provider: 'synthetic-provider', version: '1' };
   constructor(readonly envelope: OtherFixtureEnvelope, readonly capabilities: ExecutionCapabilities = fixtureCapabilities) {}
 
   async execute(request: ExecutionRequest): Promise<ExecutionResult> {
