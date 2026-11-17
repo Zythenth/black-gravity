@@ -882,6 +882,8 @@ test('black_gravity_wait_many, black_gravity_compare and black_gravity_group_sta
       const synthTaskB = 'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
       const synthGroup = 'cccccccc-cccc-4ccc-8ccc-cccccccccccc';
 
+      // Inside the AppContainer, spawnSync with stdio pipes can hang until the command times out, so the first wait
+      // captures its output through files; the later waits inherit the command's own stdout.
       const positiveLpacScript = [
         "const fs = require('node:fs'), path = require('node:path'), cp = require('node:child_process');",
         'const targets = JSON.parse(process.argv[1]);',
@@ -905,10 +907,14 @@ test('black_gravity_wait_many, black_gravity_compare and black_gravity_group_sta
         `const taskA = ${JSON.stringify(taskA)}, taskB = ${JSON.stringify(taskB)};`,
         'fs.writeFileSync(path.join(scratchState, taskA + ".json"), JSON.stringify({ version: 1, ownerPid: process.pid, record: { taskId: taskA, status: "running", messageCursor: 1, messages: [] } }));',
         'fs.writeFileSync(path.join(scratchState, taskB + ".json"), JSON.stringify({ version: 1, ownerPid: process.pid, record: { taskId: taskB, status: "running", messageCursor: 0, messages: [] } }));',
-        'const r0 = cp.spawnSync(process.execPath, ["wait-cli.mjs", "wait", "--state-directory", scratchState, taskA + ":1", taskB + ":0", "--timeout", "1"], { encoding: "utf8" });',
-        'const raw0 = (r0.stdout || "").replace(/\\r?\\n$/, "");',
+        "const outputDir = fs.mkdtempSync(path.join(process.env.TEMP, 'lpac-wait-out-'));",
+        'const outFile = path.join(outputDir, "stdout.txt"), errFile = path.join(outputDir, "stderr.txt");',
+        'const outFd = fs.openSync(outFile, "w"), errFd = fs.openSync(errFile, "w");',
+        'const r0 = cp.spawnSync(process.execPath, ["wait-cli.mjs", "wait", "--state-directory", scratchState, taskA + ":1", taskB + ":0", "--timeout", "1"], { stdio: ["ignore", outFd, errFd] });',
+        'fs.closeSync(outFd); fs.closeSync(errFd);',
+        'const raw0 = fs.readFileSync(outFile, "utf8").replace(/\\r?\\n$/, "");',
         'const lines0 = raw0 === "" ? [] : raw0.split(/\\r?\\n/);',
-        'if (r0.error || r0.status !== 8 || r0.stderr !== "" || lines0.length !== 1) process.exit(45);',
+        'if (r0.error || r0.status !== 8 || fs.readFileSync(errFile, "utf8") !== "" || lines0.length !== 1) process.exit(45);',
         'process.stdout.write(JSON.stringify({ code: r0.status, json: JSON.parse(lines0[0]) }) + "\\n");',
         'const snap = (id) => ({ version: 1, ownerPid: process.pid, record: { taskId: id, status: "completed", messageCursor: 1, messages: [{ sequence: 1, kind: "final", text: "PRIVATE_LPAC_POS" }] } });',
         'fs.writeFileSync(path.join(scratchState, id1 + ".json"), JSON.stringify(snap(id1)));',
