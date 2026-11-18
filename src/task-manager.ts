@@ -24,14 +24,14 @@ import { sanitizePayload } from './payload-safety.js';
 import { providedSkillsSchema, MAX_TOTAL_BUNDLES_BYTES, verifyProvidedSkills } from './skills.js';
 import { prepareCraft, mergePermanentSkills, verifyCraftSelection } from './craft.js';
 import { convertCrlfToLf, listCopyFiles, normalizeEditedLineEndings, planLineEndings, restoreByteOrderMarks, restoreCrlfLineEndings, type LineEndingStyle } from './line-endings.js';
-import { assertForbiddenDirectoriesUsable, assertSecretExclusionsUsable, assertAgyPathUsable, assertWindowsNodeCacheDirectoryUsable, assertAntiAiCraftDirectoryUsable, type Config, type ApprovalMode, type ConfigurationIssue, type ConfigurationIssueReason } from './config.js';
+import { assertForbiddenDirectoriesUsable, assertSecretExclusionsUsable, assertAgyPathUsable, assertWindowsNodeCacheDirectoryUsable, assertAntiAiCraftDirectoryUsable, type Config, type ApprovalMode, type ConfigurationIssue, type ConfigurationIssueReason, type TestExecutor } from './config.js';
 import { EventStore } from './event-store.js';
 import { assertTextIsUtf8, createProjectCopy, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, forkProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, clearLineEndingConversions, type ChangePreview, type ProjectCopy } from './isolation.js';
-import { BridgeError, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt } from './types.js';
+import { BridgeError, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt, type TestEvidence } from './types.js';
 import { validatePrompt, validateRuntimeCacheSeparation, validateWorkingDirectory, validateStateSeparation } from './validation.js';
 import { processAlive, StateStore, StateStoreLinkError, stateDirectoryProblem } from './state-store.js';
 import { criteriaSchema, verifyCriteria, type ReviewEvidence } from './verification.js';
-import { prepareNativeTest, readNativeReceipt, readNativeSandboxError, testCommandSchema, type NativeTestReceipt, type TestCommand, type WindowsNativeTestRequest } from './native-tests.js';
+import { prepareNativeTest, readNativeReceipt, readNativeSandboxError, testCommandSchema, type LocalNativeTestRequest, type LocalTestBackend, type NativeTestReceipt, type TestCommand } from './native-tests.js';
 import { textChunk } from './chunks.js';
 import { roleSchema, validateRoleReport, resolveRole, listRoles, applyRoleDefaults, effortSchema, type Effort } from './roles.js';
 import { aggregateUsage, normalizeUsage, taskTokenUsage } from './usage.js';
@@ -43,7 +43,8 @@ import type { BridgeEvent } from './types.js';
 import { decisionsSchema, handoffSchema } from './handoff.js';
 import { comparisonModelsSchema, compareFindings, type Comparison } from './comparison.js';
 import { normalizeSandboxPolicy, resolveSandboxSelection, sandboxPolicyDigest, type SandboxPolicySnapshot } from './sandbox-policy.js';
-import { executeWindowsTest, recoverWindowsExecutions } from './windows-executor.js';
+import { executeWindowsTest, recoverWindowsExecutions, type WindowsExecution } from './windows-executor.js';
+import { detectBubblewrap, executeLinuxTest, type BubblewrapDetection, type LinuxExecution } from './linux-executor.js';
 import { portableNodeStatus, type PortableNodeStatus } from './portable-node.js';
 
 const RESTORE_LIMITS = { maxDepth: 256, maxNodes: 5_000_000 };
@@ -144,9 +145,24 @@ export class TaskManager {
   }
 
   private readonly executor: ExecutionAdapter;
+  private readonly linuxBwrapStatus?: BubblewrapDetection;
 
-  constructor(private readonly adapter: CliAdapter, private readonly config: Config, executor?: ExecutionAdapter) {
+  constructor(
+    private readonly adapter: CliAdapter,
+    private readonly config: Config,
+    executor?: ExecutionAdapter,
+    runtimeOptions?: { linuxBwrapDetection?: BubblewrapDetection },
+  ) {
     this.executor = executor ?? new AgyExecutionAdapter(adapter, config);
+    if (runtimeOptions?.linuxBwrapDetection) {
+      this.linuxBwrapStatus = runtimeOptions.linuxBwrapDetection;
+    } else if (process.platform === 'win32') {
+      if (config.testExecutor === 'linux-bwrap') {
+        this.linuxBwrapStatus = { available: false, code: 'LINUX_BWRAP_MISSING', reason: 'unsupported-platform' };
+      }
+    } else if (process.platform === 'linux' || config.testExecutor === 'linux-bwrap') {
+      this.linuxBwrapStatus = detectBubblewrap();
+    }
     this.events = new EventStore(config.eventBufferSize, taskId => this.persist(taskId));
 
     if (config.stateDirectoryInvalid) {
@@ -326,6 +342,19 @@ export class TaskManager {
     return this.state.loadSandboxPolicy();
   }
   windowsRuntimeStatus(): Promise<PortableNodeStatus> { return portableNodeStatus(this.config.windowsNodeRuntime, this.config.windowsNodeCacheDirectory, undefined, { cacheDirectoryInvalid: this.config.windowsNodeCacheDirectoryInvalid }); }
+  private effectiveTestExecutor(): TestExecutor {
+    if (!this.config.testExecutorExplicit && this.config.testExecutor === 'agy' && this.linuxBwrapStatus?.available) {
+      return 'linux-bwrap';
+    }
+    return this.config.testExecutor;
+  }
+  testExecutorStatus(): { selected: TestExecutor; explicit: boolean; linuxBwrap?: BubblewrapDetection } {
+    return {
+      selected: this.effectiveTestExecutor(),
+      explicit: this.config.testExecutorExplicit,
+      ...(this.linuxBwrapStatus ? { linuxBwrap: { ...this.linuxBwrapStatus } } : {}),
+    };
+  }
 
   async setSandboxPolicy(value: unknown, expectedSha256: string,
     confirm?: (previous: SandboxPolicySnapshot, proposed: SandboxPolicySnapshot) => Promise<boolean>): Promise<SandboxPolicySnapshot> {
@@ -819,6 +848,10 @@ export class TaskManager {
     });
   }
 
+  private isObservedTestSource(source: TestEvidence['source']): boolean {
+    return source === 'agy-tool' || source === 'windows-executor' || source === 'linux-executor';
+  }
+
   async preview(taskId: string, includePatch = true) {
     this.assertStateDirectoryUsable();
     this.refresh();
@@ -827,7 +860,7 @@ export class TaskManager {
     return this.withProject(task.project, async () => {
       const preview = await previewProjectCopy(task.project!, this.config);
       const current = task.record.verification && await verifyCriteria(task.project!, preview.sha256, task.record.acceptanceCriteria, task.record.verification.review.evidence);
-      const tree = task.record.tests?.some(test => test.source === 'agy-tool' || test.source === 'windows-executor') ? await fingerprintProjectCopy(task.project!, this.config) : undefined;
+      const tree = task.record.tests?.some(test => this.isObservedTestSource(test.source)) ? await fingerprintProjectCopy(task.project!, this.config) : undefined;
       return { ...preview, patch: includePatch ? preview.patch : undefined, patchLength: preview.patch.length,
         tests: (task.record.tests || []).map(test => ({ ...test, stale: test.sha256 !== preview.sha256 || (test.treeSha256 !== undefined && test.treeSha256 !== tree) })),
         verification: task.record.verification ? { ...task.record.verification, stale: task.record.verification.sha256 !== preview.sha256 ||
@@ -973,8 +1006,8 @@ export class TaskManager {
     if (current.status !== 'passed' || JSON.stringify(current.fileHashes) !== JSON.stringify(previous.fileHashes)) {
       throw new BridgeError('VERIFICATION_STALE', 'Verification files or evidence changed; verify again');
     }
-    const tree = task.record.tests?.some(test => test.source === 'agy-tool' || test.source === 'windows-executor') ? await fingerprintProjectCopy(task.project!, this.config) : undefined;
-    const latestTests = new Map((task.record.tests || []).filter(test => test.source === 'agy-tool' || test.source === 'windows-executor').map(test => [test.command, test]));
+    const tree = task.record.tests?.some(test => this.isObservedTestSource(test.source)) ? await fingerprintProjectCopy(task.project!, this.config) : undefined;
+    const latestTests = new Map((task.record.tests || []).filter(test => this.isObservedTestSource(test.source)).map(test => [test.command, test]));
     if ([...latestTests.values()].some(test => test.sha256 !== sha256 || test.treeSha256 !== tree)) {
       throw new BridgeError('TESTS_STALE', 'Run the observed test commands again against the current files');
     }
@@ -992,22 +1025,36 @@ export class TaskManager {
     await this.assertProcessesReconciled(this.tasks.get(taskId)!.record);
     const preview = await this.preview(taskId);
     if (preview.sha256 !== expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Preview the current patch before starting tests');
-    if (this.config.testExecutor === 'windows-lpac') return this.queueWindowsTest(taskId, task, expectedSha256, command, retries, timeoutSeconds, sandbox);
+    const executor = this.effectiveTestExecutor();
+    if (executor === 'windows-lpac' || executor === 'linux-bwrap') {
+      if (executor === 'linux-bwrap') {
+        const detection = this.linuxBwrapStatus ?? (process.platform === 'win32'
+          ? { available: false, code: 'LINUX_BWRAP_MISSING', reason: 'unsupported-platform' }
+          : detectBubblewrap());
+        if (!detection.available) {
+          throw new BridgeError(detection.code ?? 'LINUX_BWRAP_MISSING', detection.reason ?? 'Bubblewrap is unavailable');
+        }
+      }
+      return this.queueLocalTest(executor, taskId, task, expectedSha256, command, retries, timeoutSeconds, sandbox);
+    }
     if (task.agentPolicy) throw new BridgeError('POLICY_TEST_EXECUTOR_UNAVAILABLE', 'Tasks with an enforced tool policy require the bridge Windows LPAC executor for direct tests; native terminal access is not granted by this policy');
     if (sandbox !== undefined) throw new BridgeError('SANDBOX_PERMISSIONS_UNSUPPORTED', 'Per-test sandbox permissions require the Windows LPAC executor');
     return this.run({ prompt: 'Run the requested tests in the native sandbox.', workingDirectory: task.workingDirectory, sessionId: task.sessionId,
       model: task.model, timeoutSeconds, nativeTest: { ...command, expectedSha256, maxAttempts: retries + 1 } });
   }
 
-  private async queueWindowsTest(sourceTaskId: string, source: TaskRecord, expectedSha256: string, command: TestCommand, retries: number, timeoutSeconds: number, sandbox: unknown): Promise<TaskRecord> {
+  private async queueLocalTest(backend: LocalTestBackend, sourceTaskId: string, source: TaskRecord, expectedSha256: string, command: TestCommand, retries: number, timeoutSeconds: number, sandbox: unknown): Promise<TaskRecord> {
     if (this.config.antiAiCraft) assertAntiAiCraftDirectoryUsable(this.config);
     if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 86400) {
       throw new BridgeError('INVALID_TIMEOUT', 'timeoutSeconds must be between 1 and 86400');
     }
     const policy = this.state.loadSandboxPolicy();
     const selection = await resolveSandboxSelection(policy.policy, sandbox, source.workingDirectory, this.config.stateDirectory, this.forbiddenDirectories(), this.config, this.config.windowsNodeCacheDirectory);
-    const nativeTest: WindowsNativeTestRequest = { ...command, expectedSha256,
-      maxAttempts: retries + 1, backend: 'windows-lpac', sandbox: selection, policySha256: policy.sha256 };
+    if (backend === 'linux-bwrap' && selection.childProcesses === false) {
+      throw new BridgeError('SANDBOX_PERMISSIONS_UNSUPPORTED', 'Linux bwrap executor cannot enforce childProcesses: false');
+    }
+    const nativeTest: LocalNativeTestRequest = { ...command, expectedSha256,
+      maxAttempts: retries + 1, backend, sandbox: selection, policySha256: policy.sha256 };
     const releaseRegistry = this.state.acquire('registry');
     let releaseProject: (() => void) | undefined;
     try {
@@ -1030,7 +1077,7 @@ export class TaskManager {
       if (currentPreview.sha256 !== nativeTest.expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Copy changed while tests were queued');
       if (this.queue.length >= this.config.maxQueuedTasks && this.active >= this.config.maxConcurrentTasks) throw new BridgeError('QUEUE_FULL', 'Task queue is full');
       releaseProject = this.state.acquire(this.projectLock(current.project));
-      if (isLocalExecutorFailure) {
+      if (isLocalExecutorFailure && backend === 'windows-lpac') {
         await this.nativeRecovery;
         await recoverWindowsExecutions(this.config.stateDirectory, { requireIdle: true });
         this.nativeRecoveryError = undefined;
@@ -1047,7 +1094,7 @@ export class TaskManager {
       }
       const record: TaskRecord = { parentTaskId: current.record.taskId, group: structuredClone(current.record.group), memory: structuredClone(current.record.memory), craft: current.record.craft, deliveryMode: current.record.deliveryMode, providedSkills: current.project.providedSkills, taskId: randomUUID(), sessionId: current.record.sessionId, model: current.record.model, effort: current.record.effort,
         execution: this.initialExecutionIdentity(current.record.model, current.record.effort),
-        mode: 'write', role: current.record.role, roleDefinition: current.record.roleDefinition, prompt: 'Run the requested tests in the Windows sandbox.',
+        mode: 'write', role: current.record.role, roleDefinition: current.record.roleDefinition, prompt: backend === 'windows-lpac' ? 'Run the requested tests in the Windows sandbox.' : 'Run the requested tests in the Linux sandbox.',
         acceptanceCriteria: current.record.acceptanceCriteria, handoff: current.record.handoff, tests: current.record.tests,
         usageIsResume: true, usageBaseline: this.latestObservedUsage(current.record.sessionId, current.record.workingDirectory),
         workingDirectory: current.record.workingDirectory, copyDirectory: current.project.copyDirectory, includedFiles: current.project.includedFiles,
@@ -1059,7 +1106,7 @@ export class TaskManager {
       this.tasks.set(record.taskId, { record, options, ownerPid: process.pid, owned: true, project: current.project, releaseProject });
       releaseProject = undefined;
       this.queue.push(record.taskId);
-      this.events.append(record.taskId, 'task.queued', { workingDirectory: record.workingDirectory, model: record.model, backend: 'windows-lpac' });
+      this.events.append(record.taskId, 'task.queued', { workingDirectory: record.workingDirectory, model: record.model, backend });
       if (!this.batching) this.pump();
       return { ...record };
     } finally { releaseProject?.(); releaseRegistry(); }
@@ -1559,11 +1606,14 @@ export class TaskManager {
 
   private async execute(task: InternalTask): Promise<void> {
     const record = task.record;
-    if (task.options.nativeTest && 'backend' in task.options.nativeTest && task.options.nativeTest.backend === 'windows-lpac') {
+    if (task.options.nativeTest && 'backend' in task.options.nativeTest && (task.options.nativeTest.backend === 'windows-lpac' || task.options.nativeTest.backend === 'linux-bwrap')) {
+      const backend = task.options.nativeTest.backend;
       record.usageProvenance = 'local-executor';
-      try { await this.executeWindowsNativeTest(task); }
-      catch (error) {
-        this.finishFromError(task, error, 'WINDOWS_EXECUTION_UNVERIFIED');
+      try {
+        if (backend === 'windows-lpac') await this.executeWindowsNativeTest(task);
+        else await this.executeLocalNativeTest(task);
+      } catch (error) {
+        this.finishFromError(task, error, backend === 'windows-lpac' ? 'WINDOWS_EXECUTION_UNVERIFIED' : 'LINUX_EXECUTION_UNVERIFIED');
       }
       return;
     }
@@ -1686,32 +1736,35 @@ export class TaskManager {
     }
   }
 
-  private windowsRequest(task: InternalTask): WindowsNativeTestRequest {
+  private localTestRequest(task: InternalTask): LocalNativeTestRequest {
     const request = task.options.nativeTest;
-    if (!request || !('backend' in request) || request.backend !== 'windows-lpac') {
-      throw new BridgeError('WINDOWS_EXECUTION_UNVERIFIED', 'Missing frozen Windows test request');
+    if (!request || !('backend' in request) || (request.backend !== 'windows-lpac' && request.backend !== 'linux-bwrap')) {
+      throw new BridgeError('WINDOWS_EXECUTION_UNVERIFIED', 'Missing frozen local test request');
     }
     return request;
   }
 
-  private async beginWindowsNativeTest(task: InternalTask, request: WindowsNativeTestRequest): Promise<void> {
-    await this.nativeRecovery;
-    if (this.nativeRecoveryError) throw this.nativeRecoveryError;
+  private async beginLocalNativeTest(task: InternalTask, request: LocalNativeTestRequest): Promise<void> {
+    if (request.backend === 'windows-lpac') {
+      await this.nativeRecovery;
+      if (this.nativeRecoveryError) throw this.nativeRecoveryError;
+    }
+    const label = request.backend === 'windows-lpac' ? 'Windows' : 'Linux';
     const release = this.state.acquire('sandbox-policy');
     try {
       const current = this.state.loadSandboxPolicy();
       if (current.sha256 !== request.policySha256) {
-        throw new BridgeError('SANDBOX_POLICY_CHANGED', 'Sandbox policy changed while this Windows test was queued');
+        throw new BridgeError('SANDBOX_POLICY_CHANGED', `Sandbox policy changed while this ${label} test was queued`);
       }
       const selected = await resolveSandboxSelection(current.policy, request.sandbox, task.record.workingDirectory,
         this.config.stateDirectory, this.forbiddenDirectories(), this.config, this.config.windowsNodeCacheDirectory);
       if (JSON.stringify(selected) !== JSON.stringify(request.sandbox)) {
-        throw new BridgeError('SANDBOX_POLICY_CHANGED', 'Sandbox selection changed while this Windows test was queued');
+        throw new BridgeError('SANDBOX_POLICY_CHANGED', `Sandbox selection changed while this ${label} test was queued`);
       }
       if (task.termination) return;
       task.record.status = 'starting';
       task.record.startedAt = new Date().toISOString();
-      this.events.append(task.record.taskId, 'task.started', { backend: 'windows-lpac', policySha256: request.policySha256 });
+      this.events.append(task.record.taskId, 'task.started', { backend: request.backend, policySha256: request.policySha256 });
     } finally { release(); }
   }
 
@@ -1721,26 +1774,51 @@ export class TaskManager {
     return Math.max(1, Math.ceil(remaining / 1000));
   }
 
-  private async executeWindowsCommand(task: InternalTask, request: WindowsNativeTestRequest, timeoutSeconds: number) {
-    if (!task.project) throw new BridgeError('TASK_NOT_READY', 'Windows tests require an isolated project copy');
-    if (this.config.windowsNodeRuntime === 'portable') {
-      assertWindowsNodeCacheDirectoryUsable(this.config);
+  private async executeLocalCommand(task: InternalTask, request: LocalNativeTestRequest, timeoutSeconds: number): Promise<WindowsExecution | LinuxExecution> {
+    if (!task.project) throw new BridgeError('TASK_NOT_READY', 'Local tests require an isolated project copy');
+    const protectedPaths = [
+      task.record.workingDirectory,
+      this.config.stateDirectory,
+      ...(this.config.windowsNodeCacheDirectory ? [this.config.windowsNodeCacheDirectory] : []),
+      ...this.forbiddenDirectories(),
+    ];
+    const onProcess = (child: ChildProcessWithoutNullStreams) => {
+      task.child = child;
+      task.record.pid = child.pid;
+      this.events.append(task.record.taskId, 'process.started', { pid: child.pid, executor: request.backend });
+    };
+    if (request.backend === 'windows-lpac') {
+      if (this.config.windowsNodeRuntime === 'portable') {
+        assertWindowsNodeCacheDirectoryUsable(this.config);
+      }
+      const controller = new AbortController();
+      task.nativeAbort = controller;
+      try {
+        return await executeWindowsTest({ executable: request.executable, args: request.args }, task.project.copyDirectory, {
+          timeoutSeconds, maxRuntimeBytes: this.config.maxCopyBytes, maxFiles: this.config.maxCopyFiles,
+          mode: task.record.mode, stateDirectory: this.config.stateDirectory,
+          protectedPaths,
+          windowsNodeRuntime: this.config.windowsNodeRuntime, portableNodeCacheDirectory: this.config.windowsNodeCacheDirectory,
+          portableNodeCacheDirectoryInvalid: this.config.windowsNodeCacheDirectoryInvalid,
+          sandbox: request.sandbox, signal: controller.signal,
+          onProcess,
+        });
+      } finally {
+        if (task.nativeAbort === controller) task.nativeAbort = undefined;
+        task.child = undefined;
+      }
     }
     const controller = new AbortController();
     task.nativeAbort = controller;
+    if (task.termination) controller.abort();
     try {
-      return await executeWindowsTest({ executable: request.executable, args: request.args }, task.project.copyDirectory, {
-        timeoutSeconds, maxRuntimeBytes: this.config.maxCopyBytes, maxFiles: this.config.maxCopyFiles,
+      return await executeLinuxTest({ executable: request.executable, args: request.args }, task.project.copyDirectory, {
+        timeoutSeconds, maxFiles: this.config.maxCopyFiles,
         mode: task.record.mode, stateDirectory: this.config.stateDirectory,
-        protectedPaths: [task.record.workingDirectory, this.config.stateDirectory, ...(this.config.windowsNodeCacheDirectory ? [this.config.windowsNodeCacheDirectory] : []), ...this.forbiddenDirectories()],
-        windowsNodeRuntime: this.config.windowsNodeRuntime, portableNodeCacheDirectory: this.config.windowsNodeCacheDirectory,
-        portableNodeCacheDirectoryInvalid: this.config.windowsNodeCacheDirectoryInvalid,
+        protectedPaths,
         sandbox: request.sandbox, signal: controller.signal,
-        onProcess: child => {
-          task.child = child;
-          task.record.pid = child.pid;
-          this.events.append(task.record.taskId, 'process.started', { pid: child.pid, executor: 'windows-lpac' });
-        },
+        detection: this.linuxBwrapStatus,
+        onProcess,
       });
     } finally {
       if (task.nativeAbort === controller) task.nativeAbort = undefined;
@@ -1748,9 +1826,9 @@ export class TaskManager {
     }
   }
 
-  private async repairWindowsTest(task: InternalTask, request: WindowsNativeTestRequest, observedExitCode: number, timeoutSeconds: number): Promise<void> {
+  private async repairLocalTest(task: InternalTask, request: LocalNativeTestRequest, observedExitCode: number, timeoutSeconds: number): Promise<void> {
     if (task.termination) return;
-    if (!task.project) throw new BridgeError('TASK_NOT_READY', 'Windows test copy is unavailable');
+    if (!task.project) throw new BridgeError('TASK_NOT_READY', 'Local test copy is unavailable');
     const { nativeTest: _nativeTest, outputSchema: _outputSchema, artifactPaths: _artifactPaths, ...baseOptions } = task.options;
     const options: RunOptions = { ...baseOptions, timeoutSeconds,
       prompt: 'The bridge observed this exact test command exit with code ' + observedExitCode + ': ' +
@@ -1778,12 +1856,18 @@ export class TaskManager {
   }
 
   private async executeWindowsNativeTest(task: InternalTask): Promise<void> {
-    const request = this.windowsRequest(task);
-    await this.beginWindowsNativeTest(task, request);
+    return this.executeLocalNativeTest(task);
+  }
+
+  private async executeLocalNativeTest(task: InternalTask): Promise<void> {
+    const request = this.localTestRequest(task);
+    const label = request.backend === 'windows-lpac' ? 'Windows' : 'Linux';
+    const source = request.backend === 'windows-lpac' ? 'windows-executor' as const : 'linux-executor' as const;
+    await this.beginLocalNativeTest(task, request);
     if (task.termination) { this.finish(task, task.termination); return; }
-    if (!task.project) throw new BridgeError('TASK_NOT_READY', 'Windows tests require an isolated project copy');
+    if (!task.project) throw new BridgeError('TASK_NOT_READY', `${label} tests require an isolated project copy`);
     const initial = await previewProjectCopy(task.project, this.config);
-    if (initial.sha256 !== request.expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Copy changed while the Windows test was queued');
+    if (initial.sha256 !== request.expectedSha256) throw new BridgeError('REVIEW_CHANGED', `Copy changed while the ${label} test was queued`);
     const deadline = Date.now() + task.options.timeoutSeconds! * 1000;
     let modelInvoked = false;
     task.timer = setTimeout(() => {
@@ -1801,28 +1885,29 @@ export class TaskManager {
         const beforePreview = await previewProjectCopy(task.project, this.config);
         const beforeTree = await fingerprintProjectCopy(task.project, this.config);
         if (attempt === 1 && beforePreview.sha256 !== request.expectedSha256) {
-          throw new BridgeError('REVIEW_CHANGED', 'Copy changed before the Windows test command started');
+          throw new BridgeError('REVIEW_CHANGED', `Copy changed before the ${label} test command started`);
         }
-        const result = await this.executeWindowsCommand(task, request, remaining);
+        const result = await this.executeLocalCommand(task, request, remaining);
         const afterTree = await fingerprintProjectCopy(task.project, this.config);
         const afterPreview = await previewProjectCopy(task.project, this.config);
         task.record.exitCode = result.exitCode;
         if (result.exitCode !== null) {
           task.record.tests = [...(task.record.tests || []).slice(-19), {
             command: JSON.stringify({ executable: request.executable, args: request.args }), exitCode: result.exitCode,
-            output: redactDiagnostic(result.output), sha256: afterPreview.sha256, beforeSha256: beforePreview.sha256, recordedAt: new Date().toISOString(), source: 'windows-executor',
+            output: redactDiagnostic(result.output), sha256: afterPreview.sha256, beforeSha256: beforePreview.sha256, recordedAt: new Date().toISOString(), source,
             treeSha256: afterTree, beforeTreeSha256: beforeTree, executionError: result.error && redactDiagnostic(result.error), truncated: result.truncated,
-            attempt, testTaskId: task.record.taskId, sandbox: 'windows-lpac', sandboxSelection: request.sandbox,
+            attempt, testTaskId: task.record.taskId, sandbox: request.backend, sandboxSelection: request.sandbox,
             sandboxPolicySha256: request.policySha256,
-            portableNode: result.portableNode,
+            ...('processesReaped' in result ? {} : { portableNode: result.portableNode }),
           }];
         }
-        this.events.append(task.record.taskId, 'test.results', { attempt, exitCode: result.exitCode, sha256: afterPreview.sha256, sandbox: 'windows-lpac' });
+        this.events.append(task.record.taskId, 'test.results', { attempt, exitCode: result.exitCode, sha256: afterPreview.sha256, sandbox: request.backend });
         if (task.termination) break;
-        if (result.exitCode === null || result.error || result.profileDeleted !== true) {
-          throw new BridgeError('TEST_EXECUTION_UNVERIFIED', 'The Windows executor did not return a clean, verified execution receipt');
+        const receiptVerified = 'processesReaped' in result ? result.processesReaped === true : result.profileDeleted === true;
+        if (result.exitCode === null || result.error || !receiptVerified) {
+          throw new BridgeError('TEST_EXECUTION_UNVERIFIED', `The ${label} executor did not return a clean, verified execution receipt`);
         }
-        if (beforeTree !== afterTree) throw new BridgeError('TEST_CHANGED_PATCH', 'Project files changed during the observed Windows test command');
+        if (beforeTree !== afterTree) throw new BridgeError('TEST_CHANGED_PATCH', `Project files changed during the observed ${label} test command`);
         if (result.exitCode === 0) {
           if (!modelInvoked) task.record.usageProvenance = 'local-executor';
           this.finish(task, 'completed');
@@ -1830,7 +1915,7 @@ export class TaskManager {
         }
         if (attempt === request.maxAttempts) {
           if (!modelInvoked) task.record.usageProvenance = 'local-executor';
-          this.finish(task, 'failed', 'TEST_FAILED', 'Observed Windows test command failed');
+          this.finish(task, 'failed', 'TEST_FAILED', `Observed ${label} test command failed`);
           return;
         }
         const repairSeconds = this.remainingSeconds(deadline);
@@ -1842,7 +1927,7 @@ export class TaskManager {
         }
         modelInvoked = true;
         task.record.usageProvenance = undefined;
-        await this.repairWindowsTest(task, request, result.exitCode, repairSeconds);
+        await this.repairLocalTest(task, request, result.exitCode, repairSeconds);
       }
       if (task.termination) this.finish(task, task.termination);
     } finally {

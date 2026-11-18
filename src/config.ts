@@ -22,7 +22,7 @@ import {
 } from './hardening-policy.js';
 
 export type { SecretExceptionsPolicy } from './hardening-policy.js';
-export type TestExecutor = 'agy' | 'windows-lpac';
+export type TestExecutor = 'agy' | 'windows-lpac' | 'linux-bwrap';
 export type ApprovalMode = 'auto' | 'ask';
 export type ConfigurationIssueReason =
   | 'invalid-json'
@@ -106,6 +106,7 @@ export interface Config extends ProjectLimits {
   forbiddenDirectories: string[];
   forbiddenDirectoriesInvalid?: boolean;
   testExecutor: TestExecutor;
+  testExecutorExplicit: boolean;
   windowsNodeRuntime: WindowsNodeRuntime;
   windowsNodeCacheDirectory?: string;
   windowsNodeCacheDirectoryInvalid?: boolean;
@@ -129,8 +130,8 @@ function approvalMode(value: string | undefined): ApprovalMode {
 
 function testExecutor(value: string | undefined): TestExecutor {
   if (value === undefined) return process.platform === 'win32' ? 'windows-lpac' : 'agy';
-  if (value === 'agy' || value === 'windows-lpac') return value;
-  throw new Error('BRIDGE_TEST_EXECUTOR must be agy or windows-lpac');
+  if (value === 'agy' || value === 'windows-lpac' || value === 'linux-bwrap') return value;
+  throw new Error('BRIDGE_TEST_EXECUTOR must be agy, windows-lpac, or linux-bwrap');
 }
 
 function windowsNodeRuntime(value: string | undefined): WindowsNodeRuntime {
@@ -681,6 +682,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     forbiddenDirectories: forbiddenDirs.forbiddenDirectories,
     ...(forbiddenDirs.forbiddenDirectoriesInvalid ? { forbiddenDirectoriesInvalid: true } : {}),
     testExecutor: testExecutor(env.BRIDGE_TEST_EXECUTOR),
+    testExecutorExplicit: env.BRIDGE_TEST_EXECUTOR !== undefined,
     windowsNodeRuntime: windowsNodeRuntime(env.BRIDGE_WINDOWS_NODE_RUNTIME),
     windowsNodeCacheDirectory: windowsNodeCache.windowsNodeCacheDirectory,
     ...(windowsNodeCache.windowsNodeCacheDirectoryInvalid ? { windowsNodeCacheDirectoryInvalid: true } : {}),

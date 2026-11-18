@@ -137,6 +137,7 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
       configurationIssues: tasks.configurationIssues,
       maintenanceIssues: tasks.maintenanceIssues,
       windowsRuntime: await tasks.windowsRuntimeStatus(),
+      testExecutor: tasks.testExecutorStatus(),
       ...(tasks.isStateDirectoryUsable() ? waitCommand() : {}),
       bridgeLimitations: {
         interactiveReplies: { available: false, reason: 'The verified agy headless protocol rejects control_request/control_response. This bridge cannot answer pending permission requests; use supported sandbox permissions and inspect failures.' },

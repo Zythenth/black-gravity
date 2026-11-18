@@ -15,12 +15,14 @@ export interface NativeTestRequest extends TestCommand {
   expectedSha256: string;
   maxAttempts: number;
 }
-export interface WindowsNativeTestRequest extends NativeTestRequest {
-  backend: 'windows-lpac';
+export type LocalTestBackend = 'windows-lpac' | 'linux-bwrap';
+export interface LocalNativeTestRequest extends NativeTestRequest {
+  backend: LocalTestBackend;
   sandbox: SandboxSelection;
   policySha256: string;
 }
-export type BridgeNativeTestRequest = NativeTestRequest | WindowsNativeTestRequest;
+export type WindowsNativeTestRequest = LocalNativeTestRequest;
+export type BridgeNativeTestRequest = NativeTestRequest | LocalNativeTestRequest;
 export const receiptSchema = z.object({
   nonce: z.string().uuid(), exitCode: z.number().int().min(0).max(255).nullable(),
   beforeSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),

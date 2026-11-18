@@ -24,9 +24,9 @@ const verificationStatus = z.enum(['passed', 'failed', 'unverified']);
 const portableNodeIdentity = z.object({ buildId: z.string(), nodeVersion: z.string(), libuvVersion: z.string(), sha256: hash }).strict();
 export const testEvidenceSchema = z.object({
   command: z.string(), exitCode: z.number().int().min(0).max(0xffffffff), output: z.string(), sha256: hash, beforeSha256: hash.optional(), recordedAt: timestamp,
-  source: z.enum(['client-reported', 'agy-tool', 'windows-executor']), treeSha256: hash.optional(), beforeTreeSha256: hash.optional(),
+  source: z.enum(['client-reported', 'agy-tool', 'windows-executor', 'linux-executor']), treeSha256: hash.optional(), beforeTreeSha256: hash.optional(),
   executionError: z.string().optional(), truncated: z.boolean().optional(), attempt: count.optional(),
-  testTaskId: id.optional(), sandbox: z.enum(['agy-native-requested', 'windows-lpac']).optional(),
+  testTaskId: id.optional(), sandbox: z.enum(['agy-native-requested', 'windows-lpac', 'linux-bwrap']).optional(),
   sandboxSelection: sandboxSelectionSchema.optional(), sandboxPolicySha256: hash.optional(),
   portableNode: portableNodeIdentity.optional(),
 }).strict();
@@ -131,6 +131,17 @@ export const successOutputSchemas = {
     }).strict().optional(),
     windowsRuntime: z.object({ requestedMode: z.enum(['system', 'portable']), supported: z.boolean(), ready: z.boolean(), buildId: z.string(),
       nodeVersion: z.string(), libuvVersion: z.string(), sha256: hash.nullable(), error: z.object({ code: z.string(), message: z.string() }).strict().optional() }).strict().optional(),
+    testExecutor: z.object({
+      selected: z.enum(['agy', 'windows-lpac', 'linux-bwrap']),
+      explicit: z.boolean(),
+      linuxBwrap: z.object({
+        available: z.boolean(),
+        path: z.string().optional(),
+        version: z.string().optional(),
+        code: z.string().optional(),
+        reason: z.string().optional(),
+      }).strict().optional(),
+    }).strict().optional(),
     waitCommand: waitCommandSchema.optional(),
   }).strict(),
   black_gravity_list_models: z.object({ models: z.array(z.object({ id: z.string(), name: z.string() }).strict()) }).strict(),

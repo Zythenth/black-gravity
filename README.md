@@ -139,6 +139,34 @@ The skill guides model selection, waiting, and review. For a standalone MCP setu
 - Git 2.32 or newer on an absolute `PATH` entry.
 - The [official Antigravity CLI](https://www.antigravity.google/docs/cli/install/) on `PATH` or configured by absolute `AGY_PATH`, with authentication completed in `agy`.
 
+### Linux Bubblewrap test executor (`linux-bwrap`)
+
+**Verified in CI (`ubuntu-24.04`) only; Linux user-machine verification is not yet done.** When `BRIDGE_TEST_EXECUTOR` is unset on Linux, `black_gravity_test` uses `linux-bwrap` only if startup detection finds `bwrap` and passes the user-namespace probe; otherwise it stays on `agy` (also selectable explicitly with `BRIDGE_TEST_EXECUTOR=agy`). Setting `BRIDGE_TEST_EXECUTOR=linux-bwrap` requires Bubblewrap: if unavailable, `black_gravity_test` refuses before queuing with `LINUX_BWRAP_MISSING` or `LINUX_USER_NAMESPACES_BLOCKED` and never falls back to host execution. `black_gravity_health.testExecutor` reports `selected`, `explicit`, and `linuxBwrap` availability details (`available`, `path`, `version`, `code`, `reason`). The sandbox root itself is read-only and exposes only system directories (`/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/opt`, `/nix/store`, read-only, with system roots that are symbolic links on the host recreated as symbolic links inside the sandbox), the Node and `PATH` toolchain directories (read-only, mounted after the `/tmp` and `/run` `tmpfs`, including directories reached through symlinks at their original path, never the home directory; toolchains that are `/tmp`, `/run`, or `XDG_RUNTIME_DIR` themselves, or contain them, are refused), the copy, a scratch directory, and the declared `readPaths`/`writePaths`; only the copy, the scratch directory, `/tmp`, and declared `writePaths` are writable; the home directory and `/var` are not visible; `/tmp` is an empty per-run `tmpfs`; `/run`, `XDG_RUNTIME_DIR`, and protected paths are empty read-only `tmpfs` mounts; when network is disabled (the default), a seccomp filter blocks creating `AF_UNIX` sockets and `io_uring`, and limits `socketpair` to stream and seqpacket types (other types, including datagram and raw, are blocked), while pipes still work, so host Unix sockets are unreachable; test commands that need Unix sockets require network enabled in the sandbox policy; the filter supports `x86_64` and `arm64`, and other architectures are refused when network is disabled. Execution is also refused when an automatically mounted directory (toolchains, their aliases, or `readPaths`) contains a FIFO, because read-only mounts do not stop writes to named pipes; the run is also refused when such a directory cannot be traversed or listed (a command inside the sandbox can regain access to the user's own directories through a nested user namespace); system roots are not scanned. Threat model: system roots (`/usr`, `/etc`, `/opt`, and the other system directories listed above) are trusted and controlled by the administrator; FIFOs and other pre-existing channels inside them are outside the scope of this executor in this version.
+
+Install Bubblewrap:
+
+```bash
+sudo apt install bubblewrap    # Debian / Ubuntu
+sudo dnf install bubblewrap    # Fedora / RHEL
+sudo pacman -S bubblewrap      # Arch Linux
+```
+
+On Ubuntu 23.10+ where AppArmor restricts unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`), grant `userns` only to `/usr/bin/bwrap`:
+
+```bash
+sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/bwrap
+```
+
 ## Host permissions
 
 `black-gravity permissions` prints host rules to review and merge into the host configuration. From the source checkout:

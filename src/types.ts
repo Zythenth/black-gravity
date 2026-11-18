@@ -114,14 +114,14 @@ export interface TestEvidence {
   sha256: string;
   beforeSha256?: string;
   recordedAt: string;
-  source: 'client-reported' | 'agy-tool' | 'windows-executor';
+  source: 'client-reported' | 'agy-tool' | 'windows-executor' | 'linux-executor';
   treeSha256?: string;
   beforeTreeSha256?: string;
   executionError?: string;
   truncated?: boolean;
   attempt?: number;
   testTaskId?: string;
-  sandbox?: 'agy-native-requested' | 'windows-lpac';
+  sandbox?: 'agy-native-requested' | 'windows-lpac' | 'linux-bwrap';
   sandboxSelection?: SandboxSelection;
   sandboxPolicySha256?: string;
   portableNode?: PortableNodeIdentity;

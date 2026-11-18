@@ -26,6 +26,7 @@ const TEST_WEIGHTS = {
   'task-results': 30,
   'group-runtime': 30,
   'specialist-runtime': 30,
+  'linux-executor': 24,
   'windows-aliases': 24,
 };
 
