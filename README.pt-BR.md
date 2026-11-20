@@ -117,6 +117,44 @@ claude mcp list
 agy mcp add black-gravity -- node "$server"
 ```
 
+### Executor de testes Linux Bubblewrap (`linux-bwrap`)
+
+**Verificado no CI (`ubuntu-24.04`) e num servidor Ubuntu 26.04 (kernel 7.0, Bubblewrap 0.11.1, usuário sem root); outras distribuições não foram verificadas.** Quando `BRIDGE_TEST_EXECUTOR` não está definido no Linux, `black_gravity_test` usa `linux-bwrap` apenas se a detecção inicial encontrar o `bwrap` e aprovar o teste de user namespace; caso contrário permanece em `agy` (também selecionável explicitamente com `BRIDGE_TEST_EXECUTOR=agy`).
+
+Instale o Bubblewrap se `bwrap --version` não o encontrar. Os comandos abaixo exigem root e não foram executados no servidor verificado; outras formas de instalação não foram verificadas. Sem o Bubblewrap, e com `BRIDGE_TEST_EXECUTOR` não definido, `black_gravity_test` permanece em `agy`.
+
+```bash
+sudo apt install bubblewrap    # Debian / Ubuntu
+sudo dnf install bubblewrap    # Fedora / RHEL
+sudo pacman -S bubblewrap      # Arch Linux
+```
+
+Depois confira, sem root, se o Bubblewrap consegue criar um user namespace:
+
+```bash
+bwrap --unshare-user --ro-bind / / true && echo ok
+```
+
+Se aparecer `ok`, pule o próximo passo. No servidor Ubuntu 26.04.1 verificado, o pacote `apparmor` traz e carrega um perfil `bwrap` (`/etc/apparmor.d/bwrap-userns-restrict`) que permite user namespaces e confina os processos iniciados pelo `bwrap`. Não adicione o perfil abaixo onde um perfil assim estiver carregado: `apparmor_parser -r` substitui qualquer perfil carregado com o mesmo nome, seja qual for o nome do arquivo.
+
+O perfil abaixo é o que o CI carrega no runner `ubuntu-24.04` do GitHub Actions, onde a conferência falha porque o AppArmor restringe user namespaces sem privilégios (`kernel.apparmor_restrict_unprivileged_userns=1`); ele não foi executado no servidor verificado. O `flags=(unconfined)` dele não confina o `bwrap` nem os processos que ele inicia, ao contrário do perfil do Ubuntu 26.04. Ele concede `userns` apenas para `/usr/bin/bwrap` e exige root; sem root, deixe `BRIDGE_TEST_EXECUTOR` sem definir e `black_gravity_test` permanece em `agy`:
+
+```bash
+sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/bwrap>
+}
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/bwrap
+```
+
+As montagens, o filtro seccomp, as verificações de FIFO, as recusas e o modelo de ameaça do executor estão descritos em [Executor de testes Linux Bubblewrap](documentation/linux-executor.md).
+
 ### Compilar a partir do código-fonte
 
 ```powershell
@@ -141,40 +179,6 @@ A skill orienta a escolha do modelo, o acompanhamento e a revisão. Para usar so
 - Node.js 24 ou mais recente, com npm. O Windows LPAC tem [requisitos adicionais de runtime](documentation/windows-runtime.md).
 - Git 2.32 ou mais recente em uma entrada absoluta do `PATH`.
 - [CLI oficial do Antigravity](https://www.antigravity.google/docs/cli/install/) no `PATH` ou configurado com `AGY_PATH` absoluto, com a autenticação concluída no próprio `agy`.
-
-### Executor de testes Linux Bubblewrap (`linux-bwrap`)
-
-**Verificado no CI (`ubuntu-24.04`) e num servidor Ubuntu 26.04 (kernel 7.0, Bubblewrap 0.11.1, usuário sem root); outras distribuições não foram verificadas.** Quando `BRIDGE_TEST_EXECUTOR` não está definido no Linux, `black_gravity_test` usa `linux-bwrap` apenas se a detecção inicial encontrar o `bwrap` e aprovar o teste de user namespace; caso contrário permanece em `agy` (também selecionável explicitamente com `BRIDGE_TEST_EXECUTOR=agy`). Definir `BRIDGE_TEST_EXECUTOR=linux-bwrap` exige o Bubblewrap: quando indisponível, `black_gravity_test` recusa antes de enfileirar com `LINUX_BWRAP_MISSING` ou `LINUX_USER_NAMESPACES_BLOCKED` e nunca faz fallback para execução no host. `black_gravity_health.testExecutor` informa `selected`, `explicit` e os detalhes de disponibilidade em `linuxBwrap` (`available`, `path`, `version`, `code`, `reason`). A raiz do sandbox em si é somente leitura e expõe apenas diretórios do sistema (`/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/opt`, `/nix/store`, somente leitura, sendo que raízes do sistema que são links simbólicos no host são recriadas como links simbólicos dentro do sandbox), os diretórios do Node e das ferramentas no `PATH` (somente leitura, montados após os `tmpfs` de `/tmp` e `/run`, inclusive os alcançados por links simbólicos no caminho original, nunca o diretório pessoal; toolchains que sejam os próprios `/tmp`, `/run` ou `XDG_RUNTIME_DIR`, ou que os contenham, são recusados), a cópia, um diretório temporário de trabalho e os caminhos declarados em `readPaths`/`writePaths`; apenas a cópia, o diretório temporário de trabalho, `/tmp` e os caminhos em `writePaths` permitem escrita; o diretório pessoal e `/var` não ficam visíveis; `/tmp` é um `tmpfs` vazio por execução; `/run`, `XDG_RUNTIME_DIR` e os caminhos protegidos são montagens `tmpfs` vazias somente leitura; quando a rede está desativada (o padrão), um filtro seccomp bloqueia a criação de sockets `AF_UNIX` e `io_uring`, e limita `socketpair` aos tipos stream e seqpacket (outros tipos, incluindo datagrama e raw, são bloqueados), enquanto pipes continuam funcionando, tornando os sockets Unix do host inacessíveis; comandos de teste que precisam de sockets Unix exigem rede ativada na política do sandbox; o filtro suporta `x86_64` e `arm64`, e outras arquiteturas são recusadas quando a rede está desativada. A execução também é recusada quando um diretório montado automaticamente (toolchains, seus aliases ou `readPaths`) contém um FIFO, porque montagens somente leitura não impedem gravações em pipes nomeados; a execução também é recusada quando um diretório desse tipo não pode ser atravessado ou listado (um comando dentro do sandbox pode recuperar acesso aos próprios diretórios do usuário por meio de um user namespace aninhado); raízes do sistema não são verificadas. Modelo de ameaça: as raízes do sistema (`/usr`, `/etc`, `/opt` e os demais diretórios do sistema listados acima) são confiáveis e controladas pelo administrador; FIFOs e outros canais preexistentes dentro delas estão fora do escopo deste executor nesta versão.
-
-Instale o Bubblewrap se `bwrap --version` não o encontrar. Os comandos abaixo exigem root e não foram executados no servidor verificado; outras formas de instalação não foram verificadas. Sem o Bubblewrap, e com `BRIDGE_TEST_EXECUTOR` não definido, `black_gravity_test` permanece em `agy`.
-
-```bash
-sudo apt install bubblewrap    # Debian / Ubuntu
-sudo dnf install bubblewrap    # Fedora / RHEL
-sudo pacman -S bubblewrap      # Arch Linux
-```
-
-Depois confira, sem root, se o Bubblewrap consegue criar um user namespace:
-
-```bash
-bwrap --unshare-user --ro-bind / / true && echo ok
-```
-
-Se aparecer `ok`, pule o próximo passo. No servidor Ubuntu 26.04.1 verificado, o pacote `apparmor` traz e carrega um perfil `bwrap` (`/etc/apparmor.d/bwrap-userns-restrict`) que permite user namespaces e confina os processos iniciados pelo `bwrap`. Não adicione o perfil abaixo onde um perfil assim estiver carregado: `apparmor_parser -r` substitui qualquer perfil carregado com o mesmo nome, seja qual for o nome do arquivo. O perfil abaixo é o que o CI carrega no runner `ubuntu-24.04` do GitHub Actions, onde a conferência falha porque o AppArmor restringe user namespaces sem privilégios (`kernel.apparmor_restrict_unprivileged_userns=1`); ele não foi executado no servidor verificado. O `flags=(unconfined)` dele não confina o `bwrap` nem os processos que ele inicia, ao contrário do perfil do Ubuntu 26.04. Ele concede `userns` apenas para `/usr/bin/bwrap` e exige root; sem root, deixe `BRIDGE_TEST_EXECUTOR` sem definir e `black_gravity_test` permanece em `agy`:
-
-```bash
-sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
-abi <abi/4.0>,
-include <tunables/global>
-
-profile bwrap /usr/bin/bwrap flags=(unconfined) {
-  userns,
-
-  include if exists <local/bwrap>
-}
-EOF
-sudo apparmor_parser -r /etc/apparmor.d/bwrap
-```
 
 ## Permissões do host
 
