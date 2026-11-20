@@ -35,7 +35,8 @@ function setup(prefixArgs = [fixturePath], configOverrides: Record<string, strin
   stateDirectories.push(stateDirectory);
   const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off',
     AGY_PATH: process.execPath,
-    DEFAULT_TIMEOUT_SECONDS: '2',
+    // Processes that exit by themselves never reach this limit; the margin covers slow process starts on loaded Windows runners. Tests that expect a hang or a timeout set their own value.
+    DEFAULT_TIMEOUT_SECONDS: '15',
     BRIDGE_TEST_EXECUTOR: 'agy',
     BRIDGE_STATE_DIRECTORY: stateDirectory,
     MAX_PROMPT_CHARS: '1000000',

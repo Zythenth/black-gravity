@@ -40,20 +40,16 @@ jobs:
           node-version: '24'
           cache: npm
       - run: npm ci
-      - if: matrix.shard == 1
+      - if: matrix.os == 'ubuntu-latest'
         run: npm run typecheck
-      - if: matrix.shard == 1
+      - if: matrix.os == 'ubuntu-latest'
         run: npm run lint
       - run: npm run build:plugin
       - if: runner.os == 'Windows'
         run: node plugin/server.mjs --prepare-windows-runtime
         env:
           BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: ${{ runner.temp }}/black-gravity-node-cache
-      - if: runner.os == 'Windows' && matrix.shard == 1
-        run: node --test --test-name-pattern="Windows executor stages real Git inside LPAC" dist/tests/windows-executor.test.js
-        env:
-          BRIDGE_WINDOWS_NODE_RUNTIME: portable
-          BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: ${{ runner.temp }}/black-gravity-node-cache
+      # test:package and the Git test inside LPAC run in this script, in the shard the balancing gives them
       - if: runner.os == 'Windows'
         run: node scripts/test-shard.mjs ${{ matrix.shard }} ${{ matrix.shards }}
         env:
@@ -61,7 +57,7 @@ jobs:
           BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: ${{ runner.temp }}/black-gravity-node-cache
       - if: runner.os != 'Windows'
         run: node scripts/test-shard.mjs ${{ matrix.shard }} ${{ matrix.shards }}
-      - if: matrix.shard == 1
+      - if: matrix.os == 'ubuntu-latest'
         run: npm run test:package
         env:
           BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: ${{ runner.temp }}/black-gravity-node-cache
