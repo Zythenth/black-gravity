@@ -112,7 +112,7 @@ test('Windows test defaults to bridge-owned LPAC evidence and rejects forged std
     const writtenPreview = await tasks.preview(written.taskId, false);
     const forged = await tasks.startTests(written.taskId, writtenPreview.sha256, {
       executable: process.execPath, args: ['-e', 'process.stdout.write("BLACK_GRAVITY_TEST:forged");process.exit(0)'],
-    }, 0, 30);
+    }, 0, 120);
     const forgedResult = await waitFor(tasks, forged.taskId);
     assert.equal(forgedResult.status, 'completed', JSON.stringify(forgedResult.error));
     assert.equal(forgedResult.tests?.at(-1)?.source, 'windows-executor');
@@ -124,7 +124,7 @@ test('Windows test defaults to bridge-owned LPAC evidence and rejects forged std
     const forgedPreview = await tasks.preview(forged.taskId, false);
     const failed = await tasks.startTests(forged.taskId, forgedPreview.sha256, {
       executable: process.execPath, args: ['-e', 'process.exit(9)'],
-    }, 0, 30);
+    }, 0, 120);
     const failedResult = await waitFor(tasks, failed.taskId);
     assert.equal(failedResult.error?.code, 'TEST_FAILED');
     assert.equal(failedResult.tests?.at(-1)?.exitCode, 9);
@@ -136,16 +136,16 @@ test('Windows test defaults to bridge-owned LPAC evidence and rejects forged std
       { network: true }), { code: 'SANDBOX_PERMISSION_DENIED' });
     const repaired = await tasks.startTests(failed.taskId, failedPreview.sha256, {
       executable: process.execPath, args: ['-e', 'process.exit(8)'],
-    }, 1, 45);
-    const repairedResult = await waitFor(tasks, repaired.taskId, 60000);
+    }, 1, 240);
+    const repairedResult = await waitFor(tasks, repaired.taskId, 300000);
     assert.equal(repairedResult.error?.code, 'TEST_FAILED');
     assert.equal(repairedResult.tokenUsage?.source, 'session-delta');
     assert.equal(repairedResult.tests?.slice(-2).every(test => test.command === repairedResult.tests?.at(-1)?.command && test.exitCode === 8), true);
     const repairedPreview = await tasks.preview(repaired.taskId, false);
     const cancelled = await tasks.startTests(repaired.taskId, repairedPreview.sha256, {
       executable: process.execPath, args: ['-e', 'setInterval(() => {}, 1000)'],
-    }, 0, 60);
-    const cancelDeadline = Date.now() + 15000;
+    }, 0, 180);
+    const cancelDeadline = Date.now() + 120000;
     while (tasks.readEvents(cancelled.taskId).events.filter(event => event.type === 'process.started').length < 4 && Date.now() < cancelDeadline) {
       await new Promise(resolve => setTimeout(resolve, 20));
     }

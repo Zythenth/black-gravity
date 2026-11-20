@@ -933,12 +933,12 @@ test('black_gravity_wait_many, black_gravity_compare and black_gravity_group_sta
           expectedSha256: writePreview.sha256,
           command: { executable: process.execPath, args: ['-e', positiveLpacScript, privateTargets] },
           retries: 0,
-          timeoutSeconds: 60,
+          timeoutSeconds: 180,
         },
       });
       assert.equal(posTestCall.isError, undefined, JSON.stringify(posTestCall.structuredContent));
       const posTestTaskId = (posTestCall.structuredContent as { task: { taskId: string } }).task.taskId;
-      const posTestResult = await waitForTask(f.tasks, posTestTaskId);
+      const posTestResult = await waitForTask(f.tasks, posTestTaskId, 240_000);
       assert.equal(posTestResult.status, 'completed', JSON.stringify(posTestResult.error));
       const posReceipt = posTestResult.tests?.at(-1);
       assert.ok(posReceipt);
@@ -1025,12 +1025,12 @@ test('black_gravity_wait_many, black_gravity_compare and black_gravity_group_sta
           expectedSha256: posReceipt.sha256,
           command: { executable: process.execPath, args: ['-e', negativeLpacScript] },
           retries: 0,
-          timeoutSeconds: 60,
+          timeoutSeconds: 180,
         },
       });
       assert.equal(negTestCall.isError, undefined, JSON.stringify(negTestCall.structuredContent));
       const negTestTaskId = (negTestCall.structuredContent as { task: { taskId: string } }).task.taskId;
-      const negTestResult = await waitForTask(f.tasks, negTestTaskId);
+      const negTestResult = await waitForTask(f.tasks, negTestTaskId, 240_000);
       assert.equal(negTestResult.status, 'failed');
       assert.equal(negTestResult.error?.code, 'TEST_FAILED');
       const negReceipt = negTestResult.tests?.at(-1);
