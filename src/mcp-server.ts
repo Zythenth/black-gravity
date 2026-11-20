@@ -27,6 +27,7 @@ import { redactDiagnostic } from './subprocess.js';
 import { waitCommandInfo } from './wait-command.js';
 import { recommendWaitMode } from './wait-profiles.js';
 import { SERVER_ICONS } from './server-icons.js';
+import { MODEL_ALIASES, resolveModelAlias } from './model-resolution.js';
 
 function response(value: unknown) {
   const structuredContent = value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : { value };
@@ -90,7 +91,7 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
     approvalInstructions;
   const server = new McpServer({ name: 'black-gravity', version: '0.9.0', icons: SERVER_ICONS }, { instructions });
   // Intercept tool registration: titles and annotations come from TOOL_ANNOTATIONS, and state-dependent tools immediately refuse when BRIDGE_STATE_DIRECTORY is invalid/degraded.
-  const statelessTools = new Set(['black_gravity_health', 'black_gravity_capabilities', 'black_gravity_list_models', 'black_gravity_roles']);
+  const statelessTools = new Set(['black_gravity_health', 'black_gravity_capabilities', 'black_gravity_list_models', 'black_gravity_resolve_model', 'black_gravity_roles']);
   const originalRegisterTool = server.registerTool.bind(server);
   server.registerTool = ((name: string, ...args: unknown[]) => {
     const row = toolAnnotationRow(name);
@@ -164,6 +165,37 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
     description: 'Report which capabilities each installed CLI exposes as observed, absent or unknown, using only version and help output. Starts no task and no login. Unknown is not support.',
     inputSchema: {},
   }, safe(async () => ({ clis: [await adapter.capabilityRecord({ id: 'agy', version: AGY_ADAPTER_VERSION })] })));
+
+  if (toolEnabled(tasks.toolProfile, 'black_gravity_resolve_model')) server.registerTool('black_gravity_resolve_model', {
+    outputSchema: outputSchemas.black_gravity_resolve_model,
+    description: 'Resolve the Flash or Argon alias to an exact model ID returned by agy models for the requested effort, never substituting another model or effort. Starts no task. Reports whether the CLI exposes the effective model.',
+    inputSchema: { alias: z.enum(MODEL_ALIASES), effort: effortSchema.optional() },
+  }, async ({ alias, effort }) => safe(async () => {
+    const capabilities = await adapter.capabilityRecord({ id: 'agy', version: AGY_ADAPTER_VERSION });
+    let models: Awaited<ReturnType<CliAdapter['listModels']>> | null = null;
+    let listError: { code: string } | undefined;
+    if (capabilities.installed) {
+      try {
+        models = await adapter.listModels();
+      } catch (error) {
+        if (error instanceof BridgeError) {
+          models = null;
+          listError = { code: error.code };
+        } else {
+          throw error;
+        }
+      }
+    }
+    return {
+      resolution: resolveModelAlias({
+        alias,
+        effort: effort ?? 'high',
+        cli: { installed: capabilities.installed, version: capabilities.version },
+        models,
+        ...(listError ? { listError } : {}),
+      }),
+    };
+  })());
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_get_model')) server.registerTool('black_gravity_get_model', {
     outputSchema: outputSchemas.black_gravity_get_model,

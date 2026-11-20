@@ -91,6 +91,7 @@ const snapshotSchema = z.object({
   project: z.object({ executionPolicy: stagedExecutionPolicySchema.optional(), executionStateDirectory: z.string().optional(), sourceDirectory: z.string(), copyDirectory: z.string(), gitDirectory: z.string(),
     baseline: z.array(z.tuple([z.string(), z.string().regex(/^[a-f0-9]{64}$/)])), includedFiles: z.array(z.string()), providedSkills: stagedSkillsSchema.optional(),
     blockedFiles: z.array(blockedMetadataSchema).optional(),
+    modelProofFailure: z.string().max(2000).optional(),
   }).optional(),
   events: z.array(z.object({ taskId: z.string().uuid(), sequence: z.number().int().positive(), timestamp: z.string(), type: z.string(), data: z.unknown(), raw: z.unknown().optional(), rawIsData: z.literal(true).optional(), rawEnvelope: z.string().min(1).max(64).optional() }).refine(event => [event.raw !== undefined, event.rawIsData !== undefined, event.rawEnvelope !== undefined].filter(Boolean).length <= 1 && event.rawEnvelope !== 'event')),
   cursor: z.number().int().nonnegative(),

@@ -83,7 +83,7 @@ test('group MCP preserves owners, waits for every prerequisite and returns compa
       assert.equal(result.isError, undefined, JSON.stringify(result)); return result.structuredContent;
     };
     try {
-      assert.equal((await client.listTools()).tools.length, 51);
+      assert.equal((await client.listTools()).tools.length, 52);
       const groupId = randomUUID(), input = definition(source);
       const created = successOutputSchemas.black_gravity_group_create.parse(await call('black_gravity_group_create', { groupId, definition: input })).group;
       assert.equal(JSON.stringify(created).includes('PRIVATE_JOB_PROMPT_A'), false);

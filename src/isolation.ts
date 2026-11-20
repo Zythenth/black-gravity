@@ -38,6 +38,7 @@ export interface ProjectCopy {
   baseline: Map<string, string>;
   includedFiles: string[];
   blockedFiles?: BlockedPath[];
+  modelProofFailure?: string;
 }
 
 export interface ChangePreview {

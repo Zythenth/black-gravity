@@ -20,6 +20,11 @@ import {
   REGISTRY_CAPABILITIES,
   type RegistryCapability,
 } from './capability-registry.js';
+import {
+  IDENTITY_STATUSES,
+  MODEL_ALIASES,
+  RESOLUTION_STATUSES,
+} from './model-resolution.js';
 
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const id = z.string().uuid();
@@ -116,6 +121,22 @@ const cliCapabilityRecord = z.object({
   effectiveModel: capabilityEntry, editToolRestrictions: z.array(editToolRestriction),
   error: z.string().optional(),
 }).strict();
+const modelResolutionSchema = z.object({
+  alias: z.enum(MODEL_ALIASES),
+  requestedEffort: effortSchema,
+  status: z.enum(RESOLUTION_STATUSES),
+  modelId: z.string().nullable(),
+  candidates: z.array(z.string()),
+  availableEfforts: z.array(effortSchema),
+  effortEncoding: z.literal('model-id-suffix'),
+  detail: z.string(),
+  identity: z.object({
+    model: z.enum(IDENTITY_STATUSES),
+    effort: z.enum(IDENTITY_STATUSES),
+    detail: z.string(),
+  }).strict(),
+  errorCode: z.string().optional(),
+}).strict();
 
 export const successOutputSchemas = {
   black_gravity_wait_many: z.object({ ready: z.boolean(), timedOut: z.boolean(), hasMoreMessages: z.boolean(), tasks: z.array(jointWaitTaskSchema).max(32), waitCommand: waitCommandSchema.optional() }).strict(),
@@ -169,6 +190,7 @@ export const successOutputSchemas = {
   }).strict(),
   black_gravity_list_models: z.object({ models: z.array(z.object({ id: z.string(), name: z.string() }).strict()) }).strict(),
   black_gravity_capabilities: z.object({ clis: z.array(cliCapabilityRecord) }).strict(),
+  black_gravity_resolve_model: z.object({ resolution: modelResolutionSchema }).strict(),
   black_gravity_get_agent_policy: z.object({ allowedTools: nativeToolsSchema, mcpServers: z.array(z.object({ id: z.string(), description: z.string().nullable(), nativeServerName: z.string(), tools: z.array(mcpCatalogToolSchema) }).strict()).max(20) }).strict(),
   black_gravity_get_model: z.object({ model: z.string().nullable() }).strict(),
   black_gravity_get_sandbox_policy: sandboxPolicySnapshot,

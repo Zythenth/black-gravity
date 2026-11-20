@@ -56,7 +56,7 @@ async function waitUntilReady(client: Client, taskId: string, timeoutMs = 180_00
 
 test('tool profiles reduce the MCP catalog and reject writes in query/review', async () => {
   assert.throws(() => loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_TOOL_PROFILE: 'unknown' }));
-  for (const [profile, count] of [['full', 51], ['query', 37], ['review', 40], ['implementation', 51]] as const) {
+  for (const [profile, count] of [['full', 52], ['query', 38], ['review', 41], ['implementation', 52]] as const) {
     const f = await fixture(profile);
     try {
       const names = (await f.client.listTools()).tools.map(tool => tool.name);

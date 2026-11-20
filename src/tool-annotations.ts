@@ -20,6 +20,7 @@ export const TOOL_ANNOTATIONS: Readonly<Record<string, ToolAnnotationRow>> = {
   black_gravity_health: { title: 'Check Antigravity CLI', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   black_gravity_list_models: { title: 'List Antigravity models', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   black_gravity_capabilities: { title: 'Report CLI capabilities', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  black_gravity_resolve_model: { title: 'Resolve Flash or Argon model ID', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   black_gravity_get_model: { title: 'Get selected model', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_get_sandbox_policy: { title: 'Get Windows test sandbox policy', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_usage: { title: 'Read observed token usage', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },

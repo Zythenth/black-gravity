@@ -6,10 +6,10 @@ Set `BRIDGE_TOOL_PROFILE` in the server environment and restart the MCP connecti
 
 | Value | Tools | Catalog and execution |
 | --- | --- | --- |
-| `full` (default) | 51 | All tools, preserving the existing configuration. |
-| `query` | 37 | Queries, models, sessions, handoff, comparison and sandbox policy inspection. Read-only tasks. |
-| `review` | 40 | Queries plus preview, patch reads and verification. Read-only tasks. |
-| `implementation` | 51 | Full flow, including tests, authorized integration and discard. |
+| `full` (default) | 52 | All tools, preserving the existing configuration. |
+| `query` | 38 | Queries, models, sessions, handoff, comparison and sandbox policy inspection. Read-only tasks. |
+| `review` | 41 | Queries plus preview, patch reads and verification. Read-only tasks. |
+| `implementation` | 52 | Full flow, including tests, authorized integration and discard. |
 
 `black_gravity_health.toolProfile` reports the profile. Tools outside it are unregistered and direct calls are refused. `query` and `review` refuse `mode: "write"` and default to read-only when the mode is omitted. Sandboxing and integration approval still apply. Unknown profile values prevent startup.
 
@@ -22,6 +22,7 @@ Every tool publishes an `outputSchema` describing fields and types in its struct
 | `black_gravity_health` | Checks executable, version, apparent authentication and capabilities. |
 | `black_gravity_list_models` | Lists IDs returned by `agy models`. |
 | `black_gravity_capabilities` | Reports each CLI capability as observed, absent or unknown from version and help output only, whether the CLI exposes the model actually used, and recorded edit-tool restrictions. |
+| `black_gravity_resolve_model` | Resolves the `flash` or `argon` alias and requested effort to an exact ID from `agy models`, without substituting or downgrading, and reports effective-model observability. |
 | `black_gravity_get_model` / `black_gravity_set_model` | Reads or saves the default model. `null` selects Auto. |
 | `black_gravity_context` / `black_gravity_handoff` | Inspects and transfers plans, decisions, criteria and evidence to another role in an independent copy. |
 | `black_gravity_compare` / `black_gravity_comparison` | Requests reviews from two to four models and gathers findings, differences, failures and observed usage. |

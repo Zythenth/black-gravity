@@ -46,6 +46,7 @@ import { normalizeSandboxPolicy, resolveSandboxSelection, sandboxPolicyDigest, t
 import { executeWindowsTest, recoverWindowsExecutions, type WindowsExecution } from './windows-executor.js';
 import { detectBubblewrap, executeLinuxTest, type BubblewrapDetection, type LinuxExecution } from './linux-executor.js';
 import { portableNodeStatus, type PortableNodeStatus } from './portable-node.js';
+import { classifyInitModel, evaluateModelProof } from './model-resolution.js';
 
 const RESTORE_LIMITS = { maxDepth: 256, maxNodes: 5_000_000 };
 const RESUME_GUIDANCE = 'Pass the taskId of the task to continue, or a sessionId obtained from black_gravity_status';
@@ -241,6 +242,7 @@ export class TaskManager {
     }
     const interrupted = new Set<string>();
     const landed = new Set<string>();
+    const missingCopyProofTasks: InternalTask[] = [];
     this.pendingSnapshots = new Map();
     this.events.holdLogs();
     let published = false;
@@ -257,9 +259,14 @@ export class TaskManager {
         if (cached) Object.assign(item, cached);
         // The cache keeps this snapshot's own project; sharing one object between snapshots of the same copy happens only in memory.
         const ownProject = item.project;
+        let hadProjectProofMarker = false;
         if (item.project) {
-          if (!projects.has(item.project.copyDirectory)) projects.set(item.project.copyDirectory, item.project);
-          item.project = projects.get(item.project.copyDirectory);
+          hadProjectProofMarker = Boolean(item.project.modelProofFailure);
+          const shared = projects.get(item.project.copyDirectory) ?? item.project;
+          if (!projects.has(item.project.copyDirectory)) projects.set(item.project.copyDirectory, shared);
+          shared.modelProofFailure ??= item.project.modelProofFailure ?? this.modelProofFailure(item.record);
+          if (ownProject && shared.modelProofFailure) ownProject.modelProofFailure ??= shared.modelProofFailure;
+          item.project = shared;
         }
         // State written by earlier versions may hold unredacted results, reports, messages or tests; every returned field derives from the record.
         const restored = item.redacted ? undefined : sanitizePayload(item.record, RESTORE_LIMITS);
@@ -276,6 +283,7 @@ export class TaskManager {
         }
         const task: InternalTask = { record: item.record, options: item.options, ownerPid: item.ownerPid, project: item.project };
         this.tasks.set(item.record.taskId, task);
+        if (item.project && !hadProjectProofMarker) missingCopyProofTasks.push(task);
         const events = item.redacted ? item.events : restoredEvents(item.events);
         this.events.restore(item.record.taskId, events, item.cursor);
         // The cache keeps the full sanitized event list, before the in-memory buffer limit.
@@ -292,6 +300,11 @@ export class TaskManager {
             interrupted.add(item.record.taskId);
             this.finish(task, 'failed', 'SERVER_RESTARTED', 'Previous execution was interrupted; inspect its copy before starting new work');
           }
+        }
+      }
+      for (const task of missingCopyProofTasks) {
+        if (task.project?.modelProofFailure && !this.pendingSnapshots.has(task.record.taskId)) {
+          this.persist(task.record.taskId);
         }
       }
       // A transitioned task is never transitioned again, so its snapshot must land after the sibling updates its transition produced, or a failed rename would lose them.
@@ -672,6 +685,8 @@ export class TaskManager {
         contextProject = await this.withProject(contextSource.project, async () => {
           if (await fingerprintProjectCopy(contextSource.project!, this.config) !== options.handoff!.treeSha256) throw new BridgeError('CONTEXT_CHANGED', 'Context changed before copying');
           const fork = await forkProjectCopy(contextSource.project!, this.config);
+          const inheritedFailure = contextSource.project!.modelProofFailure ?? this.copyModelProofFailure(contextSource);
+          if (inheritedFailure) fork.modelProofFailure = inheritedFailure;
           if (await fingerprintProjectCopy(fork, this.config) !== options.handoff!.treeSha256 ||
             (await previewProjectCopy(fork, this.config)).sha256 !== options.handoff!.patchSha256) {
             await discardProjectCopy(fork);
@@ -931,15 +946,46 @@ export class TaskManager {
       return { taskId: task.taskId, model: task.model!, status: task.status, contextMatches,
         report: task.report?.role === 'reviewer' ? task.report : null, error: task.error ?? null, tokenUsage: task.tokenUsage };
     }));
+    const mismatchedTasks = tasks.filter(task => this.modelProofFailure(task) !== undefined);
+    const mismatchedTaskIds = new Set(mismatchedTasks.map(task => task.taskId));
+    const mismatchWarnings = mismatchedTasks.map(task =>
+      `Model proof failed for ${task.execution!.requested.model}: observed ${task.execution!.observed.model}; its opinion is excluded from the findings.`,
+    );
     return {
-      ...comparison, ready, complete: complete && opinions.every(opinion => opinion.contextMatches === true),
+      ...comparison, ready, complete: complete && mismatchedTaskIds.size === 0 && opinions.every(opinion => opinion.contextMatches === true),
       missingModels, contextStale: current === null || current.treeSha256 !== comparison.treeSha256 ||
         opinions.some(opinion => terminal.has(opinion.status) && opinion.contextMatches !== true),
       opinions,
-      findings: compareFindings(tasks.filter(task => opinions.some(opinion => opinion.taskId === task.taskId && opinion.contextMatches === true)), comparison.models),
+      findings: compareFindings(tasks.filter(task => !mismatchedTaskIds.has(task.taskId) && opinions.some(opinion => opinion.taskId === task.taskId && opinion.contextMatches === true)), comparison.models),
       warnings: ['Findings are model-reported with checked citations, not verified conclusions. Identical means exact matching findings only.',
-        'Missing findings, failed opinions and unverified fields do not demonstrate agreement. Codex must inspect and synthesize the reports before making recommendations.'],
+        'Missing findings, failed opinions and unverified fields do not demonstrate agreement. Codex must inspect and synthesize the reports before making recommendations.',
+        ...mismatchWarnings],
     };
+  }
+
+  private modelProofFailure(record: TaskRecord): string | undefined {
+    if (!record.execution) return undefined;
+    const proof = evaluateModelProof(record.execution);
+    return proof.verdict === 'mismatch' ? proof.detail : undefined;
+  }
+
+  private copyModelProofFailure(task: InternalTask): string | undefined {
+    if (task.project?.modelProofFailure) return task.project.modelProofFailure;
+    const ownFailure = this.modelProofFailure(task.record);
+    if (ownFailure) return ownFailure;
+    const copyDirectory = task.project?.copyDirectory;
+    if (!copyDirectory) return undefined;
+    for (const candidate of this.tasks.values()) {
+      if (candidate.project?.copyDirectory === copyDirectory) {
+        const failure = candidate.project?.modelProofFailure ?? this.modelProofFailure(candidate.record);
+        if (failure) return failure;
+      }
+    }
+    return undefined;
+  }
+
+  private modelProofFailureMessage(detail: string): string {
+    return detail.startsWith('Model proof failed') ? detail : `Model proof failed: ${detail}`;
   }
 
   async verify(taskId: string, expectedSha256: string, reviews: ReviewEvidence[] = []) {
@@ -951,6 +997,15 @@ export class TaskManager {
       const preview = await previewProjectCopy(task.project!, this.config);
       if (preview.sha256 !== expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Preview the current patch before verification');
       const verification = await verifyCriteria(task.project!, preview.sha256, task.record.acceptanceCriteria, reviews);
+      const proofFailure = this.copyModelProofFailure(task);
+      if (proofFailure) {
+        verification.checks.push({
+          criterionId: 'model-identity',
+          status: 'failed',
+          observation: proofFailure,
+        });
+        verification.status = 'failed';
+      }
       task.record.verification = verification;
       this.events.append(taskId, 'review.verified', { sha256: preview.sha256, status: verification.status });
       return verification;
@@ -965,6 +1020,10 @@ export class TaskManager {
         task.project.copyDirectory !== output.project.copyDirectory || !task.record.group || !output.record.group ||
         task.record.group.rootTaskId !== output.record.group.rootTaskId || task.record.integratedAt || task.record.discardedAt) {
       throw new BridgeError('WORKFLOW_TASK_UNAVAILABLE', 'Workflow requires completed retained outputs in the same conversation copy');
+    }
+    const proofFailure = this.copyModelProofFailure(task) ?? this.copyModelProofFailure(output);
+    if (proofFailure) {
+      throw new BridgeError('WORKFLOW_VALIDATION_FAILED', this.modelProofFailureMessage(proofFailure));
     }
     return this.withProject(task.project, async () => {
       const project = task.project!, preview = await previewProjectCopy(project, this.config), treeSha256 = await fingerprintProjectCopy(project, this.config);
@@ -999,6 +1058,10 @@ export class TaskManager {
   }
 
   private async requireVerification(task: InternalTask, sha256: string): Promise<void> {
+    const proofFailure = this.copyModelProofFailure(task);
+    if (proofFailure) {
+      throw new BridgeError('VERIFICATION_REQUIRED', this.modelProofFailureMessage(proofFailure));
+    }
     const previous = task.record.verification;
     if (!previous || previous.status !== 'passed') throw new BridgeError('VERIFICATION_REQUIRED', 'All acceptance criteria require artifact checks and grounded Codex review before integration');
     if (previous.sha256 !== sha256) throw new BridgeError('VERIFICATION_STALE', 'Verify the current patch before integration');
@@ -2022,9 +2085,20 @@ export class TaskManager {
             this.events.append(record.taskId, type, data, raw);
           },
           onInit: init => {
-            const observedModel = typeof init.model === 'string' ? init.model.trim() : '';
-            if (observedModel && record.execution) {
-              record.execution.observed = { model: observedModel.slice(0, 256), status: 'observed' };
+            const requested = record.execution?.requested.model ?? null;
+            const classification = classifyInitModel(requested, init.model);
+            if (record.execution && classification.observed.status === 'observed') {
+              record.execution.observed = classification.observed;
+            }
+            if (classification.mismatch) {
+              const failure = this.modelProofFailure(record);
+              if (failure) {
+                project.modelProofFailure ??= failure;
+              }
+              this.events.append(record.taskId, 'model.mismatch', {
+                requested,
+                observed: classification.observed.model,
+              });
             }
           },
           onSession: sessionId => {

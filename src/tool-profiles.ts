@@ -5,7 +5,7 @@ export type ToolProfile = z.infer<typeof toolProfileSchema>;
 const queryTools = new Set([
   'black_gravity_workflow_result', 'black_gravity_peer_receipts', 'black_gravity_wait_many', 'black_gravity_group_status', 'black_gravity_groups', 'black_gravity_group_wait', 'black_gravity_group_cancel',
   'black_gravity_memory_list', 'black_gravity_memory_read',
-  'black_gravity_health', 'black_gravity_get_agent_policy', 'black_gravity_list_models', 'black_gravity_capabilities', 'black_gravity_get_model', 'black_gravity_usage',
+  'black_gravity_health', 'black_gravity_get_agent_policy', 'black_gravity_list_models', 'black_gravity_capabilities', 'black_gravity_resolve_model', 'black_gravity_get_model', 'black_gravity_usage',
   'black_gravity_list_project_files', 'black_gravity_run', 'black_gravity_resume', 'black_gravity_status',
   'black_gravity_tasks', 'black_gravity_events', 'black_gravity_result', 'black_gravity_read_result',
   'black_gravity_cancel', 'black_gravity_sessions', 'black_gravity_wait', 'black_gravity_context', 'black_gravity_handoff',

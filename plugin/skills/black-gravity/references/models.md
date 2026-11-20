@@ -5,6 +5,7 @@ Reference for the [core skill](../SKILL.md). Open it when checking or saving the
 ## Model preference
 
 - Prefer `model` in `black_gravity_run` for per-task selection. `black_gravity_set_model` persists the default in private state for future tasks, including after a restart. `model: null` persists Auto. The order is the task's choice, the saved preference, `BRIDGE_DEFAULT_MODEL` and the agy default. Check `black_gravity_get_model` before reporting the current preference.
+- For Flash or Argon, use `black_gravity_resolve_model` and pass the returned `modelId`; on `effort-unavailable`, `alias-not-listed`, or `ambiguous`, stop and ask instead of downgrading; in `agy` 1.5.13, effective model and effort are not observable.
 
 ## Model comparison
 

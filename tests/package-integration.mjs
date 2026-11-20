@@ -109,7 +109,7 @@ function checkRuntimeStatus(command, args, label) {
 function checkPermissionsCommand(bin) {
   const output = execFileSync(process.execPath, [bin, 'permissions', '--host', 'claude-code', '--preset', 'delegation'], { cwd: directory, encoding: 'utf8' });
   const permissions = JSON.parse(output).permissions;
-  assert.equal(permissions.allow.length, 44);
+  assert.equal(permissions.allow.length, 45);
   assert.equal(permissions.ask.length, 7);
   assert.equal(permissions.deny.length, 0);
   assert.ok(permissions.ask.includes('mcp__black-gravity__black_gravity_integrate'));

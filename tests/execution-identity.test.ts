@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execSync, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { AGY_ADAPTER_VERSION } from '../src/agy-execution-adapter.js';
@@ -51,20 +53,37 @@ function createMockProcess(events: readonly unknown[], exitCode = 0): CliProcess
 class ControlledIdentityCliAdapter extends ControlledCliAdapter {
   spawnCalls = 0;
   nextEvents?: readonly unknown[];
+  listedModels: Model[] = [{ id: 'requested-model-1', name: 'Requested Model 1' }];
+  onSpawn?: (options: RunOptions, model: string | undefined, cwd: string, sessionId: string) => readonly unknown[] | void;
 
-  override spawnTask(options: RunOptions, _model: string | undefined, _cwd: string): CliProcess {
+  override spawnTask(options: RunOptions, model: string | undefined, cwd: string): CliProcess {
     this.spawnCalls += 1;
-    const sessionId = options.sessionId ?? 'session-default';
-    const events = this.nextEvents ?? [
+    const sessionId = options.sessionId ?? `session-${this.spawnCalls}`;
+    if (options.agentPolicy) {
+      const hook = spawnSync(process.execPath, ['bridge-execution-hook.mjs'], {
+        cwd: path.join(cwd, '.agents'),
+        windowsHide: true,
+        encoding: 'utf8',
+        input: JSON.stringify({
+          toolCall: { name: 'finish', args: {} },
+          workspacePaths: [cwd],
+          conversationId: sessionId,
+        }),
+      });
+      assert.equal(hook.status, 0, hook.stderr);
+      assert.equal(JSON.parse(hook.stdout).decision, 'allow');
+    }
+    const hookEvents = this.onSpawn?.(options, model, cwd, sessionId);
+    const events = hookEvents ?? this.nextEvents ?? [
       { event: 'init', conversation_id: sessionId },
       { event: 'result', result: { status: 'SUCCESS', conversation_id: sessionId, response: 'ok' } },
     ];
-    this.nextEvents = undefined;
+    if (!hookEvents) this.nextEvents = undefined;
     return createMockProcess(events);
   }
 
   override async listModels(): Promise<Model[]> {
-    return [{ id: 'requested-model-1', name: 'Requested Model 1' }];
+    return this.listedModels;
   }
 }
 
@@ -678,4 +697,1002 @@ test('StateStore strictly validates persisted execution identity and MCP outputs
       (err: unknown) => err instanceof BridgeError && err.code === 'INVALID_STATE',
     );
   }
+});
+
+test('treats init.model echo of requested model as not-observable across reload without model.mismatch event', async t => {
+  const ws = createWorkspace(t);
+  const cli = new ControlledIdentityCliAdapter(ws.config);
+  const tasks = ws.track(new TaskManager(cli, ws.config));
+
+  cli.nextEvents = [
+    { event: 'init', conversation_id: 'conv-echo-1', init: { model: 'requested-model-1' } },
+    { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-echo-1', response: 'done' } },
+  ];
+  const echoTask = await tasks.run({
+    prompt: 'echo init model',
+    workingDirectory: ws.repoDir,
+    model: 'requested-model-1',
+    effort: 'high',
+  });
+  const settledEcho = await waitForTask(tasks, echoTask.taskId);
+  assert.equal(settledEcho.status, 'completed');
+  assert.deepEqual(settledEcho.execution?.observed, { model: null, status: 'not-observable' });
+  assert.equal(
+    tasks.readEvents(echoTask.taskId).events.some(event => event.type === 'model.mismatch'),
+    false,
+  );
+
+  cli.nextEvents = [
+    { event: 'init', conversation_id: 'conv-echo-2', init: { model: '  requested-model-1  ' } },
+    { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-echo-2', response: 'done' } },
+  ];
+  const paddedEchoTask = await tasks.run({
+    prompt: 'padded echo init model',
+    workingDirectory: ws.repoDir,
+    model: 'requested-model-1',
+  });
+  const settledPadded = await waitForTask(tasks, paddedEchoTask.taskId);
+  assert.deepEqual(settledPadded.execution?.observed, { model: null, status: 'not-observable' });
+  assert.equal(
+    tasks.readEvents(paddedEchoTask.taskId).events.some(event => event.type === 'model.mismatch'),
+    false,
+  );
+
+  await tasks.shutdown();
+
+  const reloaded = new StateStore(ws.stateDir).load();
+  const reloadedEcho = reloaded.find(item => item.record.taskId === echoTask.taskId);
+  assert.ok(reloadedEcho);
+  assert.deepEqual(reloadedEcho.record.execution?.observed, { model: null, status: 'not-observable' });
+  assert.equal(reloadedEcho.events.some(event => event.type === 'model.mismatch'), false);
+});
+
+test('records observed model and emits model.mismatch when init.model differs from requested model', async t => {
+  const ws = createWorkspace(t);
+  const cli = new ControlledIdentityCliAdapter(ws.config);
+  const tasks = ws.track(new TaskManager(cli, ws.config));
+
+  cli.nextEvents = [
+    { event: 'init', conversation_id: 'conv-mismatch-1', init: { model: 'observed-model-x' } },
+    { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-mismatch-1', response: 'done' } },
+  ];
+  const task = await tasks.run({
+    prompt: 'mismatched init model',
+    workingDirectory: ws.repoDir,
+    model: 'requested-model-1',
+    effort: 'medium',
+  });
+  const settled = await waitForTask(tasks, task.taskId);
+  assert.equal(settled.status, 'completed');
+  assert.deepEqual(settled.execution?.observed, { model: 'observed-model-x', status: 'observed' });
+
+  const mismatchEvents = tasks.readEvents(task.taskId).events.filter(event => event.type === 'model.mismatch');
+  assert.equal(mismatchEvents.length, 1);
+  assert.deepEqual(mismatchEvents[0]!.data, { requested: 'requested-model-1', observed: 'observed-model-x' });
+
+  await tasks.shutdown();
+
+  const reloaded = new StateStore(ws.stateDir).load();
+  const entry = reloaded.find(item => item.record.taskId === task.taskId);
+  assert.ok(entry);
+  assert.deepEqual(entry.record.execution?.observed, { model: 'observed-model-x', status: 'observed' });
+  const reloadedMismatches = entry.events.filter(event => event.type === 'model.mismatch');
+  assert.equal(reloadedMismatches.length, 1);
+  assert.deepEqual(reloadedMismatches[0]!.data, { requested: 'requested-model-1', observed: 'observed-model-x' });
+});
+
+test('records observed model without model.mismatch when no model was requested', async t => {
+  const ws = createWorkspace(t);
+  const cli = new ControlledIdentityCliAdapter(ws.config);
+  const tasks = ws.track(new TaskManager(cli, ws.config));
+
+  cli.nextEvents = [
+    { event: 'init', conversation_id: 'conv-noreq-1', init: { model: 'observed-model-x' } },
+    { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-noreq-1', response: 'done' } },
+  ];
+  const task = await tasks.run({
+    prompt: 'no requested model with init model',
+    workingDirectory: ws.repoDir,
+  });
+  const settled = await waitForTask(tasks, task.taskId);
+  assert.equal(settled.status, 'completed');
+  assert.deepEqual(settled.execution?.requested, { model: null, effort: null });
+  assert.deepEqual(settled.execution?.observed, { model: 'observed-model-x', status: 'observed' });
+  assert.equal(
+    tasks.readEvents(task.taskId).events.some(event => event.type === 'model.mismatch'),
+    false,
+  );
+});
+
+test('verify fails with model-identity check and blocks integrate on mismatch, while echo passes without model-identity check', async t => {
+  const ws = createWorkspace(t);
+  const cli = new ControlledIdentityCliAdapter(ws.config);
+  const tasks = ws.track(new TaskManager(cli, ws.config));
+
+  const criteria = [
+    {
+      id: 'created',
+      description: 'Create OUTPUT.txt with expected text',
+      check: { kind: 'file-contains' as const, path: 'OUTPUT.txt', text: 'verified-output' },
+    },
+  ];
+  const reviews = [
+    {
+      criterionId: 'created',
+      verdict: 'passed' as const,
+      path: 'OUTPUT.txt',
+      line: 1,
+      quote: 'verified-output',
+      explanation: 'Confirmed created artifact content',
+    },
+  ];
+
+  cli.onSpawn = (_options, _model, cwd) => {
+    writeFileSync(path.join(cwd, 'OUTPUT.txt'), 'verified-output\n', 'utf8');
+    return [
+      { event: 'init', conversation_id: 'conv-verify-mismatch', init: { model: 'observed-model-x' } },
+      { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-verify-mismatch', response: 'done' } },
+    ];
+  };
+  const mismatched = await tasks.run({
+    prompt: 'write file with mismatched model',
+    workingDirectory: ws.repoDir,
+    model: 'requested-model-1',
+    acceptanceCriteria: criteria,
+  });
+  const settledMismatch = await waitForTask(tasks, mismatched.taskId);
+  assert.equal(settledMismatch.status, 'completed');
+
+  const mismatchPreview = await tasks.preview(settledMismatch.taskId, false);
+  const mismatchVerification = await tasks.verify(settledMismatch.taskId, mismatchPreview.sha256, reviews);
+  assert.equal(mismatchVerification.status, 'failed');
+  const identityCheck = mismatchVerification.checks.find(check => check.criterionId === 'model-identity');
+  assert.ok(identityCheck);
+  assert.equal(identityCheck.status, 'failed');
+  assert.match(identityCheck.observation, /requested-model-1/);
+  assert.match(identityCheck.observation, /observed-model-x/);
+  const verifiedEvent = tasks.readEvents(settledMismatch.taskId).events.filter(event => event.type === 'review.verified').at(-1);
+  assert.equal((verifiedEvent?.data as { status?: string } | undefined)?.status, 'failed');
+
+  await assert.rejects(
+    () => tasks.integrate(settledMismatch.taskId, mismatchPreview.sha256, async () => true),
+    (err: unknown) => err instanceof BridgeError && err.code === 'VERIFICATION_REQUIRED',
+  );
+
+  cli.onSpawn = (_options, _model, cwd) => {
+    writeFileSync(path.join(cwd, 'OUTPUT.txt'), 'verified-output\n', 'utf8');
+    return [
+      { event: 'init', conversation_id: 'conv-verify-echo', init: { model: 'requested-model-1' } },
+      { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-verify-echo', response: 'done' } },
+    ];
+  };
+  const echoed = await tasks.run({
+    prompt: 'write file with echoed model',
+    workingDirectory: ws.repoDir,
+    model: 'requested-model-1',
+    acceptanceCriteria: criteria,
+  });
+  const settledEcho = await waitForTask(tasks, echoed.taskId);
+  assert.equal(settledEcho.status, 'completed');
+
+  const echoPreview = await tasks.preview(settledEcho.taskId, false);
+  const echoVerification = await tasks.verify(settledEcho.taskId, echoPreview.sha256, reviews);
+  assert.equal(echoVerification.status, 'passed');
+  assert.equal(echoVerification.checks.some(check => check.criterionId === 'model-identity'), false);
+});
+
+test('comparison excludes mismatched model opinions, sets complete false, and emits proof warnings', async t => {
+  const ws = createWorkspace(t);
+  const cli = new ControlledIdentityCliAdapter(ws.config);
+  cli.listedModels = [
+    { id: 'requested-model-1', name: 'Requested Model 1' },
+    { id: 'requested-model-2', name: 'Requested Model 2' },
+  ];
+  const tasks = ws.track(new TaskManager(cli, ws.config));
+
+  const source = await tasks.run({
+    prompt: 'source task for comparison',
+    workingDirectory: ws.repoDir,
+    mode: 'read-only',
+  });
+  const settledSource = await waitForTask(tasks, source.taskId);
+  assert.equal(settledSource.status, 'completed');
+  const context = await tasks.context(settledSource.taskId);
+
+  const reviewReport = (message: string) => ({
+    summary: 'Review complete',
+    reviewedFiles: ['README.md'],
+    findings: [
+      {
+        severity: 'P2' as const,
+        path: 'README.md',
+        line: 1,
+        quote: 'hello',
+        message,
+        impact: 'Test impact',
+        suggestion: 'Test suggestion',
+      },
+    ],
+    unverified: [],
+  });
+
+  cli.onSpawn = (options, model) => {
+    const convId = options.sessionId ?? `cmp-${model}`;
+    const observed = model === 'requested-model-1' ? 'observed-wrong-1' : 'observed-wrong-2';
+    return [
+      { event: 'init', conversation_id: convId, init: { model: observed } },
+      {
+        event: 'result',
+        result: {
+          status: 'SUCCESS',
+          conversation_id: convId,
+          structured_output: reviewReport(`Finding from ${model}`),
+        },
+      },
+    ];
+  };
+  const bothMismatch = await tasks.compare(
+    settledSource.taskId,
+    context.treeSha256,
+    ['requested-model-1', 'requested-model-2'],
+    'Compare both mismatched',
+  );
+  for (const taskId of bothMismatch.taskIds) {
+    assert.equal((await waitForTask(tasks, taskId)).status, 'completed');
+  }
+  const bothResult = successOutputSchemas.black_gravity_comparison.parse(await tasks.comparison(bothMismatch.comparisonId));
+  assert.equal(bothResult.ready, true);
+  assert.equal(bothResult.complete, false);
+  assert.deepEqual(bothResult.findings, []);
+  assert.ok(
+    bothResult.warnings.includes(
+      'Model proof failed for requested-model-1: observed observed-wrong-1; its opinion is excluded from the findings.',
+    ),
+  );
+  assert.ok(
+    bothResult.warnings.includes(
+      'Model proof failed for requested-model-2: observed observed-wrong-2; its opinion is excluded from the findings.',
+    ),
+  );
+
+  cli.onSpawn = (options, model) => {
+    const convId = options.sessionId ?? `cmp-ctrl-${model}`;
+    const observed = model === 'requested-model-1' ? 'requested-model-1' : 'observed-wrong-2';
+    return [
+      { event: 'init', conversation_id: convId, init: { model: observed } },
+      {
+        event: 'result',
+        result: {
+          status: 'SUCCESS',
+          conversation_id: convId,
+          structured_output: reviewReport('Control finding'),
+        },
+      },
+    ];
+  };
+  const oneMismatch = await tasks.compare(
+    settledSource.taskId,
+    context.treeSha256,
+    ['requested-model-1', 'requested-model-2'],
+    'Compare one mismatched',
+  );
+  for (const taskId of oneMismatch.taskIds) {
+    assert.equal((await waitForTask(tasks, taskId)).status, 'completed');
+  }
+  const oneResult = successOutputSchemas.black_gravity_comparison.parse(await tasks.comparison(oneMismatch.comparisonId));
+  assert.equal(oneResult.ready, true);
+  assert.equal(oneResult.complete, false);
+  assert.equal(oneResult.findings.length, 1);
+  assert.deepEqual(
+    oneResult.findings[0]!.opinions.map(opinion => opinion.model),
+    ['requested-model-1'],
+  );
+  assert.deepEqual(oneResult.findings[0]!.notReportedBy, ['requested-model-2']);
+  assert.ok(
+    oneResult.warnings.includes(
+      'Model proof failed for requested-model-2: observed observed-wrong-2; its opinion is excluded from the findings.',
+    ),
+  );
+  assert.equal(
+    oneResult.warnings.some(warning => warning.includes('Model proof failed for requested-model-1:')),
+    false,
+  );
+});
+
+test('integrate rejects a pre-existing passed verification when the reloaded task has a model mismatch', async t => {
+  const ws = createWorkspace(t);
+  const cli = new ControlledIdentityCliAdapter(ws.config);
+  const tasks = ws.track(new TaskManager(cli, ws.config));
+
+  const criteria = [
+    {
+      id: 'created',
+      description: 'Create OUTPUT.txt with expected text',
+      check: { kind: 'file-contains' as const, path: 'OUTPUT.txt', text: 'verified-output' },
+    },
+  ];
+  const reviews = [
+    {
+      criterionId: 'created',
+      verdict: 'passed' as const,
+      path: 'OUTPUT.txt',
+      line: 1,
+      quote: 'verified-output',
+      explanation: 'Confirmed created artifact content',
+    },
+  ];
+
+  cli.onSpawn = (_options, _model, cwd) => {
+    writeFileSync(path.join(cwd, 'OUTPUT.txt'), 'verified-output\n', 'utf8');
+    return [
+      { event: 'init', conversation_id: 'conv-stale-verify', init: { model: 'observed-model-x' } },
+      { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-stale-verify', response: 'done' } },
+    ];
+  };
+  const task = await tasks.run({
+    prompt: 'write file with mismatch and legacy passed verification',
+    workingDirectory: ws.repoDir,
+    model: 'requested-model-1',
+    acceptanceCriteria: criteria,
+  });
+  const settled = await waitForTask(tasks, task.taskId);
+  assert.equal(settled.status, 'completed');
+
+  const preview = await tasks.preview(settled.taskId, false);
+  const verified = await tasks.verify(settled.taskId, preview.sha256, reviews);
+  assert.equal(verified.status, 'failed');
+  await tasks.shutdown();
+
+  // Simulate an older persisted snapshot where verification.status was recorded as 'passed' despite model mismatch.
+  const snapshotPath = path.join(ws.stateDir, `${settled.taskId}.json`);
+  const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as {
+    record: {
+      verification?: {
+        status: string;
+        checks: Array<{ criterionId: string; status: string; observation: string }>;
+      };
+    };
+  };
+  assert.ok(snapshot.record.verification);
+  snapshot.record.verification.checks = snapshot.record.verification.checks.filter(
+    check => check.criterionId !== 'model-identity',
+  );
+  snapshot.record.verification.status = 'passed';
+  writeFileSync(snapshotPath, JSON.stringify(snapshot), 'utf8');
+
+  const reloaded = ws.track(new TaskManager(cli, ws.config));
+  assert.equal(reloaded.status(settled.taskId).verification?.status, 'passed');
+
+  await assert.rejects(
+    () => reloaded.integrate(settled.taskId, preview.sha256, async () => true),
+    (err: unknown) =>
+      err instanceof BridgeError &&
+      err.code === 'VERIFICATION_REQUIRED' &&
+      err.message.includes('Model proof failed') &&
+      !err.message.includes('Model proof failed: Model proof failed'),
+  );
+});
+
+test('workflowSnapshot fails with WORKFLOW_VALIDATION_FAILED on mismatched output task and succeeds without mismatch', async t => {
+  const ws = createWorkspace(t);
+  const cli = new ControlledIdentityCliAdapter(ws.config);
+  const tasks = ws.track(new TaskManager(cli, ws.config));
+  const repoDir = realpathSync(ws.repoDir);
+
+  const criterion = { id: 'readme', description: 'README exists', check: { kind: 'file-exists' as const, path: 'README.md' } };
+  const makeWorkflow = (firstPrompt: string, finalPrompt: string) => ({
+    workingDirectory: repoDir,
+    title: 'Workflow model proof fixture',
+    workflow: { finalNode: 'final' },
+    jobs: [
+      {
+        key: 'first',
+        owner: 'implementer',
+        dependsOn: [],
+        task: { prompt: firstPrompt, mode: 'read-only' as const, model: 'requested-model-1', acceptanceCriteria: [criterion] },
+      },
+      {
+        key: 'final',
+        owner: 'implementer',
+        dependsOn: ['first'],
+        task: { prompt: finalPrompt, mode: 'read-only' as const, model: 'requested-model-1', acceptanceCriteria: [criterion] },
+      },
+    ],
+  });
+
+  const until = async (predicate: () => boolean, timeoutMs = 30000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error('Timed out waiting for workflow state');
+      await delay(20);
+    }
+  };
+
+  cli.onSpawn = (_options, _model, _cwd, sessionId) => [
+    { event: 'init', conversation_id: sessionId, init: { model: 'observed-model-x' } },
+    {
+      event: 'result',
+      result: { status: 'SUCCESS', conversation_id: sessionId, structured_output: { summary: 'done' } },
+    },
+  ];
+  const mismatchGroup = await tasks.groups.create(randomUUID(), makeWorkflow('step with mismatch', 'final mismatch'));
+  tasks.groups.start(mismatchGroup.groupId, mismatchGroup.definitionSha256);
+  await until(() => tasks.groups.status(mismatchGroup.groupId).state === 'paused');
+  const pausedStatus = tasks.groups.status(mismatchGroup.groupId);
+  assert.equal(pausedStatus.error?.code, 'WORKFLOW_VALIDATION_FAILED');
+  const mismatchTaskId = pausedStatus.nodes[0]!.taskId!;
+
+  await assert.rejects(
+    () => tasks.workflowSnapshot(mismatchTaskId, mismatchTaskId, 'first'),
+    (err: unknown) =>
+      err instanceof BridgeError &&
+      err.code === 'WORKFLOW_VALIDATION_FAILED' &&
+      err.message.includes('Model proof failed') &&
+      !err.message.includes('Model proof failed: Model proof failed'),
+  );
+
+  cli.onSpawn = (_options, _model, _cwd, sessionId) => [
+    { event: 'init', conversation_id: sessionId, init: { model: 'requested-model-1' } },
+    {
+      event: 'result',
+      result: { status: 'SUCCESS', conversation_id: sessionId, structured_output: { summary: 'done' } },
+    },
+  ];
+  const controlGroup = await tasks.groups.create(randomUUID(), makeWorkflow('step with echo', 'final echo'));
+  tasks.groups.start(controlGroup.groupId, controlGroup.definitionSha256);
+  await until(() => tasks.groups.status(controlGroup.groupId).state === 'completed');
+  const controlTaskId = tasks.groups.status(controlGroup.groupId).nodes[0]!.taskId!;
+
+  const snapshot = await tasks.workflowSnapshot(controlTaskId, controlTaskId, 'first');
+  assert.equal(snapshot.phase, 'validated');
+});
+
+test('native-test continuation inherits copy-wide model mismatch in verify and integrate, while echo passes', async t => {
+  const ws = createWorkspace(t);
+  const cli = new ControlledIdentityCliAdapter(ws.config);
+  const tasks = ws.track(new TaskManager(cli, ws.config));
+
+  const criteria = [
+    {
+      id: 'created',
+      description: 'Create OUTPUT.txt with expected text',
+      check: { kind: 'file-contains' as const, path: 'OUTPUT.txt', text: 'verified-output' },
+    },
+  ];
+  const reviews = [
+    {
+      criterionId: 'created',
+      verdict: 'passed' as const,
+      path: 'OUTPUT.txt',
+      line: 1,
+      quote: 'verified-output',
+      explanation: 'Confirmed created artifact content',
+    },
+  ];
+
+  const runWriteAndRetest = async (initModel: string, sessionId: string) => {
+    cli.onSpawn = (_options, _model, cwd) => {
+      writeFileSync(path.join(cwd, 'OUTPUT.txt'), 'verified-output\n', 'utf8');
+      return [
+        { event: 'init', conversation_id: sessionId, init: { model: initModel } },
+        { event: 'result', result: { status: 'SUCCESS', conversation_id: sessionId, response: 'done' } },
+      ];
+    };
+    const writeTask = await tasks.run({
+      prompt: `write file (${sessionId})`,
+      workingDirectory: ws.repoDir,
+      model: 'requested-model-1',
+      acceptanceCriteria: criteria,
+    });
+    const settledWrite = await waitForTask(tasks, writeTask.taskId);
+    assert.equal(settledWrite.status, 'completed');
+    const writePreview = await tasks.preview(settledWrite.taskId, false);
+
+    cli.onSpawn = (options, _model, cwd) => {
+      const match = options.prompt.match(/<bridge-test-command>(.*?)<\/bridge-test-command>/s);
+      assert.ok(match);
+      const req = JSON.parse(match[1]!) as { commandLine: string };
+      const output = execSync(req.commandLine, {
+        cwd,
+        encoding: 'utf8',
+        windowsHide: true,
+        shell: process.platform === 'win32' ? 'powershell.exe' : '/bin/sh',
+      });
+      return [
+        { event: 'init', conversation_id: sessionId },
+        {
+          event: 'step_update',
+          step_update: {
+            step_index: 0,
+            state: 'DONE',
+            step_type: 'tool',
+            tool_name: 'run_command',
+            tool_info: { name: 'run_command', parameters: { CommandLine: req.commandLine }, output },
+          },
+        },
+        { event: 'result', result: { status: 'SUCCESS', conversation_id: sessionId, response: 'tests passed' } },
+      ];
+    };
+    const retest = await tasks.startTests(
+      settledWrite.taskId,
+      writePreview.sha256,
+      { executable: process.execPath, args: ['-e', 'process.exit(0)'] },
+    );
+    const settledRetest = await waitForTask(tasks, retest.taskId);
+    assert.equal(settledRetest.status, 'completed', JSON.stringify(settledRetest.error));
+    assert.deepEqual(settledRetest.execution?.observed, { model: null, status: 'not-observable' });
+    const retestPreview = await tasks.preview(settledRetest.taskId, false);
+    return { settledRetest, retestPreview };
+  };
+
+  const mismatched = await runWriteAndRetest('observed-model-x', 'conv-copy-mismatch');
+  const mismatchedVerification = await tasks.verify(
+    mismatched.settledRetest.taskId,
+    mismatched.retestPreview.sha256,
+    reviews,
+  );
+  assert.equal(mismatchedVerification.status, 'failed');
+  assert.equal(
+    mismatchedVerification.checks.find(check => check.criterionId === 'model-identity')?.status,
+    'failed',
+  );
+  await assert.rejects(
+    () => tasks.integrate(mismatched.settledRetest.taskId, mismatched.retestPreview.sha256, async () => true),
+    (err: unknown) =>
+      err instanceof BridgeError &&
+      err.code === 'VERIFICATION_REQUIRED' &&
+      err.message.includes('Model proof failed') &&
+      !err.message.includes('Model proof failed: Model proof failed'),
+  );
+
+  const echoed = await runWriteAndRetest('requested-model-1', 'conv-copy-echo');
+  const echoedVerification = await tasks.verify(
+    echoed.settledRetest.taskId,
+    echoed.retestPreview.sha256,
+    reviews,
+  );
+  assert.equal(echoedVerification.status, 'passed');
+  assert.equal(echoedVerification.checks.some(check => check.criterionId === 'model-identity'), false);
+  const integrated = await tasks.integrate(echoed.settledRetest.taskId, echoed.retestPreview.sha256, async () => true);
+  assert.equal(integrated.summary.added, 1);
+});
+
+test('copy-level modelProofFailure survives retention eviction and StateStore reload', async t => {
+  const ws = createWorkspace(t);
+  const lowRetentionConfig = loadConfig({
+    BRIDGE_ANTI_AI_CRAFT: 'off',
+    BRIDGE_STATE_DIRECTORY: ws.stateDir,
+    BRIDGE_TEST_EXECUTOR: 'agy',
+    AGY_PATH: process.execPath,
+    MAX_RETAINED_TASKS: '1',
+  });
+  const cli = new ControlledIdentityCliAdapter(lowRetentionConfig);
+  const tasks = ws.track(new TaskManager(cli, lowRetentionConfig));
+
+  const criteria = [
+    {
+      id: 'created',
+      description: 'Create OUTPUT.txt with expected text',
+      check: { kind: 'file-contains' as const, path: 'OUTPUT.txt', text: 'verified-output' },
+    },
+  ];
+  const reviews = [
+    {
+      criterionId: 'created',
+      verdict: 'passed' as const,
+      path: 'OUTPUT.txt',
+      line: 1,
+      quote: 'verified-output',
+      explanation: 'Confirmed created artifact content',
+    },
+  ];
+
+  cli.onSpawn = (_options, _model, cwd) => {
+    writeFileSync(path.join(cwd, 'OUTPUT.txt'), 'verified-output\n', 'utf8');
+    return [
+      { event: 'init', conversation_id: 'conv-evict-a', init: { model: 'observed-model-x' } },
+      { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-evict-a', response: 'done' } },
+    ];
+  };
+  const taskA = await tasks.run({
+    prompt: 'write file with mismatch before eviction',
+    workingDirectory: ws.repoDir,
+    model: 'requested-model-1',
+    acceptanceCriteria: criteria,
+  });
+  const settledA = await waitForTask(tasks, taskA.taskId);
+  assert.equal(settledA.status, 'completed');
+
+  cli.onSpawn = () => [
+    { event: 'init', conversation_id: 'conv-evict-a', init: { model: 'requested-model-1' } },
+    { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-evict-a', response: 'resumed ok' } },
+  ];
+  const taskB = await tasks.resume(
+    {
+      prompt: 'resume on same copy and evict A',
+      workingDirectory: ws.repoDir,
+      model: 'requested-model-1',
+    },
+    settledA.taskId,
+  );
+  const settledB = await waitForTask(tasks, taskB.taskId);
+  assert.equal(settledB.status, 'completed');
+  assert.deepEqual(settledB.execution?.observed, { model: null, status: 'not-observable' });
+
+  assert.equal(tasks.list().some(item => item.taskId === settledA.taskId), false);
+  assert.throws(
+    () => tasks.status(settledA.taskId),
+    (err: unknown) => err instanceof BridgeError && err.code === 'TASK_NOT_FOUND',
+  );
+
+  const previewB = await tasks.preview(settledB.taskId, false);
+  const verifiedB = await tasks.verify(settledB.taskId, previewB.sha256, reviews);
+  assert.equal(verifiedB.status, 'failed');
+  assert.equal(verifiedB.checks.find(check => check.criterionId === 'model-identity')?.status, 'failed');
+  await assert.rejects(
+    () => tasks.integrate(settledB.taskId, previewB.sha256, async () => true),
+    (err: unknown) =>
+      err instanceof BridgeError &&
+      err.code === 'VERIFICATION_REQUIRED' &&
+      err.message.includes('Model proof failed'),
+  );
+
+  await tasks.shutdown();
+
+  const reloadedEntries = new StateStore(ws.stateDir).load();
+  const storedB = reloadedEntries.find(item => item.record.taskId === settledB.taskId);
+  assert.ok(storedB?.project?.modelProofFailure);
+  assert.match(storedB.project.modelProofFailure, /Model proof failed/);
+
+  const reloadedTasks = ws.track(new TaskManager(cli, lowRetentionConfig));
+  const reloadedVerified = await reloadedTasks.verify(settledB.taskId, previewB.sha256, reviews);
+  assert.equal(reloadedVerified.status, 'failed');
+  assert.equal(reloadedVerified.checks.find(check => check.criterionId === 'model-identity')?.status, 'failed');
+  await assert.rejects(
+    () => reloadedTasks.integrate(settledB.taskId, previewB.sha256, async () => true),
+    (err: unknown) =>
+      err instanceof BridgeError &&
+      err.code === 'VERIFICATION_REQUIRED' &&
+      err.message.includes('Model proof failed'),
+  );
+});
+
+test('handoff fork inherits copy-level modelProofFailure even when forked task echoes requested model', async t => {
+  const ws = createWorkspace(t);
+  const cli = new ControlledIdentityCliAdapter(ws.config);
+  const tasks = ws.track(new TaskManager(cli, ws.config));
+
+  const criteria = [
+    {
+      id: 'created',
+      description: 'Create OUTPUT.txt with expected text',
+      check: { kind: 'file-contains' as const, path: 'OUTPUT.txt', text: 'verified-output' },
+    },
+  ];
+  const reviews = [
+    {
+      criterionId: 'created',
+      verdict: 'passed' as const,
+      path: 'OUTPUT.txt',
+      line: 1,
+      quote: 'verified-output',
+      explanation: 'Confirmed created artifact content',
+    },
+  ];
+
+  cli.onSpawn = (_options, _model, cwd) => {
+    writeFileSync(path.join(cwd, 'OUTPUT.txt'), 'verified-output\n', 'utf8');
+    return [
+      { event: 'init', conversation_id: 'conv-handoff-src', init: { model: 'observed-model-x' } },
+      { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-handoff-src', response: 'done' } },
+    ];
+  };
+  const source = await tasks.run({
+    prompt: 'source write task with mismatch',
+    workingDirectory: ws.repoDir,
+    model: 'requested-model-1',
+    acceptanceCriteria: criteria,
+  });
+  const settledSource = await waitForTask(tasks, source.taskId);
+  assert.equal(settledSource.status, 'completed');
+
+  const ctx = await tasks.context(settledSource.taskId);
+  cli.onSpawn = () => [
+    { event: 'init', conversation_id: 'conv-handoff-fork', init: { model: 'requested-model-1' } },
+    { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-handoff-fork', response: 'fork done' } },
+  ];
+  const forked = await tasks.run({
+    contextTaskId: settledSource.taskId,
+    expectedContextSha256: ctx.treeSha256,
+    prompt: 'handoff implementer task with echo',
+    workingDirectory: ws.repoDir,
+    role: 'implementer',
+    model: 'requested-model-1',
+  });
+  const settledFork = await waitForTask(tasks, forked.taskId);
+  assert.equal(settledFork.status, 'completed');
+  assert.notEqual(settledFork.copyDirectory, settledSource.copyDirectory);
+  assert.deepEqual(settledFork.execution?.observed, { model: null, status: 'not-observable' });
+
+  const forkPreview = await tasks.preview(settledFork.taskId, false);
+  const forkVerified = await tasks.verify(settledFork.taskId, forkPreview.sha256, reviews);
+  assert.equal(forkVerified.status, 'failed');
+  assert.equal(forkVerified.checks.find(check => check.criterionId === 'model-identity')?.status, 'failed');
+  await assert.rejects(
+    () => tasks.integrate(settledFork.taskId, forkPreview.sha256, async () => true),
+    (err: unknown) =>
+      err instanceof BridgeError &&
+      err.code === 'VERIFICATION_REQUIRED' &&
+      err.message.includes('Model proof failed'),
+  );
+
+  await tasks.shutdown();
+  const storedFork = new StateStore(ws.stateDir).load().find(item => item.record.taskId === settledFork.taskId);
+  assert.ok(storedFork?.project?.modelProofFailure);
+  assert.match(storedFork.project.modelProofFailure, /Model proof failed/);
+});
+
+test('reloaded legacy mismatch snapshot without project.modelProofFailure blocks verify and integrate after eviction', async t => {
+  const criteria = [
+    {
+      id: 'created',
+      description: 'Create OUTPUT.txt with expected text',
+      check: { kind: 'file-contains' as const, path: 'OUTPUT.txt', text: 'verified-output' },
+    },
+  ];
+  const reviews = [
+    {
+      criterionId: 'created',
+      verdict: 'passed' as const,
+      path: 'OUTPUT.txt',
+      line: 1,
+      quote: 'verified-output',
+      explanation: 'Confirmed created artifact content',
+    },
+  ];
+
+  {
+    const ws = createWorkspace(t);
+    const lowRetentionConfig = loadConfig({
+      BRIDGE_ANTI_AI_CRAFT: 'off',
+      BRIDGE_STATE_DIRECTORY: ws.stateDir,
+      BRIDGE_TEST_EXECUTOR: 'agy',
+      AGY_PATH: process.execPath,
+      MAX_RETAINED_TASKS: '1',
+    });
+    const cli = new ControlledIdentityCliAdapter(lowRetentionConfig);
+    const initialTasks = ws.track(new TaskManager(cli, lowRetentionConfig));
+
+    cli.onSpawn = (_options, _model, cwd) => {
+      writeFileSync(path.join(cwd, 'OUTPUT.txt'), 'verified-output\n', 'utf8');
+      return [
+        { event: 'init', conversation_id: 'conv-legacy-evict', init: { model: 'observed-model-x' } },
+        { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-legacy-evict', response: 'done' } },
+      ];
+    };
+    const taskA = await initialTasks.run({
+      prompt: 'legacy mismatch task before reload',
+      workingDirectory: ws.repoDir,
+      model: 'requested-model-1',
+      acceptanceCriteria: criteria,
+    });
+    const settledA = await waitForTask(initialTasks, taskA.taskId);
+    assert.equal(settledA.status, 'completed');
+    await initialTasks.shutdown();
+
+    const snapshotPath = path.join(ws.stateDir, `${settledA.taskId}.json`);
+    const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as {
+      project?: { modelProofFailure?: string };
+    };
+    assert.ok(snapshot.project?.modelProofFailure);
+    delete snapshot.project.modelProofFailure;
+    writeFileSync(snapshotPath, JSON.stringify(snapshot), 'utf8');
+
+    const storedBeforeReload = new StateStore(ws.stateDir).load().find(item => item.record.taskId === settledA.taskId);
+    assert.equal(storedBeforeReload?.project?.modelProofFailure, undefined);
+    assert.deepEqual(storedBeforeReload?.record.execution?.observed, { model: 'observed-model-x', status: 'observed' });
+
+    const reloadedTasks = ws.track(new TaskManager(cli, lowRetentionConfig));
+    cli.onSpawn = () => [
+      { event: 'init', conversation_id: 'conv-legacy-evict', init: { model: 'requested-model-1' } },
+      { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-legacy-evict', response: 'resumed ok' } },
+    ];
+    const taskB = await reloadedTasks.resume(
+      {
+        prompt: 'resume reloaded legacy mismatch and evict A',
+        workingDirectory: ws.repoDir,
+        model: 'requested-model-1',
+      },
+      settledA.taskId,
+    );
+    const settledB = await waitForTask(reloadedTasks, taskB.taskId);
+    assert.equal(settledB.status, 'completed');
+    assert.equal(reloadedTasks.list().some(item => item.taskId === settledA.taskId), false);
+
+    const previewB = await reloadedTasks.preview(settledB.taskId, false);
+    const verifiedB = await reloadedTasks.verify(settledB.taskId, previewB.sha256, reviews);
+    assert.equal(verifiedB.status, 'failed');
+    assert.equal(verifiedB.checks.find(check => check.criterionId === 'model-identity')?.status, 'failed');
+    await assert.rejects(
+      () => reloadedTasks.integrate(settledB.taskId, previewB.sha256, async () => true),
+      (err: unknown) =>
+        err instanceof BridgeError &&
+        err.code === 'VERIFICATION_REQUIRED' &&
+        err.message.includes('Model proof failed'),
+    );
+  }
+
+  {
+    const ws = createWorkspace(t);
+    const lowRetentionConfig = loadConfig({
+      BRIDGE_ANTI_AI_CRAFT: 'off',
+      BRIDGE_STATE_DIRECTORY: ws.stateDir,
+      BRIDGE_TEST_EXECUTOR: 'agy',
+      AGY_PATH: process.execPath,
+      MAX_RETAINED_TASKS: '1',
+    });
+    const cli = new ControlledIdentityCliAdapter(lowRetentionConfig);
+    const initialTasks = ws.track(new TaskManager(cli, lowRetentionConfig));
+
+    cli.onSpawn = (_options, _model, cwd) => {
+      writeFileSync(path.join(cwd, 'OUTPUT.txt'), 'verified-output\n', 'utf8');
+      return [
+        { event: 'init', conversation_id: 'conv-legacy-ctrl', init: { model: 'requested-model-1' } },
+        { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-legacy-ctrl', response: 'done' } },
+      ];
+    };
+    const taskC = await initialTasks.run({
+      prompt: 'control non-mismatch task before reload',
+      workingDirectory: ws.repoDir,
+      model: 'requested-model-1',
+      acceptanceCriteria: criteria,
+    });
+    const settledC = await waitForTask(initialTasks, taskC.taskId);
+    assert.equal(settledC.status, 'completed');
+    await initialTasks.shutdown();
+
+    const storedControl = new StateStore(ws.stateDir).load().find(item => item.record.taskId === settledC.taskId);
+    assert.equal(storedControl?.project?.modelProofFailure, undefined);
+
+    const reloadedTasks = ws.track(new TaskManager(cli, lowRetentionConfig));
+    cli.onSpawn = () => [
+      { event: 'init', conversation_id: 'conv-legacy-ctrl', init: { model: 'requested-model-1' } },
+      { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-legacy-ctrl', response: 'resumed ok' } },
+    ];
+    const taskD = await reloadedTasks.resume(
+      {
+        prompt: 'resume reloaded control and evict C',
+        workingDirectory: ws.repoDir,
+        model: 'requested-model-1',
+      },
+      settledC.taskId,
+    );
+    const settledD = await waitForTask(reloadedTasks, taskD.taskId);
+    assert.equal(settledD.status, 'completed');
+    assert.equal(reloadedTasks.list().some(item => item.taskId === settledC.taskId), false);
+
+    const previewD = await reloadedTasks.preview(settledD.taskId, false);
+    const verifiedD = await reloadedTasks.verify(settledD.taskId, previewD.sha256, reviews);
+    assert.equal(verifiedD.status, 'passed');
+    assert.equal(verifiedD.checks.some(check => check.criterionId === 'model-identity'), false);
+    const integratedD = await reloadedTasks.integrate(settledD.taskId, previewD.sha256, async () => true);
+    assert.equal(integratedD.summary.added, 1);
+  }
+});
+
+test('reloaded legacy mismatch A and echo continuation B persist project.modelProofFailure onto B so evicting A by C survives refresh', async t => {
+  const ws = createWorkspace(t);
+  const retention2Config = loadConfig({
+    BRIDGE_ANTI_AI_CRAFT: 'off',
+    BRIDGE_STATE_DIRECTORY: ws.stateDir,
+    BRIDGE_TEST_EXECUTOR: 'agy',
+    AGY_PATH: process.execPath,
+    MAX_RETAINED_TASKS: '2',
+  });
+  const cli = new ControlledIdentityCliAdapter(retention2Config);
+  const initialTasks = ws.track(new TaskManager(cli, retention2Config));
+
+  const criteria = [
+    {
+      id: 'created',
+      description: 'Create OUTPUT.txt with expected text',
+      check: { kind: 'file-contains' as const, path: 'OUTPUT.txt', text: 'verified-output' },
+    },
+  ];
+  const reviews = [
+    {
+      criterionId: 'created',
+      verdict: 'passed' as const,
+      path: 'OUTPUT.txt',
+      line: 1,
+      quote: 'verified-output',
+      explanation: 'Confirmed created artifact content',
+    },
+  ];
+
+  cli.onSpawn = (_options, _model, cwd) => {
+    writeFileSync(path.join(cwd, 'OUTPUT.txt'), 'verified-output\n', 'utf8');
+    return [
+      { event: 'init', conversation_id: 'conv-ab-legacy', init: { model: 'observed-model-x' } },
+      { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-ab-legacy', response: 'done A' } },
+    ];
+  };
+  const taskA = await initialTasks.run({
+    prompt: 'legacy task A with mismatch',
+    workingDirectory: ws.repoDir,
+    model: 'requested-model-1',
+    acceptanceCriteria: criteria,
+  });
+  const settledA = await waitForTask(initialTasks, taskA.taskId);
+  assert.equal(settledA.status, 'completed');
+
+  cli.onSpawn = () => [
+    { event: 'init', conversation_id: 'conv-ab-legacy', init: { model: 'requested-model-1' } },
+    { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-ab-legacy', response: 'done B' } },
+  ];
+  const taskB = await initialTasks.resume(
+    {
+      prompt: 'legacy continuation B with echo',
+      workingDirectory: ws.repoDir,
+      model: 'requested-model-1',
+    },
+    settledA.taskId,
+  );
+  const settledB = await waitForTask(initialTasks, taskB.taskId);
+  assert.equal(settledB.status, 'completed');
+  assert.equal(settledB.copyDirectory, settledA.copyDirectory);
+  assert.deepEqual(settledB.execution?.observed, { model: null, status: 'not-observable' });
+  await initialTasks.shutdown();
+
+  for (const taskId of [settledA.taskId, settledB.taskId]) {
+    const file = path.join(ws.stateDir, `${taskId}.json`);
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as { project?: { modelProofFailure?: string } };
+    delete parsed.project?.modelProofFailure;
+    writeFileSync(file, JSON.stringify(parsed), 'utf8');
+  }
+  const beforeReload = new StateStore(ws.stateDir).load();
+  assert.equal(beforeReload.find(item => item.record.taskId === settledA.taskId)?.project?.modelProofFailure, undefined);
+  assert.equal(beforeReload.find(item => item.record.taskId === settledB.taskId)?.project?.modelProofFailure, undefined);
+
+  const reloadedTasks = ws.track(new TaskManager(cli, retention2Config));
+  const diskB = JSON.parse(readFileSync(path.join(ws.stateDir, `${settledB.taskId}.json`), 'utf8')) as {
+    project?: { modelProofFailure?: string };
+  };
+  assert.ok(diskB.project?.modelProofFailure);
+  assert.match(diskB.project.modelProofFailure, /Model proof failed/);
+
+  cli.onSpawn = () => [
+    { event: 'init', conversation_id: 'conv-c-evict', init: { model: 'requested-model-1' } },
+    { event: 'result', result: { status: 'SUCCESS', conversation_id: 'conv-c-evict', response: 'done C' } },
+  ];
+  const taskC = await reloadedTasks.run({
+    prompt: 'independent task C to evict A',
+    workingDirectory: ws.repoDir,
+    mode: 'read-only',
+    model: 'requested-model-1',
+  });
+  const settledC = await waitForTask(reloadedTasks, taskC.taskId);
+  assert.equal(settledC.status, 'completed');
+
+  // Public list() and status() call refresh() after A has been evicted.
+  const listed = reloadedTasks.list();
+  assert.equal(listed.some(item => item.taskId === settledA.taskId), false);
+  assert.equal(listed.some(item => item.taskId === settledB.taskId), true);
+  assert.equal(reloadedTasks.status(settledB.taskId).taskId, settledB.taskId);
+  assert.throws(
+    () => reloadedTasks.status(settledA.taskId),
+    (err: unknown) => err instanceof BridgeError && err.code === 'TASK_NOT_FOUND',
+  );
+
+  const previewB = await reloadedTasks.preview(settledB.taskId, false);
+  const verifiedB = await reloadedTasks.verify(settledB.taskId, previewB.sha256, reviews);
+  assert.equal(verifiedB.status, 'failed');
+  assert.equal(verifiedB.checks.find(check => check.criterionId === 'model-identity')?.status, 'failed');
+  await assert.rejects(
+    () => reloadedTasks.integrate(settledB.taskId, previewB.sha256, async () => true),
+    (err: unknown) =>
+      err instanceof BridgeError &&
+      err.code === 'VERIFICATION_REQUIRED' &&
+      err.message.includes('Model proof failed'),
+  );
 });

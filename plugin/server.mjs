@@ -29984,6 +29984,7 @@ var queryTools = /* @__PURE__ */ new Set([
   "black_gravity_get_agent_policy",
   "black_gravity_list_models",
   "black_gravity_capabilities",
+  "black_gravity_resolve_model",
   "black_gravity_get_model",
   "black_gravity_usage",
   "black_gravity_list_project_files",
@@ -47761,6 +47762,175 @@ function recommendWaitMode(client) {
   return { recommendedMode: profile.mode, reason: "verified-profile" };
 }
 
+// dist/src/model-resolution.js
+var MODEL_ALIASES = ["flash", "argon"];
+var RESOLUTION_STATUSES = [
+  "resolved",
+  "cli-absent",
+  "list-unavailable",
+  "alias-not-listed",
+  "effort-unavailable",
+  "ambiguous"
+];
+var IDENTITY_STATUSES = ["not-observable", "unknown"];
+var SUFFIX_EFFORT_ORDER = ["low", "medium", "high", "xhigh"];
+var MODEL_ID_PATTERN = /^gemini-(\d+(?:\.\d+)*)-(flash|argon)-(low|medium|high|xhigh)$/;
+var MAX_OBSERVED_MODEL_CHARS = 256;
+function buildIdentity(cli) {
+  if (cli.installed && cli.version !== null && EFFECTIVE_MODEL_ABSENT_VERSIONS.includes(cli.version)) {
+    return {
+      model: "not-observable",
+      effort: "not-observable",
+      detail: "agy does not report the effective model or effort in this version; stream-json init.model only repeats the requested --model value and carries no effort field."
+    };
+  }
+  return {
+    model: "unknown",
+    effort: "unknown",
+    detail: "Effective model and effort observability is not verified for this CLI version; agy does not report the effective model or effort in checked versions, where stream-json init.model only repeats the requested --model value."
+  };
+}
+function aliasNotListedDetail(alias) {
+  if (alias === "argon") {
+    return "User-declared access to Argon is preserved, but this CLI does not list any gemini-<n>-argon-<effort> ID in agy models; no model ID was substituted or invented.";
+  }
+  return "This CLI does not list any gemini-<n>-flash-<effort> ID in agy models; no model ID was substituted or invented.";
+}
+function resolveModelAlias(input2) {
+  const base = {
+    alias: input2.alias,
+    requestedEffort: input2.effort,
+    effortEncoding: "model-id-suffix",
+    identity: buildIdentity(input2.cli)
+  };
+  if (!input2.cli.installed) {
+    return {
+      ...base,
+      status: "cli-absent",
+      modelId: null,
+      candidates: [],
+      availableEfforts: [],
+      detail: "Antigravity CLI (agy) is not installed or could not be queried; cannot resolve model alias."
+    };
+  }
+  if (input2.models === null) {
+    return {
+      ...base,
+      status: "list-unavailable",
+      modelId: null,
+      candidates: [],
+      availableEfforts: [],
+      detail: input2.listError?.code ? `Could not list models from agy (${input2.listError.code}); cannot resolve model alias.` : "Could not list models from agy; cannot resolve model alias.",
+      ...input2.listError?.code ? { errorCode: input2.listError.code } : {}
+    };
+  }
+  const candidateIds = /* @__PURE__ */ new Set();
+  const families = /* @__PURE__ */ new Map();
+  for (const model of input2.models) {
+    const match = MODEL_ID_PATTERN.exec(model.id);
+    if (!match)
+      continue;
+    const version3 = match[1];
+    const alias = match[2];
+    const effort = match[3];
+    if (alias !== input2.alias)
+      continue;
+    candidateIds.add(model.id);
+    let efforts2 = families.get(version3);
+    if (!efforts2) {
+      efforts2 = /* @__PURE__ */ new Map();
+      families.set(version3, efforts2);
+    }
+    if (!efforts2.has(effort)) {
+      efforts2.set(effort, model.id);
+    }
+  }
+  const candidates = Array.from(candidateIds).sort();
+  if (families.size === 0) {
+    return {
+      ...base,
+      status: "alias-not-listed",
+      modelId: null,
+      candidates: [],
+      availableEfforts: [],
+      detail: aliasNotListedDetail(input2.alias)
+    };
+  }
+  if (families.size > 1) {
+    const versions = Array.from(families.keys()).sort();
+    return {
+      ...base,
+      status: "ambiguous",
+      modelId: null,
+      candidates,
+      availableEfforts: [],
+      detail: `Multiple ${input2.alias} model versions are listed (${versions.join(", ")}); refusing to select one automatically.`
+    };
+  }
+  const [version2, efforts] = Array.from(families.entries())[0];
+  const availableEfforts = SUFFIX_EFFORT_ORDER.filter((effort) => efforts.has(effort));
+  const resolvedId = input2.effort === "max" ? void 0 : efforts.get(input2.effort);
+  if (resolvedId === void 0) {
+    return {
+      ...base,
+      status: "effort-unavailable",
+      modelId: null,
+      candidates,
+      availableEfforts,
+      detail: `Requested effort "${input2.effort}" is not available for ${input2.alias} (version ${version2}); available efforts: ${availableEfforts.join(", ")}. Refusing to downgrade effort or substitute another model.`
+    };
+  }
+  return {
+    ...base,
+    status: "resolved",
+    modelId: resolvedId,
+    candidates,
+    availableEfforts,
+    detail: `Resolved ${input2.alias} (${input2.effort}) to listed model ID ${resolvedId}.`
+  };
+}
+function classifyInitModel(requested, initModel) {
+  if (typeof initModel !== "string") {
+    return { observed: { model: null, status: "not-observable" }, echo: false, mismatch: false };
+  }
+  const trimmed = initModel.trim();
+  if (!trimmed) {
+    return { observed: { model: null, status: "not-observable" }, echo: false, mismatch: false };
+  }
+  if (requested !== null && trimmed === requested) {
+    return { observed: { model: null, status: "not-observable" }, echo: true, mismatch: false };
+  }
+  return {
+    observed: { model: trimmed.slice(0, MAX_OBSERVED_MODEL_CHARS), status: "observed" },
+    echo: false,
+    mismatch: requested !== null
+  };
+}
+function evaluateModelProof(execution) {
+  if (execution.observed.status === "not-observable" || execution.observed.model === null) {
+    return {
+      verdict: "not-observable",
+      detail: "Effective model identity is not observable; model proof is neither established nor failed."
+    };
+  }
+  if (execution.requested.model === null) {
+    return {
+      verdict: "no-request",
+      detail: `Observed model "${execution.observed.model}" was reported when no specific model was requested.`
+    };
+  }
+  if (execution.observed.model === execution.requested.model) {
+    return {
+      verdict: "not-observable",
+      detail: `Observed value "${execution.observed.model}" matches the requested model, cannot be distinguished from an echo, and is not proof.`
+    };
+  }
+  return {
+    verdict: "mismatch",
+    detail: `Model proof failed: requested "${execution.requested.model}", but observed "${execution.observed.model}".`
+  };
+}
+
 // dist/src/output-schemas.js
 var hash2 = external_exports.string().regex(/^[a-f0-9]{64}$/);
 var id = external_exports.string().uuid();
@@ -47913,6 +48083,22 @@ var cliCapabilityRecord = external_exports.object({
   editToolRestrictions: external_exports.array(editToolRestriction),
   error: external_exports.string().optional()
 }).strict();
+var modelResolutionSchema = external_exports.object({
+  alias: external_exports.enum(MODEL_ALIASES),
+  requestedEffort: effortSchema,
+  status: external_exports.enum(RESOLUTION_STATUSES),
+  modelId: external_exports.string().nullable(),
+  candidates: external_exports.array(external_exports.string()),
+  availableEfforts: external_exports.array(effortSchema),
+  effortEncoding: external_exports.literal("model-id-suffix"),
+  detail: external_exports.string(),
+  identity: external_exports.object({
+    model: external_exports.enum(IDENTITY_STATUSES),
+    effort: external_exports.enum(IDENTITY_STATUSES),
+    detail: external_exports.string()
+  }).strict(),
+  errorCode: external_exports.string().optional()
+}).strict();
 var successOutputSchemas = {
   black_gravity_wait_many: external_exports.object({ ready: external_exports.boolean(), timedOut: external_exports.boolean(), hasMoreMessages: external_exports.boolean(), tasks: external_exports.array(jointWaitTaskSchema).max(32), waitCommand: waitCommandSchema.optional() }).strict(),
   black_gravity_workflow_result: external_exports.object({
@@ -47990,6 +48176,7 @@ var successOutputSchemas = {
   }).strict(),
   black_gravity_list_models: external_exports.object({ models: external_exports.array(external_exports.object({ id: external_exports.string(), name: external_exports.string() }).strict()) }).strict(),
   black_gravity_capabilities: external_exports.object({ clis: external_exports.array(cliCapabilityRecord) }).strict(),
+  black_gravity_resolve_model: external_exports.object({ resolution: modelResolutionSchema }).strict(),
   black_gravity_get_agent_policy: external_exports.object({ allowedTools: nativeToolsSchema, mcpServers: external_exports.array(external_exports.object({ id: external_exports.string(), description: external_exports.string().nullable(), nativeServerName: external_exports.string(), tools: external_exports.array(mcpCatalogToolSchema) }).strict()).max(20) }).strict(),
   black_gravity_get_model: external_exports.object({ model: external_exports.string().nullable() }).strict(),
   black_gravity_get_sandbox_policy: sandboxPolicySnapshot,
@@ -48177,6 +48364,7 @@ var TOOL_ANNOTATIONS = {
   black_gravity_health: { title: "Check Antigravity CLI", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   black_gravity_list_models: { title: "List Antigravity models", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   black_gravity_capabilities: { title: "Report CLI capabilities", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  black_gravity_resolve_model: { title: "Resolve Flash or Argon model ID", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   black_gravity_get_model: { title: "Get selected model", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_get_sandbox_policy: { title: "Get Windows test sandbox policy", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_usage: { title: "Read observed token usage", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -48349,7 +48537,8 @@ var snapshotSchema = external_exports.object({
     baseline: external_exports.array(external_exports.tuple([external_exports.string(), external_exports.string().regex(/^[a-f0-9]{64}$/)])),
     includedFiles: external_exports.array(external_exports.string()),
     providedSkills: stagedSkillsSchema.optional(),
-    blockedFiles: external_exports.array(blockedMetadataSchema).optional()
+    blockedFiles: external_exports.array(blockedMetadataSchema).optional(),
+    modelProofFailure: external_exports.string().max(2e3).optional()
   }).optional(),
   events: external_exports.array(external_exports.object({ taskId: external_exports.string().uuid(), sequence: external_exports.number().int().positive(), timestamp: external_exports.string(), type: external_exports.string(), data: external_exports.unknown(), raw: external_exports.unknown().optional(), rawIsData: external_exports.literal(true).optional(), rawEnvelope: external_exports.string().min(1).max(64).optional() }).refine((event) => [event.raw !== void 0, event.rawIsData !== void 0, event.rawEnvelope !== void 0].filter(Boolean).length <= 1 && event.rawEnvelope !== "event")),
   cursor: external_exports.number().int().nonnegative(),
@@ -49424,7 +49613,7 @@ function createMcpServer(adapter, tasks, options = {}) {
   const approvalInstructions = tasks.approvalMode === "auto" ? "On Windows, global sandbox ceilings default to automatic authorization for validated proposals in automatic mode (BRIDGE_APPROVAL_MODE=auto), or require human form confirmation when configured with BRIDGE_APPROVAL_MODE=ask; the MCP caller chooses only a narrower test selection, and delegated Gemini cannot authorize or change it. Report task.tokenUsage or black_gravity_usage to the user, identifying unavailable or partial counters; resumed CLI usage is cumulative and must not be summed repeatedly. Integration requires current verification and the reviewed SHA-256; under default automatic approval mode (BRIDGE_APPROVAL_MODE=auto), verified integration is authorized automatically without human forms. When configured with BRIDGE_APPROVAL_MODE=ask, human confirmation forms are always required even for previously preauthorized or remembered project roots. The original project changes only through verified integration." : "On Windows, human confirmation forms are always required to update global sandbox ceilings under BRIDGE_APPROVAL_MODE=ask; the MCP caller chooses only a narrower test selection, and delegated Gemini cannot authorize or change it. Report task.tokenUsage or black_gravity_usage to the user, identifying unavailable or partial counters; resumed CLI usage is cumulative and must not be summed repeatedly. Integration requires current verification and the reviewed SHA-256; human confirmation forms are always required under BRIDGE_APPROVAL_MODE=ask, even if projects were previously preauthorized in server configuration or remembered. The original project changes only through confirmed integration.";
   const instructions = "For normal delegation prefer deliveryMode messages: wait returns compact public questions, blockers and final result references instead of tool history; use chunk readers for details. Omission preserves legacy events. Carry cursorMode with the previous delivery mode when waiting so a delivery mode change resets the cursor safely. Messages are agy-reported data, not verification or permission approval. Define acceptanceCriteria for every requirement before a write task. Tasks run with agy --sandbox in a temporary copy filtered by Git ignores; includePaths narrows it. Planner and reviewer roles use read-only mode. CLI SUCCESS and completed mean execution ended; prove requirements against actual artifacts and grounded review with black_gravity_verify before claiming completion. Read previews with includePatch false and results with includeResult false, then use the chunk readers for all required content. Run actual tests with black_gravity_test and inspect receipts, exit codes and stale evidence. " + approvalInstructions;
   const server = new McpServer({ name: "black-gravity", version: "0.9.0", icons: SERVER_ICONS }, { instructions });
-  const statelessTools = /* @__PURE__ */ new Set(["black_gravity_health", "black_gravity_capabilities", "black_gravity_list_models", "black_gravity_roles"]);
+  const statelessTools = /* @__PURE__ */ new Set(["black_gravity_health", "black_gravity_capabilities", "black_gravity_list_models", "black_gravity_resolve_model", "black_gravity_roles"]);
   const originalRegisterTool = server.registerTool.bind(server);
   server.registerTool = ((name, ...args) => {
     const row = toolAnnotationRow(name);
@@ -49495,6 +49684,37 @@ function createMcpServer(adapter, tasks, options = {}) {
       description: "Report which capabilities each installed CLI exposes as observed, absent or unknown, using only version and help output. Starts no task and no login. Unknown is not support.",
       inputSchema: {}
     }, safe(async () => ({ clis: [await adapter.capabilityRecord({ id: "agy", version: AGY_ADAPTER_VERSION })] })));
+  if (toolEnabled(tasks.toolProfile, "black_gravity_resolve_model"))
+    server.registerTool("black_gravity_resolve_model", {
+      outputSchema: outputSchemas.black_gravity_resolve_model,
+      description: "Resolve the Flash or Argon alias to an exact model ID returned by agy models for the requested effort, never substituting another model or effort. Starts no task. Reports whether the CLI exposes the effective model.",
+      inputSchema: { alias: external_exports.enum(MODEL_ALIASES), effort: effortSchema.optional() }
+    }, async ({ alias, effort }) => safe(async () => {
+      const capabilities = await adapter.capabilityRecord({ id: "agy", version: AGY_ADAPTER_VERSION });
+      let models = null;
+      let listError;
+      if (capabilities.installed) {
+        try {
+          models = await adapter.listModels();
+        } catch (error62) {
+          if (error62 instanceof BridgeError) {
+            models = null;
+            listError = { code: error62.code };
+          } else {
+            throw error62;
+          }
+        }
+      }
+      return {
+        resolution: resolveModelAlias({
+          alias,
+          effort: effort ?? "high",
+          cli: { installed: capabilities.installed, version: capabilities.version },
+          models,
+          ...listError ? { listError } : {}
+        })
+      };
+    })());
   if (toolEnabled(tasks.toolProfile, "black_gravity_get_model"))
     server.registerTool("black_gravity_get_model", {
       outputSchema: outputSchemas.black_gravity_get_model,
@@ -55964,6 +56184,7 @@ var TaskManager = class {
       }
     const interrupted = /* @__PURE__ */ new Set();
     const landed = /* @__PURE__ */ new Set();
+    const missingCopyProofTasks = [];
     this.pendingSnapshots = /* @__PURE__ */ new Map();
     this.events.holdLogs();
     let published = false;
@@ -55978,10 +56199,16 @@ var TaskManager = class {
         if (cached2)
           Object.assign(item, cached2);
         const ownProject = item.project;
+        let hadProjectProofMarker = false;
         if (item.project) {
+          hadProjectProofMarker = Boolean(item.project.modelProofFailure);
+          const shared = projects.get(item.project.copyDirectory) ?? item.project;
           if (!projects.has(item.project.copyDirectory))
-            projects.set(item.project.copyDirectory, item.project);
-          item.project = projects.get(item.project.copyDirectory);
+            projects.set(item.project.copyDirectory, shared);
+          shared.modelProofFailure ??= item.project.modelProofFailure ?? this.modelProofFailure(item.record);
+          if (ownProject && shared.modelProofFailure)
+            ownProject.modelProofFailure ??= shared.modelProofFailure;
+          item.project = shared;
         }
         const restored = item.redacted ? void 0 : sanitizePayload(item.record, RESTORE_LIMITS);
         if (restored && (restored.redacted || restored.truncated)) {
@@ -55998,6 +56225,8 @@ var TaskManager = class {
         }
         const task2 = { record: item.record, options: item.options, ownerPid: item.ownerPid, project: item.project };
         this.tasks.set(item.record.taskId, task2);
+        if (item.project && !hadProjectProofMarker)
+          missingCopyProofTasks.push(task2);
         const events = item.redacted ? item.events : restoredEvents(item.events);
         this.events.restore(item.record.taskId, events, item.cursor);
         const verbatim = legacy && !cached2 ? sanitizePayload({ record: item.record, events: events.map(({ taskId, sequence, type, timestamp: timestamp2 }) => ({ taskId, sequence, type, timestamp: timestamp2 })), options: { ...item.options, prompt: "" }, project: ownProject && { ...ownProject, baseline: [...ownProject.baseline] } }, RESTORE_LIMITS) : void 0;
@@ -56015,6 +56244,11 @@ var TaskManager = class {
             interrupted.add(item.record.taskId);
             this.finish(task2, "failed", "SERVER_RESTARTED", "Previous execution was interrupted; inspect its copy before starting new work");
           }
+        }
+      }
+      for (const task2 of missingCopyProofTasks) {
+        if (task2.project?.modelProofFailure && !this.pendingSnapshots.has(task2.record.taskId)) {
+          this.persist(task2.record.taskId);
         }
       }
       const entries2 = [...this.pendingSnapshots.entries()].map(([taskId, content]) => ({ taskId, content })).sort((a, b) => (interrupted.has(a.taskId) ? 1 : 0) - (interrupted.has(b.taskId) ? 1 : 0));
@@ -56459,6 +56693,9 @@ var TaskManager = class {
           if (await fingerprintProjectCopy(contextSource.project, this.config) !== options.handoff.treeSha256)
             throw new BridgeError("CONTEXT_CHANGED", "Context changed before copying");
           const fork = await forkProjectCopy(contextSource.project, this.config);
+          const inheritedFailure = contextSource.project.modelProofFailure ?? this.copyModelProofFailure(contextSource);
+          if (inheritedFailure)
+            fork.modelProofFailure = inheritedFailure;
           if (await fingerprintProjectCopy(fork, this.config) !== options.handoff.treeSha256 || (await previewProjectCopy(fork, this.config)).sha256 !== options.handoff.patchSha256) {
             await discardProjectCopy(fork);
             throw new BridgeError("CONTEXT_CHANGED", "Context changed while copying or contains newly ignored files");
@@ -56791,19 +57028,50 @@ var TaskManager = class {
         tokenUsage: task2.tokenUsage
       };
     }));
+    const mismatchedTasks = tasks.filter((task2) => this.modelProofFailure(task2) !== void 0);
+    const mismatchedTaskIds = new Set(mismatchedTasks.map((task2) => task2.taskId));
+    const mismatchWarnings = mismatchedTasks.map((task2) => `Model proof failed for ${task2.execution.requested.model}: observed ${task2.execution.observed.model}; its opinion is excluded from the findings.`);
     return {
       ...comparison,
       ready,
-      complete: complete && opinions.every((opinion) => opinion.contextMatches === true),
+      complete: complete && mismatchedTaskIds.size === 0 && opinions.every((opinion) => opinion.contextMatches === true),
       missingModels,
       contextStale: current === null || current.treeSha256 !== comparison.treeSha256 || opinions.some((opinion) => terminal3.has(opinion.status) && opinion.contextMatches !== true),
       opinions,
-      findings: compareFindings(tasks.filter((task2) => opinions.some((opinion) => opinion.taskId === task2.taskId && opinion.contextMatches === true)), comparison.models),
+      findings: compareFindings(tasks.filter((task2) => !mismatchedTaskIds.has(task2.taskId) && opinions.some((opinion) => opinion.taskId === task2.taskId && opinion.contextMatches === true)), comparison.models),
       warnings: [
         "Findings are model-reported with checked citations, not verified conclusions. Identical means exact matching findings only.",
-        "Missing findings, failed opinions and unverified fields do not demonstrate agreement. Codex must inspect and synthesize the reports before making recommendations."
+        "Missing findings, failed opinions and unverified fields do not demonstrate agreement. Codex must inspect and synthesize the reports before making recommendations.",
+        ...mismatchWarnings
       ]
     };
+  }
+  modelProofFailure(record2) {
+    if (!record2.execution)
+      return void 0;
+    const proof = evaluateModelProof(record2.execution);
+    return proof.verdict === "mismatch" ? proof.detail : void 0;
+  }
+  copyModelProofFailure(task2) {
+    if (task2.project?.modelProofFailure)
+      return task2.project.modelProofFailure;
+    const ownFailure = this.modelProofFailure(task2.record);
+    if (ownFailure)
+      return ownFailure;
+    const copyDirectory = task2.project?.copyDirectory;
+    if (!copyDirectory)
+      return void 0;
+    for (const candidate of this.tasks.values()) {
+      if (candidate.project?.copyDirectory === copyDirectory) {
+        const failure3 = candidate.project?.modelProofFailure ?? this.modelProofFailure(candidate.record);
+        if (failure3)
+          return failure3;
+      }
+    }
+    return void 0;
+  }
+  modelProofFailureMessage(detail) {
+    return detail.startsWith("Model proof failed") ? detail : `Model proof failed: ${detail}`;
   }
   async verify(taskId, expectedSha256, reviews = []) {
     this.assertStateDirectoryUsable();
@@ -56816,6 +57084,15 @@ var TaskManager = class {
       if (preview.sha256 !== expectedSha256)
         throw new BridgeError("REVIEW_CHANGED", "Preview the current patch before verification");
       const verification2 = await verifyCriteria(task2.project, preview.sha256, task2.record.acceptanceCriteria, reviews);
+      const proofFailure = this.copyModelProofFailure(task2);
+      if (proofFailure) {
+        verification2.checks.push({
+          criterionId: "model-identity",
+          status: "failed",
+          observation: proofFailure
+        });
+        verification2.status = "failed";
+      }
       task2.record.verification = verification2;
       this.events.append(taskId, "review.verified", { sha256: preview.sha256, status: verification2.status });
       return verification2;
@@ -56827,6 +57104,10 @@ var TaskManager = class {
     const task2 = this.tasks.get(taskId), output2 = this.tasks.get(outputTaskId);
     if (!task2?.project || !output2?.project || task2.record.status !== "completed" || output2.record.status !== "completed" || task2.project.copyDirectory !== output2.project.copyDirectory || !task2.record.group || !output2.record.group || task2.record.group.rootTaskId !== output2.record.group.rootTaskId || task2.record.integratedAt || task2.record.discardedAt) {
       throw new BridgeError("WORKFLOW_TASK_UNAVAILABLE", "Workflow requires completed retained outputs in the same conversation copy");
+    }
+    const proofFailure = this.copyModelProofFailure(task2) ?? this.copyModelProofFailure(output2);
+    if (proofFailure) {
+      throw new BridgeError("WORKFLOW_VALIDATION_FAILED", this.modelProofFailureMessage(proofFailure));
     }
     return this.withProject(task2.project, async () => {
       const project = task2.project, preview = await previewProjectCopy(project, this.config), treeSha256 = await fingerprintProjectCopy(project, this.config);
@@ -56883,6 +57164,10 @@ var TaskManager = class {
     });
   }
   async requireVerification(task2, sha256) {
+    const proofFailure = this.copyModelProofFailure(task2);
+    if (proofFailure) {
+      throw new BridgeError("VERIFICATION_REQUIRED", this.modelProofFailureMessage(proofFailure));
+    }
     const previous = task2.record.verification;
     if (!previous || previous.status !== "passed")
       throw new BridgeError("VERIFICATION_REQUIRED", "All acceptance criteria require artifact checks and grounded Codex review before integration");
@@ -58171,9 +58456,20 @@ var TaskManager = class {
             this.events.append(record2.taskId, type, data, raw);
           },
           onInit: (init) => {
-            const observedModel = typeof init.model === "string" ? init.model.trim() : "";
-            if (observedModel && record2.execution) {
-              record2.execution.observed = { model: observedModel.slice(0, 256), status: "observed" };
+            const requested = record2.execution?.requested.model ?? null;
+            const classification = classifyInitModel(requested, init.model);
+            if (record2.execution && classification.observed.status === "observed") {
+              record2.execution.observed = classification.observed;
+            }
+            if (classification.mismatch) {
+              const failure3 = this.modelProofFailure(record2);
+              if (failure3) {
+                project.modelProofFailure ??= failure3;
+              }
+              this.events.append(record2.taskId, "model.mismatch", {
+                requested,
+                observed: classification.observed.model
+              });
             }
           },
           onSession: (sessionId) => {
