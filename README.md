@@ -22,7 +22,8 @@ Use one registration method per harness to avoid duplicate tools. Commands run f
 | OpenCode | Supported | Confirmed by the maintainer with the configuration below |
 | agy | Not verified | `agy mcp list` exists, but agy has no documented way to isolate its configuration |
 | Other MCP clients (stdio) | Partial | The server answered `initialize` and `tools/list` with 50 tools; no other client was tested |
-| Linux and macOS commands | Not verified | No test machine |
+| Linux commands | Supported | Listed by `codex mcp list` (Codex CLI 0.171.0) and shown as Connected by `claude mcp list` (Claude Code 2.1.326, run by its absolute path), Ubuntu 26.04 |
+| macOS commands | Not verified | No test machine |
 
 ### Codex plugin
 
@@ -105,12 +106,14 @@ agy mcp list
 
 ### Linux and macOS
 
-**Not verified.** These commands are the same registrations without PowerShell syntax.
+**Supported on Linux** for the Codex and Claude Code lines, checked on Ubuntu 26.04 by a user without root; the agy line is not verified. **Not verified on macOS.** These commands are the same registrations without PowerShell syntax. If `claude` is not on `PATH`, run the Claude Code CLI by its absolute path, as the check did.
 
 ```bash
 server="$PWD/plugin/server.mjs"
 codex mcp add black-gravity -- node "$server"
+codex mcp list
 claude mcp add --scope user black-gravity -- node "$server"
+claude mcp list
 agy mcp add black-gravity -- node "$server"
 ```
 
@@ -141,9 +144,9 @@ The skill guides model selection, waiting, and review. For a standalone MCP setu
 
 ### Linux Bubblewrap test executor (`linux-bwrap`)
 
-**Verified in CI (`ubuntu-24.04`) only; Linux user-machine verification is not yet done.** When `BRIDGE_TEST_EXECUTOR` is unset on Linux, `black_gravity_test` uses `linux-bwrap` only if startup detection finds `bwrap` and passes the user-namespace probe; otherwise it stays on `agy` (also selectable explicitly with `BRIDGE_TEST_EXECUTOR=agy`). Setting `BRIDGE_TEST_EXECUTOR=linux-bwrap` requires Bubblewrap: if unavailable, `black_gravity_test` refuses before queuing with `LINUX_BWRAP_MISSING` or `LINUX_USER_NAMESPACES_BLOCKED` and never falls back to host execution. `black_gravity_health.testExecutor` reports `selected`, `explicit`, and `linuxBwrap` availability details (`available`, `path`, `version`, `code`, `reason`). The sandbox root itself is read-only and exposes only system directories (`/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/opt`, `/nix/store`, read-only, with system roots that are symbolic links on the host recreated as symbolic links inside the sandbox), the Node and `PATH` toolchain directories (read-only, mounted after the `/tmp` and `/run` `tmpfs`, including directories reached through symlinks at their original path, never the home directory; toolchains that are `/tmp`, `/run`, or `XDG_RUNTIME_DIR` themselves, or contain them, are refused), the copy, a scratch directory, and the declared `readPaths`/`writePaths`; only the copy, the scratch directory, `/tmp`, and declared `writePaths` are writable; the home directory and `/var` are not visible; `/tmp` is an empty per-run `tmpfs`; `/run`, `XDG_RUNTIME_DIR`, and protected paths are empty read-only `tmpfs` mounts; when network is disabled (the default), a seccomp filter blocks creating `AF_UNIX` sockets and `io_uring`, and limits `socketpair` to stream and seqpacket types (other types, including datagram and raw, are blocked), while pipes still work, so host Unix sockets are unreachable; test commands that need Unix sockets require network enabled in the sandbox policy; the filter supports `x86_64` and `arm64`, and other architectures are refused when network is disabled. Execution is also refused when an automatically mounted directory (toolchains, their aliases, or `readPaths`) contains a FIFO, because read-only mounts do not stop writes to named pipes; the run is also refused when such a directory cannot be traversed or listed (a command inside the sandbox can regain access to the user's own directories through a nested user namespace); system roots are not scanned. Threat model: system roots (`/usr`, `/etc`, `/opt`, and the other system directories listed above) are trusted and controlled by the administrator; FIFOs and other pre-existing channels inside them are outside the scope of this executor in this version.
+**Verified in CI (`ubuntu-24.04`) and on an Ubuntu 26.04 server (kernel 7.0, Bubblewrap 0.11.1, user without root); other distributions are not verified.** When `BRIDGE_TEST_EXECUTOR` is unset on Linux, `black_gravity_test` uses `linux-bwrap` only if startup detection finds `bwrap` and passes the user-namespace probe; otherwise it stays on `agy` (also selectable explicitly with `BRIDGE_TEST_EXECUTOR=agy`). Setting `BRIDGE_TEST_EXECUTOR=linux-bwrap` requires Bubblewrap: if unavailable, `black_gravity_test` refuses before queuing with `LINUX_BWRAP_MISSING` or `LINUX_USER_NAMESPACES_BLOCKED` and never falls back to host execution. `black_gravity_health.testExecutor` reports `selected`, `explicit`, and `linuxBwrap` availability details (`available`, `path`, `version`, `code`, `reason`). The sandbox root itself is read-only and exposes only system directories (`/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/opt`, `/nix/store`, read-only, with system roots that are symbolic links on the host recreated as symbolic links inside the sandbox), the Node and `PATH` toolchain directories (read-only, mounted after the `/tmp` and `/run` `tmpfs`, including directories reached through symlinks at their original path, never the home directory; toolchains that are `/tmp`, `/run`, or `XDG_RUNTIME_DIR` themselves, or contain them, are refused), the copy, a scratch directory, and the declared `readPaths`/`writePaths`; only the copy, the scratch directory, `/tmp`, and declared `writePaths` are writable; the home directory and `/var` are not visible; `/tmp` is an empty per-run `tmpfs`; `/run`, `XDG_RUNTIME_DIR`, and protected paths are empty read-only `tmpfs` mounts; when network is disabled (the default), a seccomp filter blocks creating `AF_UNIX` sockets and `io_uring`, and limits `socketpair` to stream and seqpacket types (other types, including datagram and raw, are blocked), while pipes still work, so host Unix sockets are unreachable; test commands that need Unix sockets require network enabled in the sandbox policy; the filter supports `x86_64` and `arm64`, and other architectures are refused when network is disabled. Execution is also refused when an automatically mounted directory (toolchains, their aliases, or `readPaths`) contains a FIFO, because read-only mounts do not stop writes to named pipes; the run is also refused when such a directory cannot be traversed or listed (a command inside the sandbox can regain access to the user's own directories through a nested user namespace); system roots are not scanned. Threat model: system roots (`/usr`, `/etc`, `/opt`, and the other system directories listed above) are trusted and controlled by the administrator; FIFOs and other pre-existing channels inside them are outside the scope of this executor in this version.
 
-Install Bubblewrap:
+Install Bubblewrap if `bwrap --version` does not find it. The commands below require root and were not run on the verified server; other installation methods were not verified. Without Bubblewrap, and with `BRIDGE_TEST_EXECUTOR` unset, `black_gravity_test` stays on `agy`.
 
 ```bash
 sudo apt install bubblewrap    # Debian / Ubuntu
@@ -151,7 +154,13 @@ sudo dnf install bubblewrap    # Fedora / RHEL
 sudo pacman -S bubblewrap      # Arch Linux
 ```
 
-On Ubuntu 23.10+ where AppArmor restricts unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`), grant `userns` only to `/usr/bin/bwrap`:
+Then check, without root, whether Bubblewrap can create a user namespace:
+
+```bash
+bwrap --unshare-user --ro-bind / / true && echo ok
+```
+
+If it prints `ok`, skip the next step. On the verified Ubuntu 26.04.1 server, the `apparmor` package ships and loads a `bwrap` profile (`/etc/apparmor.d/bwrap-userns-restrict`) that allows user namespaces and confines the processes started by `bwrap`. Do not add the profile below where such a profile is loaded: `apparmor_parser -r` replaces any loaded profile with the same name, whatever the file name. The profile below is the one CI loads on the GitHub Actions `ubuntu-24.04` runner, where the check fails because AppArmor restricts unprivileged user namespaces (`kernel.apparmor_restrict_unprivileged_userns=1`); it was not run on the verified server. Its `flags=(unconfined)` confines neither `bwrap` nor the processes it starts, unlike the Ubuntu 26.04 profile. It grants `userns` only to `/usr/bin/bwrap` and requires root; without root, leave `BRIDGE_TEST_EXECUTOR` unset and `black_gravity_test` stays on `agy`:
 
 ```bash
 sudo tee /etc/apparmor.d/bwrap >/dev/null <<'EOF'
