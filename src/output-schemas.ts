@@ -14,6 +14,12 @@ import { handoffSchema } from './handoff.js';
 import { comparisonSchema, comparisonFindingSchema } from './comparison.js';
 import { sandboxPolicySchema, sandboxSelectionSchema } from './sandbox-policy.js';
 import { WAIT_MODES, WAIT_MODE_REASONS } from './wait-profiles.js';
+import {
+  CAPABILITY_OBSERVATIONS,
+  CAPABILITY_SOURCES,
+  REGISTRY_CAPABILITIES,
+  type RegistryCapability,
+} from './capability-registry.js';
 
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const id = z.string().uuid();
@@ -93,6 +99,23 @@ const chunkShape = {
 };
 const usageRow = z.object({ taskId: id, sessionId: z.string().nullable(), model: z.string().nullable(), status, ...tokenUsage.shape }).strict();
 const sandboxPolicySnapshot = z.object({ version: z.literal(1), policy: sandboxPolicySchema, sha256: hash }).strict();
+const capabilityObservation = z.enum(CAPABILITY_OBSERVATIONS);
+const capabilitySource = z.enum(CAPABILITY_SOURCES);
+const capabilityEntry = z.object({ status: capabilityObservation, source: capabilitySource, detail: z.string() }).strict();
+const editToolRestriction = z.object({
+  tool: z.string(), restriction: z.string(), status: capabilityObservation,
+  source: z.literal('recorded'), verifiedVersions: z.array(z.string()), bridgeMitigation: z.string(),
+}).strict();
+const registryCapabilitiesSchema = z.object(
+  Object.fromEntries(REGISTRY_CAPABILITIES.map(key => [key, capabilityEntry])) as Record<RegistryCapability, typeof capabilityEntry>,
+).strict();
+const cliCapabilityRecord = z.object({
+  cli: z.literal('agy'), adapterId: z.string(), adapterVersion: z.string(),
+  installed: z.boolean(), version: z.string().nullable(), platform: z.string(), arch: z.string(),
+  queriedWith: z.array(z.string()), capabilities: registryCapabilitiesSchema,
+  effectiveModel: capabilityEntry, editToolRestrictions: z.array(editToolRestriction),
+  error: z.string().optional(),
+}).strict();
 
 export const successOutputSchemas = {
   black_gravity_wait_many: z.object({ ready: z.boolean(), timedOut: z.boolean(), hasMoreMessages: z.boolean(), tasks: z.array(jointWaitTaskSchema).max(32), waitCommand: waitCommandSchema.optional() }).strict(),
@@ -145,6 +168,7 @@ export const successOutputSchemas = {
     waitCommand: waitCommandSchema.optional(),
   }).strict(),
   black_gravity_list_models: z.object({ models: z.array(z.object({ id: z.string(), name: z.string() }).strict()) }).strict(),
+  black_gravity_capabilities: z.object({ clis: z.array(cliCapabilityRecord) }).strict(),
   black_gravity_get_agent_policy: z.object({ allowedTools: nativeToolsSchema, mcpServers: z.array(z.object({ id: z.string(), description: z.string().nullable(), nativeServerName: z.string(), tools: z.array(mcpCatalogToolSchema) }).strict()).max(20) }).strict(),
   black_gravity_get_model: z.object({ model: z.string().nullable() }).strict(),
   black_gravity_get_sandbox_policy: sandboxPolicySnapshot,

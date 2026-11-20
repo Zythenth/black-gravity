@@ -46,7 +46,7 @@ test('tools/list publishes exactly one table row per registered tool in every pr
     if (profile === 'full') {
       assert.deepEqual([...names].sort(), tableNames);
       const read = tools.filter(tool => tool.annotations?.readOnlyHint === true).length;
-      assert.deepEqual({ read, write: tools.length - read }, { read: 23, write: 27 });
+      assert.deepEqual({ read, write: tools.length - read }, { read: 24, write: 27 });
     }
   }
 });

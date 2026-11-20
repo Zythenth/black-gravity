@@ -6,6 +6,7 @@ import { z } from 'zod';
 import { clientTask, compactTask, deliveryModeSchema } from './messages.js';
 import { providedSkillsSchema } from './skills.js';
 import { CliAdapter } from './cli-adapter.js';
+import { AGY_ADAPTER_VERSION } from './agy-execution-adapter.js';
 import { TaskManager } from './task-manager.js';
 import { BridgeError } from './types.js';
 import { criteriaSchema, reviewSchema } from './verification.js';
@@ -89,7 +90,7 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
     approvalInstructions;
   const server = new McpServer({ name: 'black-gravity', version: '0.9.0', icons: SERVER_ICONS }, { instructions });
   // Intercept tool registration: titles and annotations come from TOOL_ANNOTATIONS, and state-dependent tools immediately refuse when BRIDGE_STATE_DIRECTORY is invalid/degraded.
-  const statelessTools = new Set(['black_gravity_health', 'black_gravity_list_models', 'black_gravity_roles']);
+  const statelessTools = new Set(['black_gravity_health', 'black_gravity_capabilities', 'black_gravity_list_models', 'black_gravity_roles']);
   const originalRegisterTool = server.registerTool.bind(server);
   server.registerTool = ((name: string, ...args: unknown[]) => {
     const row = toolAnnotationRow(name);
@@ -157,6 +158,12 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
     description: 'List model IDs actually returned by agy models for this account.',
     inputSchema: {},
   }, safe(async () => ({ models: await adapter.listModels() })));
+
+  if (toolEnabled(tasks.toolProfile, 'black_gravity_capabilities')) server.registerTool('black_gravity_capabilities', {
+    outputSchema: outputSchemas.black_gravity_capabilities,
+    description: 'Report which capabilities each installed CLI exposes as observed, absent or unknown, using only version and help output. Starts no task and no login. Unknown is not support.',
+    inputSchema: {},
+  }, safe(async () => ({ clis: [await adapter.capabilityRecord({ id: 'agy', version: AGY_ADAPTER_VERSION })] })));
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_get_model')) server.registerTool('black_gravity_get_model', {
     outputSchema: outputSchemas.black_gravity_get_model,

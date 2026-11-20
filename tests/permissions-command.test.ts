@@ -41,16 +41,16 @@ function assertRefusal(args: readonly string[], messageMatch?: string | RegExp):
 
 const expectedCounts: Record<PermissionPreset, Record<ToolProfile, [number, number]>> = {
   connector: {
-    full: [23, 27],
-    query: [23, 13],
-    review: [23, 16],
-    implementation: [23, 27],
+    full: [24, 27],
+    query: [24, 13],
+    review: [24, 16],
+    implementation: [24, 27],
   },
   delegation: {
-    full: [43, 7],
-    query: [34, 2],
-    review: [37, 2],
-    implementation: [43, 7],
+    full: [44, 7],
+    query: [35, 2],
+    review: [38, 2],
+    implementation: [44, 7],
   },
 };
 
@@ -250,7 +250,7 @@ test('--deny removes a tool that the preset would allow', () => {
   assert.deepEqual(deny, ['mcp__black-gravity__black_gravity_health']);
   assert.ok(!allow.includes('mcp__black-gravity__black_gravity_health'));
   assert.ok(!ask.includes('mcp__black-gravity__black_gravity_health'));
-  assert.equal(allow.length, 22);
+  assert.equal(allow.length, 23);
 
   const codexResult = runPermissions(['--host', 'codex', '--deny', 'black_gravity_health']);
   assert.equal(codexResult.exitCode, 0);

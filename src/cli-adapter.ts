@@ -11,6 +11,7 @@ import { roleContract, resolveRole } from './roles.js';
 import { validatePrompt } from './validation.js';
 import { terminateSubprocess, processError, redactDiagnostic, registerOwnedProcessGroup } from './subprocess.js';
 import { cliEnvironment } from './cli-environment.js';
+import { buildAgyCapabilityRecord, type CliCapabilityRecord } from './capability-registry.js';
 
 // Guidance included with every delegated task prompt.
 // Each rule responds to a failure observed in delegated executions.
@@ -164,6 +165,33 @@ export class CliAdapter {
     });
   }
 
+  private async probeVersionAndHelp(): Promise<{ versionText: string; helpText: string }> {
+    const [version, help] = await Promise.all([this.probe(['--version']), this.probe(['--help'])]);
+    if (version.timedOut || help.timedOut) {
+      throw new BridgeError('AGY_PROBE_FAILED', 'agy probe timed out');
+    }
+    if (version.signal !== null || help.signal !== null) {
+      throw new BridgeError('AGY_PROBE_FAILED', `agy probe terminated by signal ${version.signal ?? help.signal}`);
+    }
+    if (version.code !== 0) {
+      const diag = redactDiagnostic((version.stderr || version.stdout).trim());
+      throw new BridgeError('AGY_PROBE_FAILED', `agy --version failed with exit code ${version.code}${diag ? ': ' + diag : ''}`);
+    }
+    if (help.code !== 0) {
+      const diag = redactDiagnostic((help.stderr || help.stdout).trim());
+      throw new BridgeError('AGY_PROBE_FAILED', `agy --help failed with exit code ${help.code}${diag ? ': ' + diag : ''}`);
+    }
+    const versionText = (version.stdout || version.stderr).trim();
+    const helpText = help.stdout + '\n' + help.stderr;
+    if (!versionText) {
+      throw new BridgeError('AGY_INCOMPATIBLE', 'agy --version returned empty or invalid output');
+    }
+    if (!help.stdout.trim() && !help.stderr.trim()) {
+      throw new BridgeError('AGY_INCOMPATIBLE', 'agy --help returned empty output');
+    }
+    return { versionText, helpText };
+  }
+
   async discover(): Promise<Discovery> {
     if (this.config.agyPathInvalid) {
       this.installed = false;
@@ -178,29 +206,7 @@ export class CliAdapter {
       return discovery;
     }
     try {
-      const [version, help] = await Promise.all([this.probe(['--version']), this.probe(['--help'])]);
-      if (version.timedOut || help.timedOut) {
-        throw new BridgeError('AGY_PROBE_FAILED', 'agy probe timed out');
-      }
-      if (version.signal !== null || help.signal !== null) {
-        throw new BridgeError('AGY_PROBE_FAILED', `agy probe terminated by signal ${version.signal ?? help.signal}`);
-      }
-      if (version.code !== 0) {
-        const diag = redactDiagnostic((version.stderr || version.stdout).trim());
-        throw new BridgeError('AGY_PROBE_FAILED', `agy --version failed with exit code ${version.code}${diag ? ': ' + diag : ''}`);
-      }
-      if (help.code !== 0) {
-        const diag = redactDiagnostic((help.stderr || help.stdout).trim());
-        throw new BridgeError('AGY_PROBE_FAILED', `agy --help failed with exit code ${help.code}${diag ? ': ' + diag : ''}`);
-      }
-      const versionText = (version.stdout || version.stderr).trim();
-      const helpText = help.stdout + '\n' + help.stderr;
-      if (!versionText) {
-        throw new BridgeError('AGY_INCOMPATIBLE', 'agy --version returned empty or invalid output');
-      }
-      if (!help.stdout.trim() && !help.stderr.trim()) {
-        throw new BridgeError('AGY_INCOMPATIBLE', 'agy --help returned empty output');
-      }
+      const { versionText, helpText } = await this.probeVersionAndHelp();
       const streaming = helpText.includes('stream-json') && helpText.includes('--output-format');
       const sandbox = helpText.includes('--sandbox');
       if (!streaming || !sandbox) {
@@ -247,6 +253,36 @@ export class CliAdapter {
       else discovery.error = error instanceof Error ? redactDiagnostic(error.message) : redactDiagnostic(String(error));
     }
     return discovery;
+  }
+
+  async capabilityRecord(identity: { id: string; version: string }): Promise<CliCapabilityRecord> {
+    const notInstalled = (error: string): CliCapabilityRecord => buildAgyCapabilityRecord({
+      installed: false,
+      helpText: '',
+      error,
+      platform: process.platform,
+      arch: process.arch,
+      adapterId: identity.id,
+      adapterVersion: identity.version,
+    });
+    if (this.config.agyPathInvalid) {
+      return notInstalled('INVALID_CONFIGURATION: AGY_PATH is invalid. See configurationIssues in black_gravity_health.');
+    }
+    try {
+      const { versionText, helpText } = await this.probeVersionAndHelp();
+      return buildAgyCapabilityRecord({
+        installed: true,
+        version: versionText,
+        helpText,
+        platform: process.platform,
+        arch: process.arch,
+        adapterId: identity.id,
+        adapterVersion: identity.version,
+      });
+    } catch (error) {
+      const err = error instanceof BridgeError ? error : processError(error, 'probe');
+      return notInstalled(`${err.code}: ${redactDiagnostic(err.message)}`);
+    }
   }
 
   async listModels(): Promise<Model[]> {

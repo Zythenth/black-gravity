@@ -12383,9 +12383,9 @@ var memo = {
     if (!bucket)
       return empty;
     handoff = void 0;
-    const entry = { value: empty, issues: null };
-    bucket.set(payload.value, entry);
-    open.push(entry);
+    const entry2 = { value: empty, issues: null };
+    bucket.set(payload.value, entry2);
+    open.push(entry2);
     return empty;
   },
   guard(inst) {
@@ -12459,16 +12459,16 @@ var memo = {
         const depth = open.length;
         const result = base(payload, ctx);
         handoff = void 0;
-        const entry = open.length > depth ? open.pop() : void 0;
+        const entry2 = open.length > depth ? open.pop() : void 0;
         if (result instanceof Promise) {
           return result.then((r) => {
-            if (entry)
-              entry.issues = r.issues.length ? cloneIssues(r.issues) : NO_ISSUES;
+            if (entry2)
+              entry2.issues = r.issues.length ? cloneIssues(r.issues) : NO_ISSUES;
             return r;
           });
         }
-        if (entry)
-          entry.issues = result.issues.length ? cloneIssues(result.issues) : NO_ISSUES;
+        if (entry2)
+          entry2.issues = result.issues.length ? cloneIssues(result.issues) : NO_ISSUES;
         return result;
       };
       inst._zod.parse = wrapped;
@@ -22874,42 +22874,42 @@ function extractDefs(ctx, schema) {
   if (ctx.external && ctx.sharedDefsExtractedFor === ctx.external)
     return;
   const idToSchema = /* @__PURE__ */ new Map();
-  for (const entry of ctx.seen.entries()) {
-    const id2 = ctx.metadataRegistry.get(entry[0])?.id;
+  for (const entry2 of ctx.seen.entries()) {
+    const id2 = ctx.metadataRegistry.get(entry2[0])?.id;
     if (id2) {
       const existing = idToSchema.get(id2);
-      if (existing && existing !== entry[0]) {
+      if (existing && existing !== entry2[0]) {
         throw new Error(`Duplicate schema id "${id2}" detected during JSON Schema conversion. Two different schemas cannot share the same id when converted together.`);
       }
-      idToSchema.set(id2, entry[0]);
+      idToSchema.set(id2, entry2[0]);
     }
   }
-  const makeURI = (entry) => {
+  const makeURI = (entry2) => {
     const defsSegment = ctx.target === "draft-2020-12" ? "$defs" : "definitions";
     if (ctx.external) {
-      const externalId = ctx.external.registry.get(entry[0])?.id;
+      const externalId = ctx.external.registry.get(entry2[0])?.id;
       const uriGenerator = ctx.external.uri ?? ((id3) => id3);
       if (externalId) {
         return { ref: uriGenerator(externalId) };
       }
-      const id2 = entry[1].defId ?? entry[1].schema.id ?? `schema${ctx.counter++}`;
-      entry[1].defId = id2;
+      const id2 = entry2[1].defId ?? entry2[1].schema.id ?? `schema${ctx.counter++}`;
+      entry2[1].defId = id2;
       return { defId: id2, ref: `${uriGenerator("__shared")}#/${defsSegment}/${encodeJSONPointerSegment(id2)}` };
     }
     const uriPrefix = `#`;
     const defUriPrefix = `${uriPrefix}/${defsSegment}/`;
-    if (entry[1] === root && !entry[1].schema.id) {
+    if (entry2[1] === root && !entry2[1].schema.id) {
       return { ref: uriPrefix };
     }
-    const defId = entry[1].schema.id ?? `__schema${ctx.counter++}`;
+    const defId = entry2[1].schema.id ?? `__schema${ctx.counter++}`;
     return { defId, ref: defUriPrefix + encodeJSONPointerSegment(defId) };
   };
-  const extractToDef = (entry) => {
-    if (entry[1].schema.$ref) {
+  const extractToDef = (entry2) => {
+    if (entry2[1].schema.$ref) {
       return;
     }
-    const seen = entry[1];
-    const { ref, defId } = makeURI(entry);
+    const seen = entry2[1];
+    const { ref, defId } = makeURI(entry2);
     seen.def = { ...seen.schema };
     if (defId)
       seen.defId = defId;
@@ -22920,8 +22920,8 @@ function extractDefs(ctx, schema) {
     schema2.$ref = ref;
   };
   if (ctx.cycles === "throw") {
-    for (const entry of ctx.seen.entries()) {
-      const seen = entry[1];
+    for (const entry2 of ctx.seen.entries()) {
+      const seen = entry2[1];
       if (seen.cycle) {
         throw new Error(`Cycle detected: #/${seen.cycle?.join("/")}/<root>
 
@@ -22929,31 +22929,31 @@ Set the \`cycles\` parameter to \`"ref"\` to resolve cyclical schemas with defs.
       }
     }
   }
-  for (const entry of ctx.seen.entries()) {
-    const seen = entry[1];
-    if (schema === entry[0]) {
-      extractToDef(entry);
+  for (const entry2 of ctx.seen.entries()) {
+    const seen = entry2[1];
+    if (schema === entry2[0]) {
+      extractToDef(entry2);
       continue;
     }
     if (ctx.external) {
-      const ext = ctx.external.registry.get(entry[0])?.id;
-      if (schema !== entry[0] && ext) {
-        extractToDef(entry);
+      const ext = ctx.external.registry.get(entry2[0])?.id;
+      if (schema !== entry2[0] && ext) {
+        extractToDef(entry2);
         continue;
       }
     }
-    const id2 = ctx.metadataRegistry.get(entry[0])?.id;
+    const id2 = ctx.metadataRegistry.get(entry2[0])?.id;
     if (id2) {
-      extractToDef(entry);
+      extractToDef(entry2);
       continue;
     }
     if (seen.cycle) {
-      extractToDef(entry);
+      extractToDef(entry2);
       continue;
     }
     if (seen.count > 1) {
       if (ctx.reused === "ref") {
-        extractToDef(entry);
+        extractToDef(entry2);
       }
     }
   }
@@ -23135,12 +23135,12 @@ function finalize(ctx, schema) {
     });
   };
   if (!ctx.external || ctx.sharedEmitDoneFor !== ctx.external) {
-    for (const entry of [...ctx.seen.entries()].reverse()) {
-      flattenRef(entry[0]);
+    for (const entry2 of [...ctx.seen.entries()].reverse()) {
+      flattenRef(entry2[0]);
     }
     if (ctx.target !== "openapi-3.0") {
-      for (const entry of ctx.seen.entries()) {
-        compactTypeUnion(entry[1].def ?? entry[1].schema);
+      for (const entry2 of ctx.seen.entries()) {
+        compactTypeUnion(entry2[1].def ?? entry2[1].schema);
       }
     }
     for (const rewrite of ctx.deferred)
@@ -23187,8 +23187,8 @@ function finalize(ctx, schema) {
     delete result.id;
   const defs = ctx.external?.defs ?? {};
   if (!ctx.external || ctx.sharedEmitDoneFor !== ctx.external) {
-    for (const entry of ctx.seen.entries()) {
-      const seen = entry[1];
+    for (const entry2 of ctx.seen.entries()) {
+      const seen = entry2[1];
       if (seen.def && seen.defId) {
         if (seen.def.id === seen.defId)
           delete seen.def.id;
@@ -23800,9 +23800,9 @@ function stringifyKeyNames(bySchema, json2, visited) {
 var pendingRecords = /* @__PURE__ */ new WeakMap();
 function rewriteKeyNames(ctx) {
   const bySchema = /* @__PURE__ */ new Map();
-  for (const entry of ctx.seen.values()) {
-    if (entry.def && !bySchema.has(entry.schema))
-      bySchema.set(entry.schema, entry);
+  for (const entry2 of ctx.seen.values()) {
+    if (entry2.def && !bySchema.has(entry2.schema))
+      bySchema.set(entry2.schema, entry2);
   }
   const rewrites = /* @__PURE__ */ new Map();
   for (const record2 of pendingRecords.get(ctx) ?? []) {
@@ -23816,8 +23816,8 @@ function rewriteKeyNames(ctx) {
   }
   if (!rewrites.size)
     return;
-  for (const entry of ctx.seen.values()) {
-    for (const carrier of [entry.schema, entry.def]) {
+  for (const entry2 of ctx.seen.values()) {
+    for (const carrier of [entry2.schema, entry2.def]) {
       const rewritten = carrier && rewrites.get(carrier.propertyNames);
       if (rewritten)
         carrier.propertyNames = rewritten;
@@ -24011,8 +24011,8 @@ function toJSONSchema(input2, params) {
     const registry2 = input2;
     const ctx2 = initializeContext({ ...params, processors: allProcessors });
     const defs = {};
-    for (const entry of registry2._idmap.entries()) {
-      const [_, schema] = entry;
+    for (const entry2 of registry2._idmap.entries()) {
+      const [_, schema] = entry2;
       processSchema(schema, ctx2);
     }
     const schemas = {};
@@ -24022,8 +24022,8 @@ function toJSONSchema(input2, params) {
       defs
     };
     ctx2.external = external;
-    for (const entry of registry2._idmap.entries()) {
-      const [key, schema] = entry;
+    for (const entry2 of registry2._idmap.entries()) {
+      const [key, schema] = entry2;
       extractDefs(ctx2, schema);
       assignProp(schemas, key, finalize(ctx2, schema));
     }
@@ -28982,20 +28982,20 @@ var ProjectMemoryStore = class {
     } catch (err) {
       throw new BridgeError("INVALID_MEMORY_STATE", `Failed to read memory directory: ${err instanceof Error ? err.message : String(err)}`);
     }
-    for (const entry of entries2) {
-      if (entry === "memory.lock" || entry === "memory-recovery.lock") {
-        const lock = lstatSync(path.join(this.memoryDirectory, entry));
+    for (const entry2 of entries2) {
+      if (entry2 === "memory.lock" || entry2 === "memory-recovery.lock") {
+        const lock = lstatSync(path.join(this.memoryDirectory, entry2));
         if (lock.isSymbolicLink() || !lock.isFile() || lock.nlink !== 1 || lock.size > 1024)
           throw new BridgeError("INVALID_MEMORY_STATE", "Unsafe memory lock metadata");
         continue;
       }
-      const entryPath = path.join(this.memoryDirectory, entry);
+      const entryPath = path.join(this.memoryDirectory, entry2);
       const entryStat = lstatSync(entryPath);
       if (entryStat.isSymbolicLink() || !entryStat.isDirectory()) {
-        throw new BridgeError("INVALID_MEMORY_STATE", `Invalid non-directory entry in memory directory: ${entry}`);
+        throw new BridgeError("INVALID_MEMORY_STATE", `Invalid non-directory entry in memory directory: ${entry2}`);
       }
-      if (!/^[a-f0-9]{64}$/.test(entry)) {
-        throw new BridgeError("INVALID_MEMORY_STATE", `Unknown directory in memory directory: ${entry}`);
+      if (!/^[a-f0-9]{64}$/.test(entry2)) {
+        throw new BridgeError("INVALID_MEMORY_STATE", `Unknown directory in memory directory: ${entry2}`);
       }
       const projectFiles = readdirSync(entryPath);
       for (const file3 of projectFiles) {
@@ -29011,10 +29011,10 @@ var ProjectMemoryStore = class {
         if (!SPECIALIST_REGEX.test(specialist) || isWindowsDeviceName(specialist)) {
           throw new BridgeError("INVALID_MEMORY_STATE", `Invalid specialist filename: ${file3}`);
         }
-        if (entry === excludeProjectId && specialist === excludeSpecialist) {
+        if (entry2 === excludeProjectId && specialist === excludeSpecialist) {
           continue;
         }
-        const record2 = this.readRecord(filePath, entry, specialist);
+        const record2 = this.readRecord(filePath, entry2, specialist);
         totalEntries += 1;
         totalBytes += Buffer.byteLength(record2.text, "utf8");
       }
@@ -29093,18 +29093,18 @@ var ProjectMemoryStore = class {
       }
       const entries2 = readdirSync(projectDir);
       const summaries = [];
-      for (const entry of entries2) {
-        const entryPath = path.join(projectDir, entry);
+      for (const entry2 of entries2) {
+        const entryPath = path.join(projectDir, entry2);
         const entryStat = lstatSync(entryPath);
         if (entryStat.isSymbolicLink() || !entryStat.isFile()) {
-          throw new BridgeError("INVALID_MEMORY_STATE", `Unknown or non-file entry in project memory: ${entry}`);
+          throw new BridgeError("INVALID_MEMORY_STATE", `Unknown or non-file entry in project memory: ${entry2}`);
         }
-        if (!entry.endsWith(".json")) {
-          throw new BridgeError("INVALID_MEMORY_STATE", `Unknown file in project memory: ${entry}`);
+        if (!entry2.endsWith(".json")) {
+          throw new BridgeError("INVALID_MEMORY_STATE", `Unknown file in project memory: ${entry2}`);
         }
-        const specialist = entry.slice(0, -5);
+        const specialist = entry2.slice(0, -5);
         if (!SPECIALIST_REGEX.test(specialist) || isWindowsDeviceName(specialist)) {
-          throw new BridgeError("INVALID_MEMORY_STATE", `Invalid specialist filename: ${entry}`);
+          throw new BridgeError("INVALID_MEMORY_STATE", `Invalid specialist filename: ${entry2}`);
         }
         const record2 = this.readRecord(entryPath, projectId, specialist);
         summaries.push({
@@ -29266,8 +29266,8 @@ var memorySelectionSchema = external_exports.array(external_exports.object({
   specialist: external_exports.string().regex(/^[a-z][a-z0-9-]{0,63}$/),
   sha256: external_exports.string().regex(/^[a-f0-9]{64}$/)
 }).strict()).max(8).refine((items) => new Set(items.map((item) => item.specialist)).size === items.length, "Duplicate memory specialist");
-var memorySnapshotsSchema = external_exports.array(memorySnapshotSchema.superRefine((entry, ctx) => {
-  if (entry.text.includes("\0") || Buffer.byteLength(entry.text, "utf8") > 1024 * 1024 || entry.sha256 !== computeMemorySha256(entry.projectId, entry.specialist, entry.text)) {
+var memorySnapshotsSchema = external_exports.array(memorySnapshotSchema.superRefine((entry2, ctx) => {
+  if (entry2.text.includes("\0") || Buffer.byteLength(entry2.text, "utf8") > 1024 * 1024 || entry2.sha256 !== computeMemorySha256(entry2.projectId, entry2.specialist, entry2.text)) {
     ctx.addIssue({ code: "custom", message: "Invalid private memory snapshot content or hash" });
   }
 })).max(8).refine((items) => new Set(items.map((item) => item.specialist)).size === items.length, "Duplicate memory snapshot");
@@ -29718,14 +29718,14 @@ var mcpCatalogEntrySchema = external_exports.object({
   tools: external_exports.array(mcpCatalogToolSchema).min(1).max(100).refine((tools) => new Set(tools.map((t) => t.name)).size === tools.length, {
     message: "tools in catalog entry must have unique names"
   })
-}).strict().refine((entry) => entry.command !== void 0 !== (entry.serverUrl !== void 0), { message: "Require exactly one transport: command or serverUrl" }).refine((entry) => {
-  if (entry.serverUrl !== void 0) {
-    return entry.args === void 0 && entry.cwd === void 0 && entry.env === void 0;
+}).strict().refine((entry2) => entry2.command !== void 0 !== (entry2.serverUrl !== void 0), { message: "Require exactly one transport: command or serverUrl" }).refine((entry2) => {
+  if (entry2.serverUrl !== void 0) {
+    return entry2.args === void 0 && entry2.cwd === void 0 && entry2.env === void 0;
   }
   return true;
-}, { message: "Reject stdio-only fields (args, cwd, env) when HTTP transport is used" }).refine((entry) => {
-  if (entry.command !== void 0) {
-    return entry.headers === void 0;
+}, { message: "Reject stdio-only fields (args, cwd, env) when HTTP transport is used" }).refine((entry2) => {
+  if (entry2.command !== void 0) {
+    return entry2.headers === void 0;
   }
   return true;
 }, { message: "Reject headers when stdio transport is used" });
@@ -29809,20 +29809,20 @@ function resolveAgentPolicy(selection, ceilingTools, catalog, mode, namespace) {
         throw new BridgeError("POLICY_NOT_ALLOWED", `Duplicate serverId '${sel.serverId}' in MCP selection`);
       }
       seenServerIds.add(sel.serverId);
-      const entry = parsedCatalog.data.find((c) => c.id === sel.serverId);
-      if (!entry) {
+      const entry2 = parsedCatalog.data.find((c) => c.id === sel.serverId);
+      if (!entry2) {
         throw new BridgeError("POLICY_NOT_ALLOWED", `Unknown MCP server '${sel.serverId}'`);
       }
       const catalogToolMap = /* @__PURE__ */ new Map();
-      for (const t of entry.tools) {
+      for (const t of entry2.tools) {
         catalogToolMap.set(t.name, t.readOnly);
       }
       let eligibleTools;
       if (sel.tools === void 0) {
         if (mode === "write") {
-          eligibleTools = entry.tools.map((t) => t.name);
+          eligibleTools = entry2.tools.map((t) => t.name);
         } else {
-          eligibleTools = entry.tools.filter((t) => t.readOnly).map((t) => t.name);
+          eligibleTools = entry2.tools.filter((t) => t.readOnly).map((t) => t.name);
         }
       } else {
         const seenTools = /* @__PURE__ */ new Set();
@@ -29847,7 +29847,7 @@ function resolveAgentPolicy(selection, ceilingTools, catalog, mode, namespace) {
       }
       const cleanNs = namespace.replace(/-/g, "").toLowerCase();
       const cleanServerId = sel.serverId.replace(/-/g, "_");
-      const serverName = entry.nativeServerName ?? `bridge_${cleanNs}_${cleanServerId}`;
+      const serverName = entry2.nativeServerName ?? `bridge_${cleanNs}_${cleanServerId}`;
       if (resolvedMcpServers.some((server) => server.serverName === serverName))
         throw new BridgeError("POLICY_NOT_ALLOWED", "Selected MCP server aliases must be unique");
       resolvedMcpServers.push({
@@ -29892,14 +29892,14 @@ function mapFsError(error62) {
     return "access-denied";
   return "unresolvable";
 }
-function canonicalizeRoot(entry) {
-  if (typeof entry !== "string")
+function canonicalizeRoot(entry2) {
+  if (typeof entry2 !== "string")
     return { reason: "not-a-string" };
-  if (!path3.isAbsolute(entry))
+  if (!path3.isAbsolute(entry2))
     return { reason: "not-absolute" };
   let canonical;
   try {
-    canonical = realpathSync2.native(entry);
+    canonical = realpathSync2.native(entry2);
   } catch (error62) {
     return { reason: mapFsError(error62), error: error62 };
   }
@@ -29983,6 +29983,7 @@ var queryTools = /* @__PURE__ */ new Set([
   "black_gravity_health",
   "black_gravity_get_agent_policy",
   "black_gravity_list_models",
+  "black_gravity_capabilities",
   "black_gravity_get_model",
   "black_gravity_usage",
   "black_gravity_list_project_files",
@@ -30243,23 +30244,23 @@ async function buildSafeGitPath(cwd, rawPath, excludedRoots = []) {
   const entries2 = pathStr.split(path5.delimiter);
   const safeEntries = [];
   for (const rawEntry of entries2) {
-    const entry = rawEntry.trim();
-    if (!entry)
+    const entry2 = rawEntry.trim();
+    if (!entry2)
       continue;
-    if (!path5.isAbsolute(entry))
+    if (!path5.isAbsolute(entry2))
       continue;
-    if (allExcluded.some((root) => isInsideOrEqual(root, entry, isWindows))) {
+    if (allExcluded.some((root) => isInsideOrEqual(root, entry2, isWindows))) {
       continue;
     }
     let canonicalEntry;
     try {
-      canonicalEntry = await realpath(entry);
+      canonicalEntry = await realpath(entry2);
     } catch {
     }
     if (canonicalEntry && allExcluded.some((root) => isInsideOrEqual(root, canonicalEntry, isWindows))) {
       continue;
     }
-    safeEntries.push(entry);
+    safeEntries.push(entry2);
   }
   return safeEntries.join(path5.delimiter);
 }
@@ -30283,10 +30284,10 @@ async function resolveGitExecutable(cwd, pathEnv, excludedRoots = []) {
     ...await Promise.all(excludedRoots.flatMap((root) => [Promise.resolve(path5.resolve(root)), realpath(root).catch(() => path5.resolve(root))]))
   ];
   const entries2 = safePath.split(path5.delimiter);
-  for (const entry of entries2) {
-    if (!entry)
+  for (const entry2 of entries2) {
+    if (!entry2)
       continue;
-    const candidate = path5.join(entry, executableName);
+    const candidate = path5.join(entry2, executableName);
     let stats;
     try {
       stats = await stat(candidate);
@@ -31252,9 +31253,9 @@ async function verifyProvidedSkills(copyDirectory, manifest) {
     const onDiskFiles = [];
     async function scan(dir, relPrefix) {
       const entries2 = await readdir(dir, { withFileTypes: true });
-      for (const entry of entries2) {
-        const entryRel = relPrefix + "/" + entry.name;
-        const fullPath = path6.join(dir, entry.name);
+      for (const entry2 of entries2) {
+        const entryRel = relPrefix + "/" + entry2.name;
+        const fullPath = path6.join(dir, entry2.name);
         const st = await lstat(fullPath);
         if (st.isSymbolicLink()) {
           throw new BridgeError("SKILL_VERIFICATION_FAILED", `Symbolic link found in skill: ${entryRel}`);
@@ -31454,11 +31455,11 @@ async function listCopyFiles(root) {
   const files = [];
   const pending = [""];
   for (let prefix = pending.pop(); prefix !== void 0; prefix = pending.pop()) {
-    for (const entry of await readdir2(join(root, prefix), { withFileTypes: true })) {
-      const relative2 = prefix ? prefix + "/" + entry.name : entry.name;
-      if (entry.isDirectory())
+    for (const entry2 of await readdir2(join(root, prefix), { withFileTypes: true })) {
+      const relative2 = prefix ? prefix + "/" + entry2.name : entry2.name;
+      if (entry2.isDirectory())
         pending.push(relative2);
-      else if (entry.isFile())
+      else if (entry2.isFile())
         files.push(relative2);
     }
   }
@@ -32076,7 +32077,7 @@ function protectSource(config2, marker) {
     present2 = kind(marker.source) === "directory";
   } catch {
   }
-  if (!present2 || config2.forbiddenDirectories.some((entry) => samePath(entry, marker.source)))
+  if (!present2 || config2.forbiddenDirectories.some((entry2) => samePath(entry2, marker.source)))
     return config2;
   return { ...config2, forbiddenDirectories: [...config2.forbiddenDirectories, marker.source] };
 }
@@ -32764,8 +32765,8 @@ function generateHookSource() {
 async function stageExecutionPolicy(copyDirectory, setup, remaining) {
   resolvedAgentPolicySchema.parse(setup.policy);
   mcpCatalogSchema.parse(setup.catalog);
-  const selectedDefinitions = setup.policy.mcpServers.map((server) => setup.catalog.find((entry) => entry.id === server.serverId));
-  if (selectedDefinitions.some((entry) => !entry) || crypto2.createHash("sha256").update(JSON.stringify(selectedDefinitions)).digest("hex") !== setup.policy.catalogSha256)
+  const selectedDefinitions = setup.policy.mcpServers.map((server) => setup.catalog.find((entry2) => entry2.id === server.serverId));
+  if (selectedDefinitions.some((entry2) => !entry2) || crypto2.createHash("sha256").update(JSON.stringify(selectedDefinitions)).digest("hex") !== setup.policy.catalogSha256)
     throw new BridgeError("AGENT_POLICY_CHANGED", "Trusted MCP catalog changed after task admission");
   const canonicalTmp = await fsp.realpath(os3.tmpdir());
   const absoluteCopy = path8.resolve(copyDirectory);
@@ -32941,26 +32942,26 @@ async function stageExecutionPolicy(copyDirectory, setup, remaining) {
     const manifestContent = JSON.stringify(manifestPayload, null, 2) + "\n";
     const mcpConfig = {};
     for (const server of setup.policy.mcpServers) {
-      const entry = setup.catalog.find((c) => c.id === server.serverId);
-      if (!entry) {
+      const entry2 = setup.catalog.find((c) => c.id === server.serverId);
+      if (!entry2) {
         throw new BridgeError("POLICY_NOT_ALLOWED", `MCP server '${server.serverId}' not found in catalog`);
       }
       const serverConfig = {};
-      if (entry.command !== void 0) {
-        serverConfig.command = entry.command;
-        if (entry.args !== void 0)
-          serverConfig.args = entry.args;
-        if (entry.env !== void 0)
-          serverConfig.env = entry.env;
-        if (entry.cwd !== void 0)
-          serverConfig.cwd = entry.cwd;
-      } else if (entry.serverUrl !== void 0) {
-        serverConfig.serverUrl = entry.serverUrl;
-        if (entry.headers !== void 0)
-          serverConfig.headers = entry.headers;
+      if (entry2.command !== void 0) {
+        serverConfig.command = entry2.command;
+        if (entry2.args !== void 0)
+          serverConfig.args = entry2.args;
+        if (entry2.env !== void 0)
+          serverConfig.env = entry2.env;
+        if (entry2.cwd !== void 0)
+          serverConfig.cwd = entry2.cwd;
+      } else if (entry2.serverUrl !== void 0) {
+        serverConfig.serverUrl = entry2.serverUrl;
+        if (entry2.headers !== void 0)
+          serverConfig.headers = entry2.headers;
       }
       const selectedToolSet = new Set(server.tools);
-      const disabledTools = entry.tools.map((t) => t.name).filter((t) => !selectedToolSet.has(t));
+      const disabledTools = entry2.tools.map((t) => t.name).filter((t) => !selectedToolSet.has(t));
       if (disabledTools.length > 0) {
         serverConfig.disabledTools = disabledTools;
       }
@@ -34363,7 +34364,7 @@ async function inspectPrivateBaseline(project, limits, auxPaths) {
     }
   }
   if (entriesToScan.length > 0) {
-    const batchInput = Buffer.from(entriesToScan.map((entry) => entry.oid + "\n").join(""), "utf8");
+    const batchInput = Buffer.from(entriesToScan.map((entry2) => entry2.oid + "\n").join(""), "utf8");
     const maxOutputBytes = limits.maxCopyBytes + Math.max(65536, entriesToScan.length * 256);
     const CHUNK_OVERLAP = 4 * 1024;
     const SCAN_WINDOW_LIMIT = 64 * 1024;
@@ -34636,13 +34637,13 @@ async function verifyReadOnlyCopy(project, baseline = project.baseline) {
   const expected = new Map([...baseline, ...(project.providedSkills ?? []).flatMap((skill) => skill.files.map((file3) => [file3.path, file3.sha256])), ...(project.executionPolicy?.files ?? []).map((file3) => [file3.path, file3.sha256])]);
   const seen = /* @__PURE__ */ new Set();
   async function visit2(directory, prefix = "") {
-    for (const entry of await readdir3(directory, { withFileTypes: true })) {
-      const relative2 = prefix + entry.name;
-      if (entry.isDirectory())
-        await visit2(path10.join(directory, entry.name), relative2 + "/");
+    for (const entry2 of await readdir3(directory, { withFileTypes: true })) {
+      const relative2 = prefix + entry2.name;
+      if (entry2.isDirectory())
+        await visit2(path10.join(directory, entry2.name), relative2 + "/");
       else {
         seen.add(relative2);
-        if (!entry.isFile() || expected.get(relative2) !== await sha256File2(path10.join(directory, entry.name))) {
+        if (!entry2.isFile() || expected.get(relative2) !== await sha256File2(path10.join(directory, entry2.name))) {
           throw new BridgeError("READ_ONLY_VIOLATION", "Read-only task changed the copy: " + relative2);
         }
       }
@@ -36279,7 +36280,7 @@ function readMcpCatalog(value) {
   const list = parseJsonList(value, variable, 20);
   if (list.issues.length > 0)
     return { mcpCatalog: [], issues: list.issues };
-  const { valid, issues } = validateUniqueEntries(list.items, variable, mcpCatalogEntrySchema, (entry) => entry.id);
+  const { valid, issues } = validateUniqueEntries(list.items, variable, mcpCatalogEntrySchema, (entry2) => entry2.id);
   let validRemaining = valid;
   if (validRemaining.length > 0) {
     const serialized = JSON.stringify(validRemaining);
@@ -36402,19 +36403,19 @@ function assertAgyPathUsable(config2) {
     throw new BridgeError("INVALID_CONFIGURATION", "AGY_PATH is invalid. See configurationIssues in black_gravity_health.");
   }
 }
-function isFullWindowsRoot(entry) {
-  if (/^[A-Za-z]:[\\/]/.test(entry))
+function isFullWindowsRoot(entry2) {
+  if (/^[A-Za-z]:[\\/]/.test(entry2))
     return true;
-  if (/^(?:\\\\|\/\/)(?![\\/]|[?.][\\/])[^\\/]+[\\/][^\\/]+(?:[\\/].*)?$/.test(entry))
+  if (/^(?:\\\\|\/\/)(?![\\/]|[?.][\\/])[^\\/]+[\\/][^\\/]+(?:[\\/].*)?$/.test(entry2))
     return true;
   return false;
 }
-function isFullWindowsPath(entry) {
-  if (isFullWindowsRoot(entry))
+function isFullWindowsPath(entry2) {
+  if (isFullWindowsRoot(entry2))
     return true;
-  if (/^\\\\\?\\(?:[A-Za-z]:[\\/]|UNC[\\/][^\\/]+[\\/][^\\/]+(?:[\\/].*)?$)/i.test(entry))
+  if (/^\\\\\?\\(?:[A-Za-z]:[\\/]|UNC[\\/][^\\/]+[\\/][^\\/]+(?:[\\/].*)?$)/i.test(entry2))
     return true;
-  if (/^\\\\\?\\Volume\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}[\\/]/i.test(entry))
+  if (/^\\\\\?\\Volume\{[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}[\\/]/i.test(entry2))
     return true;
   return false;
 }
@@ -36520,17 +36521,17 @@ function readForbiddenDirectories(value) {
   const issues = [];
   const valid = [];
   for (let i = 0; i < entries2.length; i++) {
-    const entry = entries2[i];
-    if (entry.includes("\0")) {
+    const entry2 = entries2[i];
+    if (entry2.includes("\0")) {
       issues.push({ variable, index: i, reason: "invalid-entry" });
       continue;
     }
-    const isAbsolute4 = process.platform === "win32" ? isFullWindowsRoot(entry) : path12.isAbsolute(entry);
+    const isAbsolute4 = process.platform === "win32" ? isFullWindowsRoot(entry2) : path12.isAbsolute(entry2);
     if (!isAbsolute4) {
       issues.push({ variable, index: i, reason: "not-absolute" });
       continue;
     }
-    valid.push(path12.resolve(entry));
+    valid.push(path12.resolve(entry2));
   }
   if (issues.length > 0) {
     return { forbiddenDirectories: valid, forbiddenDirectoriesInvalid: true, issues };
@@ -36838,6 +36839,103 @@ function cliEnvironment(allowedEnvVars, source = process.env, platform = process
   return result;
 }
 
+// dist/src/capability-registry.js
+var CAPABILITY_OBSERVATIONS = ["observed", "absent", "unknown"];
+var CAPABILITY_SOURCES = ["help", "adapter", "recorded", "none"];
+var REGISTRY_CAPABILITIES = [
+  "read",
+  "write",
+  "sandbox",
+  "network",
+  "skills",
+  "resources",
+  "structuredOutput",
+  "cancel",
+  "resume",
+  "observableUsage",
+  "modelList",
+  "modelSelection",
+  "effort",
+  "sessionsList"
+];
+var EFFECTIVE_MODEL_ABSENT_VERSIONS = ["1.5.13"];
+var USAGE_OBSERVED_VERSIONS = ["1.5.13"];
+function entry(status2, source, detail) {
+  return { status: status2, source, detail };
+}
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function hasOption(help, flag) {
+  return new RegExp("(^|[\\s,\\[(|])" + escapeRegExp(flag) + "(?=$|[\\s,=\\])|])", "m").test(help);
+}
+function hasSubcommand(help, name) {
+  return new RegExp("^\\s*" + escapeRegExp(name) + "(?=\\s|$)", "m").test(help);
+}
+function recordedEditToolRestrictions() {
+  return [{
+    tool: "edit_file",
+    restriction: 'Target text must match exactly, including line endings; on CRLF files searches written with LF fail with "target content not found".',
+    status: "observed",
+    source: "recorded",
+    verifiedVersions: [],
+    bridgeMitigation: "Pure-CRLF text files up to 16 MiB are handed to the executor as LF and restored to their original bytes before preview, tests and integration."
+  }];
+}
+function unqueriedCapabilities() {
+  return Object.fromEntries(REGISTRY_CAPABILITIES.map((key) => [key, entry("unknown", "none", "CLI could not be queried")]));
+}
+function installedCapabilities(help, version2) {
+  const helpFlag = (flag, detail = flag) => entry(hasOption(help, flag) ? "observed" : "absent", "help", detail);
+  const hasStreamJson = help.includes("stream-json");
+  const hasOutputFormat = hasOption(help, "--output-format");
+  const hasSandbox = hasOption(help, "--sandbox");
+  const hasReadMode = help.split(/\r?\n/).some((line) => hasOption(line, "--mode") && /\bplan\b/.test(line));
+  const hasObservableUsage = hasStreamJson && version2 !== null && USAGE_OBSERVED_VERSIONS.includes(version2);
+  return {
+    read: entry(hasReadMode ? "observed" : "absent", "help", "--mode and plan"),
+    write: entry(hasSandbox && hasStreamJson && hasOutputFormat ? "observed" : "absent", "adapter", "usable through this adapter only when --sandbox and stream-json output are both advertised; the adapter writes only inside an isolated copy under agy --sandbox"),
+    sandbox: helpFlag("--sandbox"),
+    network: entry("unknown", "none", "the CLI help does not declare it"),
+    skills: entry(hasOption(help, "--add-dir") ? "observed" : "absent", "adapter", "this adapter delivers skills by adding their directories with --add-dir"),
+    resources: entry("unknown", "none", "the CLI help does not declare it"),
+    structuredOutput: helpFlag("--json-schema"),
+    cancel: entry("unknown", "none", "the CLI help does not declare it; the bridge terminates the process for cancel, which is not native CLI cancel"),
+    resume: helpFlag("--conversation"),
+    observableUsage: hasObservableUsage ? entry("observed", "adapter", "the stream-json result event of this version carries usage counters") : entry("unknown", "adapter", "not checked for this version"),
+    modelList: entry(hasSubcommand(help, "models") ? "observed" : "absent", "help", "models"),
+    modelSelection: helpFlag("--model"),
+    effort: helpFlag("--effort"),
+    sessionsList: entry("unknown", "none", "the CLI help does not declare it")
+  };
+}
+function effectiveModelEntry(installed, version2) {
+  if (!installed) {
+    return entry("unknown", "none", "CLI could not be queried");
+  }
+  if (version2 !== null && EFFECTIVE_MODEL_ABSENT_VERSIONS.includes(version2)) {
+    return entry("absent", "adapter", "In this version the stream-json init event repeats the --model value only when one is passed and has no model field otherwise; the result event has none. No event reports the model actually resolved; an init model value is an echo of the request, not proof of the model used.");
+  }
+  return entry("unknown", "adapter", "not checked for this version");
+}
+function buildAgyCapabilityRecord(input2) {
+  const version2 = input2.installed ? input2.version ?? null : null;
+  return {
+    cli: "agy",
+    adapterId: input2.adapterId,
+    adapterVersion: input2.adapterVersion,
+    installed: input2.installed,
+    version: version2,
+    platform: input2.platform,
+    arch: input2.arch,
+    queriedWith: ["--version", "--help"],
+    capabilities: input2.installed ? installedCapabilities(input2.helpText, version2) : unqueriedCapabilities(),
+    effectiveModel: effectiveModelEntry(input2.installed, version2),
+    editToolRestrictions: recordedEditToolRestrictions(),
+    ...input2.error !== void 0 ? { error: input2.error } : {}
+  };
+}
+
 // dist/src/cli-adapter.js
 var DELEGATION_GUIDANCE = "\n\n<bridge-environment>\nThe working directory is an isolated copy containing only the selected project files. Dependencies and build outputs ignored by Git (for example node_modules, dist or caches) are usually absent, and paths outside the copy, such as the user profile or bridge state, are unavailable unless this prompt lists them. Do not search for them or try to install or build them. If a check needs something absent, report it as unverified and finish instead of looking elsewhere. Use only the permitted tools; when a tool call is denied, do not retry it or reach the same goal another way.\nMake minimal, cohesive edits: change only what the task needs, leave unrelated lines byte-for-byte unchanged, and keep each file's existing line endings, indentation and style. Never repeat the same block of logic; extract it into a small helper. When wrapping, overriding or replacing a function, keep its full signature and forward every argument and return value. Do not change timers, process lifetime, error codes or messages unless the task asks for it. Change only the lines and values the task names; a similar value elsewhere is out of scope unless the task says so. Do not create temporary, scratch or test files in the copy: every new file becomes part of the patch. Before finishing, re-read each edited file and remove duplication or unnecessary code.\n</bridge-environment>";
 function taskPrompt(options, maxChars) {
@@ -36975,6 +37073,32 @@ var CliAdapter = class {
       });
     });
   }
+  async probeVersionAndHelp() {
+    const [version2, help] = await Promise.all([this.probe(["--version"]), this.probe(["--help"])]);
+    if (version2.timedOut || help.timedOut) {
+      throw new BridgeError("AGY_PROBE_FAILED", "agy probe timed out");
+    }
+    if (version2.signal !== null || help.signal !== null) {
+      throw new BridgeError("AGY_PROBE_FAILED", `agy probe terminated by signal ${version2.signal ?? help.signal}`);
+    }
+    if (version2.code !== 0) {
+      const diag = redactDiagnostic((version2.stderr || version2.stdout).trim());
+      throw new BridgeError("AGY_PROBE_FAILED", `agy --version failed with exit code ${version2.code}${diag ? ": " + diag : ""}`);
+    }
+    if (help.code !== 0) {
+      const diag = redactDiagnostic((help.stderr || help.stdout).trim());
+      throw new BridgeError("AGY_PROBE_FAILED", `agy --help failed with exit code ${help.code}${diag ? ": " + diag : ""}`);
+    }
+    const versionText = (version2.stdout || version2.stderr).trim();
+    const helpText = help.stdout + "\n" + help.stderr;
+    if (!versionText) {
+      throw new BridgeError("AGY_INCOMPATIBLE", "agy --version returned empty or invalid output");
+    }
+    if (!help.stdout.trim() && !help.stderr.trim()) {
+      throw new BridgeError("AGY_INCOMPATIBLE", "agy --help returned empty output");
+    }
+    return { versionText, helpText };
+  }
   async discover() {
     if (this.config.agyPathInvalid) {
       this.installed = false;
@@ -36991,29 +37115,7 @@ var CliAdapter = class {
       return discovery;
     }
     try {
-      const [version2, help] = await Promise.all([this.probe(["--version"]), this.probe(["--help"])]);
-      if (version2.timedOut || help.timedOut) {
-        throw new BridgeError("AGY_PROBE_FAILED", "agy probe timed out");
-      }
-      if (version2.signal !== null || help.signal !== null) {
-        throw new BridgeError("AGY_PROBE_FAILED", `agy probe terminated by signal ${version2.signal ?? help.signal}`);
-      }
-      if (version2.code !== 0) {
-        const diag = redactDiagnostic((version2.stderr || version2.stdout).trim());
-        throw new BridgeError("AGY_PROBE_FAILED", `agy --version failed with exit code ${version2.code}${diag ? ": " + diag : ""}`);
-      }
-      if (help.code !== 0) {
-        const diag = redactDiagnostic((help.stderr || help.stdout).trim());
-        throw new BridgeError("AGY_PROBE_FAILED", `agy --help failed with exit code ${help.code}${diag ? ": " + diag : ""}`);
-      }
-      const versionText = (version2.stdout || version2.stderr).trim();
-      const helpText = help.stdout + "\n" + help.stderr;
-      if (!versionText) {
-        throw new BridgeError("AGY_INCOMPATIBLE", "agy --version returned empty or invalid output");
-      }
-      if (!help.stdout.trim() && !help.stderr.trim()) {
-        throw new BridgeError("AGY_INCOMPATIBLE", "agy --help returned empty output");
-      }
+      const { versionText, helpText } = await this.probeVersionAndHelp();
       const streaming = helpText.includes("stream-json") && helpText.includes("--output-format");
       const sandbox = helpText.includes("--sandbox");
       if (!streaming || !sandbox) {
@@ -37072,6 +37174,35 @@ var CliAdapter = class {
         discovery.error = error62 instanceof Error ? redactDiagnostic(error62.message) : redactDiagnostic(String(error62));
     }
     return discovery;
+  }
+  async capabilityRecord(identity) {
+    const notInstalled = (error62) => buildAgyCapabilityRecord({
+      installed: false,
+      helpText: "",
+      error: error62,
+      platform: process.platform,
+      arch: process.arch,
+      adapterId: identity.id,
+      adapterVersion: identity.version
+    });
+    if (this.config.agyPathInvalid) {
+      return notInstalled("INVALID_CONFIGURATION: AGY_PATH is invalid. See configurationIssues in black_gravity_health.");
+    }
+    try {
+      const { versionText, helpText } = await this.probeVersionAndHelp();
+      return buildAgyCapabilityRecord({
+        installed: true,
+        version: versionText,
+        helpText,
+        platform: process.platform,
+        arch: process.arch,
+        adapterId: identity.id,
+        adapterVersion: identity.version
+      });
+    } catch (error62) {
+      const err = error62 instanceof BridgeError ? error62 : processError(error62, "probe");
+      return notInstalled(`${err.code}: ${redactDiagnostic(err.message)}`);
+    }
   }
   async listModels() {
     assertAgyPathUsable(this.config);
@@ -37220,12 +37351,12 @@ function logTaskEvent(taskId, type, data) {
   if (!type.startsWith("task.") && type !== "process.started")
     return;
   const details = data && typeof data === "object" ? data : {};
-  const entry = { timestamp: (/* @__PURE__ */ new Date()).toISOString(), taskId, type };
+  const entry2 = { timestamp: (/* @__PURE__ */ new Date()).toISOString(), taskId, type };
   if (type === "process.started" && typeof details.pid === "number")
-    entry.pid = details.pid;
+    entry2.pid = details.pid;
   if (type === "task.failed" && typeof details.code === "string")
-    entry.code = details.code;
-  process.stderr.write(JSON.stringify(entry) + "\n");
+    entry2.code = details.code;
+  process.stderr.write(JSON.stringify(entry2) + "\n");
 }
 
 // dist/src/event-store.js
@@ -37950,66 +38081,66 @@ var STDERR_BUFFER_LIMIT = 1e4;
 var ResponseRedactor = class {
   pending = /* @__PURE__ */ new Map();
   releaseDelta(index, delta, done, onTruncated) {
-    let entry = this.pending.get(index);
-    if (!entry) {
+    let entry2 = this.pending.get(index);
+    if (!entry2) {
       if (this.pending.size >= MAX_RESPONSE_STEPS)
         return "";
-      entry = { text: "", redaction: {}, suppressing: false, dropped: "", untilDone: false, held: [], overflow: false };
-      this.pending.set(index, entry);
+      entry2 = { text: "", redaction: {}, suppressing: false, dropped: "", untilDone: false, held: [], overflow: false };
+      this.pending.set(index, entry2);
     }
     let input2 = delta;
-    if (entry.suppressing) {
-      const newline = entry.untilDone ? -1 : input2.indexOf("\n");
-      this.dropText(entry, newline < 0 ? input2 : input2.slice(0, newline));
-      input2 = newline < 0 || entry.untilDone ? "" : input2.slice(newline + 1);
-      if (newline >= 0 && !entry.untilDone)
-        entry.suppressing = false;
+    if (entry2.suppressing) {
+      const newline = entry2.untilDone ? -1 : input2.indexOf("\n");
+      this.dropText(entry2, newline < 0 ? input2 : input2.slice(0, newline));
+      input2 = newline < 0 || entry2.untilDone ? "" : input2.slice(newline + 1);
+      if (newline >= 0 && !entry2.untilDone)
+        entry2.suppressing = false;
     }
-    entry.text += input2;
-    const cut = done ? entry.text.length : entry.text.lastIndexOf("\n") + 1;
-    const ready = entry.text.slice(0, cut);
-    entry.text = entry.text.slice(cut);
+    entry2.text += input2;
+    const cut = done ? entry2.text.length : entry2.text.lastIndexOf("\n") + 1;
+    const ready = entry2.text.slice(0, cut);
+    entry2.text = entry2.text.slice(cut);
     let marker = "";
     const buffered = [...this.pending.values()].filter((item) => item.text).length;
-    if (entry.text.length > RESPONSE_HOLD_BACK_CHARS || entry.text && buffered > MAX_BUFFERED_RESPONSE_STEPS) {
-      this.dropText(entry, entry.text);
-      entry.text = "";
-      entry.suppressing = true;
+    if (entry2.text.length > RESPONSE_HOLD_BACK_CHARS || entry2.text && buffered > MAX_BUFFERED_RESPONSE_STEPS) {
+      this.dropText(entry2, entry2.text);
+      entry2.text = "";
+      entry2.suppressing = true;
       marker = "[response line suppressed before redaction]\n";
       onTruncated?.(index, RESPONSE_HOLD_BACK_CHARS);
     }
     let released = "";
     const redactLine = (line) => {
-      const redacted = redactDiagnostic(line, entry.redaction);
+      const redacted = redactDiagnostic(line, entry2.redaction);
       return line.endsWith("\n") && !redacted.endsWith("\n") ? redacted + "\n" : redacted;
     };
     for (const line of ready.split(/(?<=\n)/).filter(Boolean)) {
-      const inBody = entry.held.length > 0 || entry.overflow;
+      const inBody = entry2.held.length > 0 || entry2.overflow;
       const minimum = inBody ? 1 : 16;
       const bodyLine = new RegExp(`^[A-Za-z0-9+/=]{${minimum},1024}\\r?\\n$`).test(line) || inBody && /^\r?\n$/.test(line);
-      if (!entry.redaction.inPrivateKey && bodyLine) {
-        if (entry.overflow)
+      if (!entry2.redaction.inPrivateKey && bodyLine) {
+        if (entry2.overflow)
           continue;
-        entry.held.push(line);
-        if (entry.held.length > MAX_HELD_RESPONSE_LINES) {
-          entry.held = [];
-          entry.overflow = true;
+        entry2.held.push(line);
+        if (entry2.held.length > MAX_HELD_RESPONSE_LINES) {
+          entry2.held = [];
+          entry2.overflow = true;
           released += "[response lines suppressed before redaction]\n";
         }
         continue;
       }
-      entry.overflow = false;
-      const orphanEnd = !entry.redaction.inPrivateKey && /-----END [^-]*PRIVATE KEY-----/.test(line) && !/-----BEGIN [^-]*PRIVATE KEY-----/.test(line);
-      if (orphanEnd && entry.held.length)
+      entry2.overflow = false;
+      const orphanEnd = !entry2.redaction.inPrivateKey && /-----END [^-]*PRIVATE KEY-----/.test(line) && !/-----BEGIN [^-]*PRIVATE KEY-----/.test(line);
+      if (orphanEnd && entry2.held.length)
         released += "[private key redacted]\n";
       else
-        released += entry.held.map(redactLine).join("");
-      entry.held = [];
+        released += entry2.held.map(redactLine).join("");
+      entry2.held = [];
       released += redactLine(line);
     }
     if (done) {
-      released += entry.held.map(redactLine).join("");
-      entry.held = [];
+      released += entry2.held.map(redactLine).join("");
+      entry2.held = [];
     }
     return released + marker;
   }
@@ -38027,10 +38158,10 @@ var ResponseRedactor = class {
     this.pending.clear();
   }
   // Dropped text may hold a key delimiter that redaction never saw, so the rest of that step stays suppressed.
-  dropText(entry, text) {
-    if ((entry.dropped + text).includes("-----"))
-      entry.untilDone = true;
-    entry.dropped = (entry.dropped + text).slice(-4);
+  dropText(entry2, text) {
+    if ((entry2.dropped + text).includes("-----"))
+      entry2.untilDone = true;
+    entry2.dropped = (entry2.dropped + text).slice(-4);
   }
 };
 var MCP_PERMISSION_RE = /no output produced[^\r\n]{0,200}["']mcp["'][^\r\n]{0,200}permission[^\r\n]{0,200}headless|(?:permission check failed|tool call denied|denied tool|action denied|cannot request approval)[^\r\n]{0,200}\bmcp\b|\bmcp\b[^\r\n]{0,200}(?:permission denied|permission check failed|requires? approval|not authorized)/iu;
@@ -38756,12 +38887,12 @@ function validateWorkflowOptions(graph2, options) {
   if (parsed.data.hooks !== void 0) {
     const detachedHooks = {};
     for (const [key, hook] of Object.entries(parsed.data.hooks)) {
-      const entry = {};
+      const entry2 = {};
       if (hook.requireReview !== void 0)
-        entry.requireReview = hook.requireReview;
+        entry2.requireReview = hook.requireReview;
       if (hook.requireTests !== void 0)
-        entry.requireTests = hook.requireTests;
-      detachedHooks[key] = entry;
+        entry2.requireTests = hook.requireTests;
+      detachedHooks[key] = entry2;
     }
     detached.hooks = detachedHooks;
   }
@@ -47612,7 +47743,7 @@ function recommendWaitMode(client) {
   if (!client || typeof client.name !== "string" || client.name.length === 0) {
     return { recommendedMode: "foreground", reason: "missing-client-info" };
   }
-  const profile = WAIT_MODE_PROFILES.find((entry) => entry.client === client.name);
+  const profile = WAIT_MODE_PROFILES.find((entry2) => entry2.client === client.name);
   if (!profile) {
     return { recommendedMode: "foreground", reason: "unknown-client" };
   }
@@ -47756,6 +47887,32 @@ var chunkShape = {
 };
 var usageRow = external_exports.object({ taskId: id, sessionId: external_exports.string().nullable(), model: external_exports.string().nullable(), status, ...tokenUsage.shape }).strict();
 var sandboxPolicySnapshot = external_exports.object({ version: external_exports.literal(1), policy: sandboxPolicySchema, sha256: hash2 }).strict();
+var capabilityObservation = external_exports.enum(CAPABILITY_OBSERVATIONS);
+var capabilitySource = external_exports.enum(CAPABILITY_SOURCES);
+var capabilityEntry = external_exports.object({ status: capabilityObservation, source: capabilitySource, detail: external_exports.string() }).strict();
+var editToolRestriction = external_exports.object({
+  tool: external_exports.string(),
+  restriction: external_exports.string(),
+  status: capabilityObservation,
+  source: external_exports.literal("recorded"),
+  verifiedVersions: external_exports.array(external_exports.string()),
+  bridgeMitigation: external_exports.string()
+}).strict();
+var registryCapabilitiesSchema = external_exports.object(Object.fromEntries(REGISTRY_CAPABILITIES.map((key) => [key, capabilityEntry]))).strict();
+var cliCapabilityRecord = external_exports.object({
+  cli: external_exports.literal("agy"),
+  adapterId: external_exports.string(),
+  adapterVersion: external_exports.string(),
+  installed: external_exports.boolean(),
+  version: external_exports.string().nullable(),
+  platform: external_exports.string(),
+  arch: external_exports.string(),
+  queriedWith: external_exports.array(external_exports.string()),
+  capabilities: registryCapabilitiesSchema,
+  effectiveModel: capabilityEntry,
+  editToolRestrictions: external_exports.array(editToolRestriction),
+  error: external_exports.string().optional()
+}).strict();
 var successOutputSchemas = {
   black_gravity_wait_many: external_exports.object({ ready: external_exports.boolean(), timedOut: external_exports.boolean(), hasMoreMessages: external_exports.boolean(), tasks: external_exports.array(jointWaitTaskSchema).max(32), waitCommand: waitCommandSchema.optional() }).strict(),
   black_gravity_workflow_result: external_exports.object({
@@ -47832,6 +47989,7 @@ var successOutputSchemas = {
     waitCommand: waitCommandSchema.optional()
   }).strict(),
   black_gravity_list_models: external_exports.object({ models: external_exports.array(external_exports.object({ id: external_exports.string(), name: external_exports.string() }).strict()) }).strict(),
+  black_gravity_capabilities: external_exports.object({ clis: external_exports.array(cliCapabilityRecord) }).strict(),
   black_gravity_get_agent_policy: external_exports.object({ allowedTools: nativeToolsSchema, mcpServers: external_exports.array(external_exports.object({ id: external_exports.string(), description: external_exports.string().nullable(), nativeServerName: external_exports.string(), tools: external_exports.array(mcpCatalogToolSchema) }).strict()).max(20) }).strict(),
   black_gravity_get_model: external_exports.object({ model: external_exports.string().nullable() }).strict(),
   black_gravity_get_sandbox_policy: sandboxPolicySnapshot,
@@ -48018,6 +48176,7 @@ var outputSchemas = Object.fromEntries(Object.entries(successOutputSchemas).map(
 var TOOL_ANNOTATIONS = {
   black_gravity_health: { title: "Check Antigravity CLI", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   black_gravity_list_models: { title: "List Antigravity models", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+  black_gravity_capabilities: { title: "Report CLI capabilities", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   black_gravity_get_model: { title: "Get selected model", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_get_sandbox_policy: { title: "Get Windows test sandbox policy", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_usage: { title: "Read observed token usage", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -48455,8 +48614,8 @@ var StateStore = class {
   // Renames across files cannot be atomic, so a failed rename can leave a prefix of
   // entries published, and callers must order entries so that the next startup can finish the rest.
   saveBatch(entries2, onPublished) {
-    const targets = entries2.map((entry) => {
-      const target = this.file(entry.taskId);
+    const targets = entries2.map((entry2) => {
+      const target = this.file(entry2.taskId);
       assertReplaceable(target);
       return target;
     });
@@ -48527,7 +48686,7 @@ var StateStore = class {
       if (data.options.peerOrigin && (!data.record.sourceMessage || data.options.peerOrigin.groupId.toLowerCase() !== data.record.group.groupId.toLowerCase()))
         throw new BridgeError("INVALID_STATE", "Peer input differs from its continuation");
       const snapshots = data.options.memorySnapshots;
-      if (snapshots?.some((entry) => entry.projectId !== computeProjectId(data.record.workingDirectory)) || JSON.stringify(data.record.memory) !== JSON.stringify(summarizeMemory(snapshots)) || JSON.stringify(data.options.memory) !== JSON.stringify(snapshots?.map(({ specialist, sha256 }) => ({ specialist, sha256 })))) {
+      if (snapshots?.some((entry2) => entry2.projectId !== computeProjectId(data.record.workingDirectory)) || JSON.stringify(data.record.memory) !== JSON.stringify(summarizeMemory(snapshots)) || JSON.stringify(data.options.memory) !== JSON.stringify(snapshots?.map(({ specialist, sha256 }) => ({ specialist, sha256 })))) {
         throw new BridgeError("INVALID_STATE", "Persisted private memory differs from its project, hashes or metadata");
       }
       if (data.record.agentPolicy?.sha256 !== data.options.agentPolicy?.sha256)
@@ -48814,10 +48973,10 @@ function findPromptMessage(record2, after) {
   }
   return promptMessage;
 }
-function waitCommandArgv(stateDirectory, entry = process.argv[1], node2 = process.execPath) {
-  if (!entry)
+function waitCommandArgv(stateDirectory, entry2 = process.argv[1], node2 = process.execPath) {
+  if (!entry2)
     return void 0;
-  return [node2, path19.resolve(entry), "wait", "--state-directory", stateDirectory];
+  return [node2, path19.resolve(entry2), "wait", "--state-directory", stateDirectory];
 }
 function shellCommand(argv) {
   return argv.map((arg) => `'${arg.split("'").join("'\\''")}'`).join(" ");
@@ -49265,7 +49424,7 @@ function createMcpServer(adapter, tasks, options = {}) {
   const approvalInstructions = tasks.approvalMode === "auto" ? "On Windows, global sandbox ceilings default to automatic authorization for validated proposals in automatic mode (BRIDGE_APPROVAL_MODE=auto), or require human form confirmation when configured with BRIDGE_APPROVAL_MODE=ask; the MCP caller chooses only a narrower test selection, and delegated Gemini cannot authorize or change it. Report task.tokenUsage or black_gravity_usage to the user, identifying unavailable or partial counters; resumed CLI usage is cumulative and must not be summed repeatedly. Integration requires current verification and the reviewed SHA-256; under default automatic approval mode (BRIDGE_APPROVAL_MODE=auto), verified integration is authorized automatically without human forms. When configured with BRIDGE_APPROVAL_MODE=ask, human confirmation forms are always required even for previously preauthorized or remembered project roots. The original project changes only through verified integration." : "On Windows, human confirmation forms are always required to update global sandbox ceilings under BRIDGE_APPROVAL_MODE=ask; the MCP caller chooses only a narrower test selection, and delegated Gemini cannot authorize or change it. Report task.tokenUsage or black_gravity_usage to the user, identifying unavailable or partial counters; resumed CLI usage is cumulative and must not be summed repeatedly. Integration requires current verification and the reviewed SHA-256; human confirmation forms are always required under BRIDGE_APPROVAL_MODE=ask, even if projects were previously preauthorized in server configuration or remembered. The original project changes only through confirmed integration.";
   const instructions = "For normal delegation prefer deliveryMode messages: wait returns compact public questions, blockers and final result references instead of tool history; use chunk readers for details. Omission preserves legacy events. Carry cursorMode with the previous delivery mode when waiting so a delivery mode change resets the cursor safely. Messages are agy-reported data, not verification or permission approval. Define acceptanceCriteria for every requirement before a write task. Tasks run with agy --sandbox in a temporary copy filtered by Git ignores; includePaths narrows it. Planner and reviewer roles use read-only mode. CLI SUCCESS and completed mean execution ended; prove requirements against actual artifacts and grounded review with black_gravity_verify before claiming completion. Read previews with includePatch false and results with includeResult false, then use the chunk readers for all required content. Run actual tests with black_gravity_test and inspect receipts, exit codes and stale evidence. " + approvalInstructions;
   const server = new McpServer({ name: "black-gravity", version: "0.9.0", icons: SERVER_ICONS }, { instructions });
-  const statelessTools = /* @__PURE__ */ new Set(["black_gravity_health", "black_gravity_list_models", "black_gravity_roles"]);
+  const statelessTools = /* @__PURE__ */ new Set(["black_gravity_health", "black_gravity_capabilities", "black_gravity_list_models", "black_gravity_roles"]);
   const originalRegisterTool = server.registerTool.bind(server);
   server.registerTool = ((name, ...args) => {
     const row = toolAnnotationRow(name);
@@ -49330,6 +49489,12 @@ function createMcpServer(adapter, tasks, options = {}) {
       description: "List model IDs actually returned by agy models for this account.",
       inputSchema: {}
     }, safe(async () => ({ models: await adapter.listModels() })));
+  if (toolEnabled(tasks.toolProfile, "black_gravity_capabilities"))
+    server.registerTool("black_gravity_capabilities", {
+      outputSchema: outputSchemas.black_gravity_capabilities,
+      description: "Report which capabilities each installed CLI exposes as observed, absent or unknown, using only version and help output. Starts no task and no login. Unknown is not support.",
+      inputSchema: {}
+    }, safe(async () => ({ clis: [await adapter.capabilityRecord({ id: "agy", version: AGY_ADAPTER_VERSION })] })));
   if (toolEnabled(tasks.toolProfile, "black_gravity_get_model"))
     server.registerTool("black_gravity_get_model", {
       outputSchema: outputSchemas.black_gravity_get_model,
@@ -50838,9 +51003,9 @@ async function verifyCraftSnapshot(root) {
       throw new BridgeError("CRAFT_SNAPSHOT_INVALID", `${current.relDir}: failed to read directory`);
     }
     entries2.sort((a, b) => b.name.localeCompare(a.name));
-    for (const entry of entries2) {
-      const relPath = `${current.relDir}/${entry.name}`;
-      const fullPath = path22.join(current.fullDir, entry.name);
+    for (const entry2 of entries2) {
+      const relPath = `${current.relDir}/${entry2.name}`;
+      const fullPath = path22.join(current.fullDir, entry2.name);
       let st;
       try {
         st = await lstat9(fullPath);
@@ -50968,7 +51133,7 @@ async function permanentBundle(snapshot, name) {
 }
 function boundedCatalog(entries2) {
   for (let limit = 600; limit >= 0; limit -= 100) {
-    const catalog = entries2.map((entry) => ({ ...entry, description: entry.description.length > limit ? entry.description.slice(0, limit).trimEnd() + "\u2026" : entry.description }));
+    const catalog = entries2.map((entry2) => ({ ...entry2, description: entry2.description.length > limit ? entry2.description.slice(0, limit).trimEnd() + "\u2026" : entry2.description }));
     if (Buffer.byteLength(JSON.stringify(catalog), "utf8") <= MAX_CATALOG_BYTES)
       return catalog;
   }
@@ -53236,7 +53401,7 @@ async function verifyCacheLayout(root, descriptor) {
   const leaf = path24.join(root, cacheLeafName(descriptor));
   const expected = /* @__PURE__ */ new Set([descriptor.assets.node.fileName, descriptor.assets.license.fileName, descriptor.assets.buildMetadata.fileName]);
   const entries2 = await readdir7(leaf, { withFileTypes: true });
-  if (entries2.some((entry) => !expected.has(entry.name) || !entry.isFile() || entry.isSymbolicLink())) {
+  if (entries2.some((entry2) => !expected.has(entry2.name) || !entry2.isFile() || entry2.isSymbolicLink())) {
     fail("UNSAFE_PORTABLE_NODE_CACHE", "Portable Node cache build directory has an unexpected entry." + cacheRepair);
   }
 }
@@ -53868,12 +54033,12 @@ async function stageNativeExecutable(source, destination, state, expectedSha256,
     return executable;
   const directory = path25.dirname(source);
   const siblings = await readdir8(directory, { withFileTypes: true });
-  for (const entry of siblings.sort((left, right) => left.name.localeCompare(right.name, "en-US"))) {
-    if (!/\.dll$/iu.test(entry.name))
+  for (const entry2 of siblings.sort((left, right) => left.name.localeCompare(right.name, "en-US"))) {
+    if (!/\.dll$/iu.test(entry2.name))
       continue;
-    if (!entry.isFile() || entry.isSymbolicLink())
+    if (!entry2.isFile() || entry2.isSymbolicLink())
       fail2("UNSAFE_RUNTIME_PATH", "Runtime DLLs must be regular files");
-    await stageFile(path25.join(directory, entry.name), path25.join(path25.dirname(destination), entry.name), state, true, allowLinks);
+    await stageFile(path25.join(directory, entry2.name), path25.join(path25.dirname(destination), entry2.name), state, true, allowLinks);
   }
   return executable;
 }
@@ -54010,18 +54175,18 @@ function npmrcContainsSecret(contents) {
 async function stageNpmDirectory(source, destination, state, relative2 = []) {
   await stageDirectory(destination, state);
   const entries2 = await readdir8(source, { withFileTypes: true });
-  for (const entry of entries2.sort((left, right) => left.name.localeCompare(right.name, "en-US"))) {
-    const childRelative = [...relative2, entry.name];
+  for (const entry2 of entries2.sort((left, right) => left.name.localeCompare(right.name, "en-US"))) {
+    const childRelative = [...relative2, entry2.name];
     if (npmPathIsOmitted(childRelative))
       continue;
-    const childSource = path25.join(source, entry.name);
-    const childDestination = path25.join(destination, entry.name);
-    if (entry.isSymbolicLink())
+    const childSource = path25.join(source, entry2.name);
+    const childDestination = path25.join(destination, entry2.name);
+    if (entry2.isSymbolicLink())
       fail2("UNSAFE_RUNTIME_PATH", "npm runtime files and directories cannot use links");
-    if (entry.isDirectory()) {
+    if (entry2.isDirectory()) {
       await stageNpmDirectory(childSource, childDestination, state, childRelative);
-    } else if (entry.isFile()) {
-      if (childRelative.length === 1 && entry.name.toLocaleLowerCase("en-US") === "npmrc") {
+    } else if (entry2.isFile()) {
+      if (childRelative.length === 1 && entry2.name.toLocaleLowerCase("en-US") === "npmrc") {
         const contents = (await readBoundedFile(childSource, maxInspectionBytes)).toString("utf8");
         if (npmrcContainsSecret(contents))
           fail2("WINDOWS_NPM_LAYOUT_UNSUPPORTED", "The bundled npm configuration contains credentials");
@@ -54749,10 +54914,10 @@ function isExecutableFile(candidate) {
 function findBwrapOnPath(pathValue) {
   if (!pathValue)
     return void 0;
-  for (const entry of pathValue.split(path27.posix.delimiter)) {
-    if (!entry || entry.includes("\0") || !entry.startsWith("/"))
+  for (const entry2 of pathValue.split(path27.posix.delimiter)) {
+    if (!entry2 || entry2.includes("\0") || !entry2.startsWith("/"))
       continue;
-    const candidate = path27.posix.join(entry, "bwrap");
+    const candidate = path27.posix.join(entry2, "bwrap");
     if (isExecutableFile(candidate))
       return candidate;
   }
@@ -54826,10 +54991,10 @@ function isRestrictedToolchainPath(target, hostRuntimeDirectory) {
 }
 function normalizePosixPaths(paths2) {
   const normalized = [];
-  for (const entry of paths2) {
-    if (!entry || entry.includes("\0") || !path27.posix.isAbsolute(entry))
+  for (const entry2 of paths2) {
+    if (!entry2 || entry2.includes("\0") || !path27.posix.isAbsolute(entry2))
       continue;
-    normalized.push(path27.posix.resolve(entry));
+    normalized.push(path27.posix.resolve(entry2));
   }
   return normalized;
 }
@@ -54896,11 +55061,11 @@ function buildBwrapArgs(input2) {
     "--new-session"
   ];
   const rootSymlinks = /* @__PURE__ */ new Map();
-  for (const entry of input2.systemRootSymlinks ?? []) {
-    if (!entry.path || !entry.target || entry.target.includes("\0"))
+  for (const entry2 of input2.systemRootSymlinks ?? []) {
+    if (!entry2.path || !entry2.target || entry2.target.includes("\0"))
       continue;
-    if (!rootSymlinks.has(entry.path))
-      rootSymlinks.set(entry.path, entry.target);
+    if (!rootSymlinks.has(entry2.path))
+      rootSymlinks.set(entry2.path, entry2.target);
   }
   for (const root of LINUX_SYSTEM_ROOTS) {
     const symlinkTarget = rootSymlinks.get(root);
@@ -55018,8 +55183,8 @@ async function restoreScratchDirectoryPermissions(root) {
     } catch {
       continue;
     }
-    for (const entry of entries2) {
-      stack.push(path27.join(current, entry));
+    for (const entry2 of entries2) {
+      stack.push(path27.join(current, entry2));
     }
   }
 }
@@ -55267,12 +55432,12 @@ async function executeLinuxTest(command2, copyDirectory, options) {
     }
   };
   const aliasCandidates = [];
-  for (const entry of (process.env.PATH ?? "").split(path27.posix.delimiter)) {
-    if (!entry || entry.includes("\0") || !path27.posix.isAbsolute(entry))
+  for (const entry2 of (process.env.PATH ?? "").split(path27.posix.delimiter)) {
+    if (!entry2 || entry2.includes("\0") || !path27.posix.isAbsolute(entry2))
       continue;
-    aliasCandidates.push(entry);
+    aliasCandidates.push(entry2);
     try {
-      const resolved = await realpath9(entry);
+      const resolved = await realpath9(entry2);
       if ((await lstat14(resolved)).isDirectory())
         addToolchainCandidate(resolved);
     } catch {
@@ -55962,11 +56127,11 @@ var TaskManager = class {
   }
   agentPolicyCatalog() {
     const namespace = "28c48913-763e-4ced-aee4-3fe6f0dd25eb";
-    return { allowedTools: [...this.config.allowedAgyTools], mcpServers: this.config.mcpCatalog.map((entry) => ({
-      id: entry.id,
-      description: entry.description ?? null,
-      nativeServerName: entry.nativeServerName ?? "bridge_" + namespace.replaceAll("-", "") + "_" + entry.id.replaceAll("-", "_"),
-      tools: structuredClone(entry.tools)
+    return { allowedTools: [...this.config.allowedAgyTools], mcpServers: this.config.mcpCatalog.map((entry2) => ({
+      id: entry2.id,
+      description: entry2.description ?? null,
+      nativeServerName: entry2.nativeServerName ?? "bridge_" + namespace.replaceAll("-", "") + "_" + entry2.id.replaceAll("-", "_"),
+      tools: structuredClone(entry2.tools)
     })) };
   }
   projectMemory() {
@@ -55998,12 +56163,12 @@ var TaskManager = class {
   }
   async readMemory(workingDirectory, specialist, expectedSha256, offset = 0, limit = 1e4) {
     this.assertStateDirectoryUsable();
-    const entry = await this.projectMemory().read(await this.memoryProject(workingDirectory), specialist);
-    if (!entry)
+    const entry2 = await this.projectMemory().read(await this.memoryProject(workingDirectory), specialist);
+    if (!entry2)
       throw new BridgeError("MEMORY_NOT_FOUND", "Selected memory does not exist");
-    if (entry.sha256 !== expectedSha256)
+    if (entry2.sha256 !== expectedSha256)
       throw new BridgeError("MEMORY_CHANGED", "Reload memory metadata before reading the current version");
-    return { memory: summarizeMemory([entry])[0], ...textChunk(redactDiagnostic(entry.text), offset, limit) };
+    return { memory: summarizeMemory([entry2])[0], ...textChunk(redactDiagnostic(entry2.text), offset, limit) };
   }
   async writeMemory(workingDirectory, specialist, text, expectedSha256) {
     this.assertStateDirectoryUsable();
@@ -56011,8 +56176,8 @@ var TaskManager = class {
       throw new BridgeError("PROFILE_READ_ONLY", "This profile cannot change private memory");
     if (containsCredential(text))
       throw new BridgeError("INPUT_SECRET_DETECTED", "Private memory cannot store credential-like values; remove them and retry");
-    const entry = await this.projectMemory().write(await this.memoryProject(workingDirectory), specialist, { text, expectedSha256 });
-    return { memory: summarizeMemory([entry])[0] };
+    const entry2 = await this.projectMemory().write(await this.memoryProject(workingDirectory), specialist, { text, expectedSha256 });
+    return { memory: summarizeMemory([entry2])[0] };
   }
   async removeMemory(workingDirectory, specialist, expectedSha256) {
     this.assertStateDirectoryUsable();
@@ -56178,14 +56343,14 @@ var TaskManager = class {
         await validateProjectRoot(workingDirectory);
         const snapshots = [];
         for (const selection of options.memory) {
-          const entry = await this.projectMemory().read(workingDirectory, selection.specialist);
-          if (!entry)
+          const entry2 = await this.projectMemory().read(workingDirectory, selection.specialist);
+          if (!entry2)
             throw new BridgeError("MEMORY_NOT_FOUND", "Selected memory does not exist: " + selection.specialist);
-          if (entry.sha256 !== selection.sha256)
+          if (entry2.sha256 !== selection.sha256)
             throw new BridgeError("MEMORY_CHANGED", "Selected private memory changed; review its current content before dispatch");
-          if (containsCredential(entry.text))
+          if (containsCredential(entry2.text))
             throw new BridgeError("INPUT_SECRET_DETECTED", "Selected private memory contains a credential-like value; rewrite it before dispatch: " + selection.specialist);
-          snapshots.push(entry);
+          snapshots.push(entry2);
         }
         options.memorySnapshots = memorySnapshotsSchema.parse(snapshots);
       }
@@ -56247,7 +56412,7 @@ var TaskManager = class {
         options.agentPolicy = resolveAgentPolicy({
           allowedTools: source.nativeTools.filter((tool) => mode !== "read-only" || ["finish", "view_file"].includes(tool)),
           mcpServers: source.mcpServers.flatMap((server) => {
-            const tools = server.tools.filter((name) => mode !== "read-only" || this.config.mcpCatalog.find((entry) => entry.id === server.serverId)?.tools.some((tool) => tool.name === name && tool.readOnly));
+            const tools = server.tools.filter((name) => mode !== "read-only" || this.config.mcpCatalog.find((entry2) => entry2.id === server.serverId)?.tools.some((tool) => tool.name === name && tool.readOnly));
             return tools.length ? [{ serverId: server.serverId, tools }] : [];
           })
         }, this.config.allowedAgyTools, this.config.mcpCatalog, mode, "28c48913-763e-4ced-aee4-3fe6f0dd25eb");
@@ -56335,7 +56500,7 @@ var TaskManager = class {
       const record2 = {
         group: options.group,
         memory: summarizeMemory(options.memorySnapshots),
-        ...options.craft ? { craft: { revision: options.craft.revision, manifestSha256: options.craft.manifestSha256, permanent: options.craft.permanent, catalog: options.craft.catalog.map((entry) => entry.name) } } : {},
+        ...options.craft ? { craft: { revision: options.craft.revision, manifestSha256: options.craft.manifestSha256, permanent: options.craft.permanent, catalog: options.craft.catalog.map((entry2) => entry2.name) } } : {},
         parentTaskId: options.parentTaskId,
         sourceMessage: options.sourceMessage,
         deliveryMode: options.deliveryMode,
@@ -56478,7 +56643,7 @@ var TaskManager = class {
       throw new BridgeError("TASK_NOT_READY", "Reading artifacts requires a completed task with a retained copy");
     }
     const normalized = artifactPath.replaceAll("\\", "/");
-    const ref = task2.record.artifacts?.find((entry) => entry.path === normalized);
+    const ref = task2.record.artifacts?.find((entry2) => entry2.path === normalized);
     if (!ref) {
       throw new BridgeError("ARTIFACT_NOT_FOUND", `Artifact not recorded: ${artifactPath}`);
     }
@@ -57127,7 +57292,7 @@ var TaskManager = class {
     if (directory)
       await this.flushInbox(directory);
     this.refresh();
-    const item = this.tasks.get(taskId)?.record.inbox?.find((entry) => entry.messageId === messageId);
+    const item = this.tasks.get(taskId)?.record.inbox?.find((entry2) => entry2.messageId === messageId);
     if (!item)
       throw new BridgeError("TASK_NOT_FOUND", "Caller message target was removed");
     return { receipt: this.inboxReceipt(item) };
@@ -57184,7 +57349,7 @@ var TaskManager = class {
       const claim2 = task2.record.dispatching;
       if (!claim2 || this.claimingMessages.has(task2.record.taskId) || processAlive2(task2.ownerPid) && (task2.ownerPid !== process.pid || claim2.ownerId !== this.inboxOwnerId))
         continue;
-      const item = task2.record.inbox?.find((entry) => entry.messageId === claim2.messageId);
+      const item = task2.record.inbox?.find((entry2) => entry2.messageId === claim2.messageId);
       const continuation = [...this.tasks.values()].find((candidate) => candidate.record.sourceMessage?.taskId === task2.record.taskId && candidate.record.sourceMessage.messageId === claim2.messageId);
       if (item) {
         item.receipt = continuation && continuation.record.error?.code !== "STATE_PERSISTENCE_FAILED" ? { messageId: item.messageId, taskId: task2.record.taskId, state: "sent", continuationTaskId: continuation.record.taskId } : { messageId: item.messageId, taskId: task2.record.taskId, state: "failed", error: { code: "DISPATCH_INTERRUPTED", message: "Dispatch was interrupted without a retained continuation; it will not be replayed" } };
@@ -57237,7 +57402,7 @@ var TaskManager = class {
         }
         if (related.some((task2) => task2.record.dispatching))
           return;
-        const queued = related.flatMap((task2) => (task2.record.inbox ?? []).filter((entry) => entry.receipt.state === "queued").map((entry) => ({ task: task2, entry })));
+        const queued = related.flatMap((task2) => (task2.record.inbox ?? []).filter((entry2) => entry2.receipt.state === "queued").map((entry2) => ({ task: task2, entry: entry2 })));
         queued.sort((a, b) => a.entry.receivedAt.localeCompare(b.entry.receivedAt));
         const first = queued[0];
         if (!first)
@@ -57269,7 +57434,7 @@ var TaskManager = class {
         try {
           this.refresh();
           target = this.tasks.get(target.record.taskId);
-          item = target.record.inbox.find((entry) => entry.messageId === item.messageId);
+          item = target.record.inbox.find((entry2) => entry2.messageId === item.messageId);
           item.receipt = { messageId: item.messageId, taskId: target.record.taskId, state: "sent", continuationTaskId: continuation.taskId };
           const parent = this.tasks.get(latest.record.taskId);
           if (parent) {
@@ -57287,7 +57452,7 @@ var TaskManager = class {
         try {
           this.refresh();
           target = this.tasks.get(target.record.taskId);
-          item = target?.record.inbox?.find((entry) => entry.messageId === item.messageId);
+          item = target?.record.inbox?.find((entry2) => entry2.messageId === item.messageId);
           if (!target || !item)
             return;
           const accepted = [...this.tasks.values()].find((task2) => task2.record.sourceMessage?.taskId === target.record.taskId && task2.record.sourceMessage.messageId === item.messageId);

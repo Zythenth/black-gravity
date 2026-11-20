@@ -59,6 +59,7 @@ export function assertCoverage(toolNames, caseNames) {
 export const toolCases = [
   { name: 'black_gravity_health', args: () => ({}) },
   { name: 'black_gravity_list_models', args: () => ({}) },
+  { name: 'black_gravity_capabilities', args: () => ({}) },
   { name: 'black_gravity_get_model', args: () => ({}) },
   { name: 'black_gravity_set_model', args: () => ({ model: null }) },
   { name: 'black_gravity_get_sandbox_policy', args: () => ({}), check: async (result, c) => { c.policy = result; } },
