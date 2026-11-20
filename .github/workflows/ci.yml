@@ -19,19 +19,22 @@ jobs:
             shards: 1
           - os: windows-latest
             shard: 1
-            shards: 5
+            shards: 6
           - os: windows-latest
             shard: 2
-            shards: 5
+            shards: 6
           - os: windows-latest
             shard: 3
-            shards: 5
+            shards: 6
           - os: windows-latest
             shard: 4
-            shards: 5
+            shards: 6
           - os: windows-latest
             shard: 5
-            shards: 5
+            shards: 6
+          - os: windows-latest
+            shard: 6
+            shards: 6
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7

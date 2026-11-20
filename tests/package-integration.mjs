@@ -28,14 +28,29 @@ const expectedFiles = [
   'plugin/anti-ai-craft/manifest.json', ...craft.files.map(file => 'plugin/anti-ai-craft/' + file.path),
 ].sort();
 
+async function waitForExit(pid, timeoutMs = 10000) {
+  const deadline = Date.now() + timeoutMs;
+  while (true) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error?.code === 'ESRCH') return true;
+    }
+    if (Date.now() >= deadline) return false;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+}
+
 async function check(command, args, label) {
   const client = new Client({ name: 'package-test', version: '1' });
   const transport = new StdioClientTransport({ command, args, cwd: directory, stderr: 'pipe',
     env: { ...cacheEnv, AGY_PATH: path.join(directory, 'missing-agy'), BRIDGE_STATE_DIRECTORY: path.join(directory, 'state-' + label) } });
   let diagnostics = '';
+  let pid;
   transport.stderr.on('data', chunk => { diagnostics = (diagnostics + String(chunk)).slice(-4000); });
   try {
     await client.connect(transport);
+    pid = transport.pid;
     assert.equal(client.getServerVersion().version, manifest.version);
     const tools = await client.listTools();
     assert.deepEqual(tools.tools.map(tool => tool.name).sort(), Object.keys(outputSchemas).sort());
@@ -62,7 +77,10 @@ async function check(command, args, label) {
     console.log(`${label}: MCP startup, version, ${tools.tools.length} contracts, health, waitCommand and Auto passed`);
   } catch (error) {
     throw new Error(`${label}: ${String(error)}; stderr: ${diagnostics}`, { cause: error });
-  } finally { await client.close(); }
+  } finally {
+    await client.close();
+    if (pid) await waitForExit(pid);
+  }
 }
 
 function checkRuntimeStatus(command, args, label) {
@@ -131,5 +149,11 @@ try {
   console.log(`Package ${manifest.version}: exact ${expectedFiles.length}-file allowlist passed; no runtime dependency installation`);
 } finally {
   if (path.relative(await realpath(os.tmpdir()), path.dirname(directory)) !== '' || !path.basename(directory).startsWith('black-gravity-package-test-')) throw Error('Unsafe package-test cleanup path');
-  await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  // Windows can keep the directory busy while an MCP server process tree winds down, hence the exit wait and retries.
+  try {
+    await rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 500 });
+  } catch (error) {
+    console.error(`package-test cleanup failed: could not remove ${directory} (${error?.code ?? error}); a process started by the test may still hold it`);
+    process.exitCode = 1;
+  }
 }
