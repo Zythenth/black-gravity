@@ -35,7 +35,7 @@ const result = (status = 'SUCCESS', extra = {}) => send({ event: 'result', resul
   response: prompt, usage: { input_tokens: args.includes('--conversation') ? 2 : 1, output_tokens: args.includes('--conversation') ? 4 : 2,
     total_tokens: args.includes('--conversation') ? 6 : 3, thinking_tokens: 0, cache_read_tokens: 0 },
   ...(report ? { structured_output: report } : {}), ...(status === 'ERROR' ? { error: 'mock failure' } : {}), ...extra } });
-send({ event: 'init', conversation_id: conversationId, init: { cwd: process.cwd(), model: args[args.indexOf('--model') + 1], args } });
+send({ event: 'init', conversation_id: conversationId, init: { cwd: process.cwd(), model: args[args.indexOf('--model') + 1], args, ...(scenario === 'init-skills' ? { skills: ['anti-ai-code', 'anti-ai-security'] } : {}) } });
 if (['oversized-stream', 'oversized-stream-late-key', 'oversized-stream-plain'].includes(scenario)) {
   const padding = 'x'.repeat(2_000_001);
   process.stdout.write(padding);

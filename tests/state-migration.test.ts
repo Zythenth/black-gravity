@@ -676,7 +676,7 @@ async function withServer<T>(home: string, env: Record<string, string>, run: (cl
   const transport = new StdioClientTransport({
     command: process.execPath, args: [entryPath], cwd, stderr: 'pipe',
     // The native executor would start a recovery helper inside the fixture root and keep it busy during cleanup.
-    env: { ...base, HOME: home, USERPROFILE: home, BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_TEST_EXECUTOR: 'agy', ...env },
+    env: { ...base, HOME: home, USERPROFILE: home, BRIDGE_TEST_EXECUTOR: 'agy', ...env },
   });
   let stderr = '';
   transport.stderr?.on('data', chunk => { stderr += String(chunk); });

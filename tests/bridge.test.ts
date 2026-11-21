@@ -46,7 +46,7 @@ test('model preference survives restart, observes other servers and supports per
     const invalidState = mkdtempSync(path.join(os.tmpdir(), 'black-gravity-state-test-')); stateDirectories.push(invalidState);
     const invalid = new TaskManager(adapter, { ...config, stateDirectory: invalidState, defaultModel: 'not-available' }); managers.push(invalid);
     await assert.rejects(invalid.run({ prompt: 'split:test', workingDirectory: dir }), { code: 'MODEL_NOT_AVAILABLE' });
-    assert.throws(() => loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_DEFAULT_MODEL: 'invalid model' }), /exact model ID/);
+    assert.throws(() => loadConfig({ BRIDGE_DEFAULT_MODEL: 'invalid model' }), /exact model ID/);
   } finally { await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 }); }
 });
 
@@ -784,7 +784,7 @@ test('startup maintenance keeps a failed cleanup for health, warns once and retr
 
 function setup(prefixArgs = [mockPath], configOverrides: Record<string, string> = {}) {
   const stateDirectory = mkdtempSync(path.join(os.tmpdir(), 'black-gravity-state-test-')); stateDirectories.push(stateDirectory);
-  const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: process.execPath, DEFAULT_TIMEOUT_SECONDS: '30', BRIDGE_TEST_EXECUTOR: 'agy', BRIDGE_STATE_DIRECTORY: stateDirectory, ...configOverrides });
+  const config = loadConfig({ AGY_PATH: process.execPath, DEFAULT_TIMEOUT_SECONDS: '30', BRIDGE_TEST_EXECUTOR: 'agy', BRIDGE_STATE_DIRECTORY: stateDirectory, ...configOverrides });
   const adapter = new CliAdapter(config, prefixArgs);
   const tasks = new TaskManager(adapter, config); managers.push(tasks);
   return { adapter, tasks, config };
@@ -811,7 +811,7 @@ async function repository(): Promise<string> {
 }
 
 test('discovery distinguishes missing executable and authentication', async () => {
-  const missing = new CliAdapter(loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: path.join(os.tmpdir(), 'absent-agy-executable') }));
+  const missing = new CliAdapter(loadConfig({ AGY_PATH: path.join(os.tmpdir(), 'absent-agy-executable') }));
   assert.equal((await missing.discover()).installed, false);
   const { adapter } = setup([mockPath, 'auth']);
   const health = await adapter.health();
@@ -860,7 +860,11 @@ test('run streams official event shapes and captures result, stderr and malforme
     const final = await until(tasks, first.taskId, done);
     assert.equal(final.status, 'completed');
     assert.equal(final.sessionId, 'mock-conversation');
-    assert.ok((final.result as { response: string }).response.startsWith('split: $() `echo injected`\n\n<bridge-verification>'));
+    const response = (final.result as { response: string }).response;
+    assert.ok(response.startsWith('split: $() `echo injected`\n\n'));
+    assert.ok(response.includes('\n\nCaller-selected skills: '));
+    assert.ok(response.includes('<anti-ai-craft '));
+    assert.ok(response.includes('\n\n<bridge-verification>'));
     const events = tasks.readEvents(first.taskId).events;
     const initialArgs = (events.find(event => event.type === 'agent.started')!.data as { args: string[] }).args;
     assert.equal(initialArgs[initialArgs.indexOf('--add-dir') + 1], final.copyDirectory);

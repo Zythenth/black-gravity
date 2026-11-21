@@ -33,7 +33,7 @@ const managers: TaskManager[] = [];
 function setup(prefixArgs = [fixturePath], configOverrides: Record<string, string> = {}) {
   const stateDirectory = mkdtempSync(path.join(os.tmpdir(), 'black-gravity-sub-state-test-'));
   stateDirectories.push(stateDirectory);
-  const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off',
+  const config = loadConfig({
     AGY_PATH: process.execPath,
     // Processes that exit by themselves never reach this limit; the margin covers slow process starts on loaded Windows runners. Tests that expect a hang or a timeout set their own value.
     DEFAULT_TIMEOUT_SECONDS: '15',
@@ -107,7 +107,7 @@ after(async () => {
 
 test('discover reports AGY_NOT_FOUND when executable is missing', async () => {
   const missingPath = path.join(os.tmpdir(), 'non-existent-agy-' + randomUUID());
-  const adapter = new CliAdapter(loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: missingPath }));
+  const adapter = new CliAdapter(loadConfig({ AGY_PATH: missingPath }));
   const result = await adapter.discover();
   assert.equal(result.installed, false);
   assert.equal(result.version, undefined);
@@ -136,7 +136,7 @@ test('discover reports AGY_PERMISSION_DENIED when spawn fails with EACCES or EPE
     });
     syncBuiltinESMExports();
     try {
-      const adapter = new CliAdapter(loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: path.resolve(`/mock/denied/${code.toLowerCase()}`) }));
+      const adapter = new CliAdapter(loadConfig({ AGY_PATH: path.resolve(`/mock/denied/${code.toLowerCase()}`) }));
       const result = await adapter.discover();
       assert.equal(result.installed, false);
       assert.ok(result.error?.includes('AGY_PERMISSION_DENIED'), `Expected AGY_PERMISSION_DENIED error for ${code}, got: ${result.error}`);
@@ -152,7 +152,7 @@ test('discover reports AGY_PERMISSION_DENIED on POSIX when file permissions are 
   const dir = await createRepo();
   const filePath = path.join(dir, 'denied-agy.sh');
   await writeFile(filePath, '#!/bin/sh\nexit 0\n', { mode: 0o644 });
-  const adapter = new CliAdapter(loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: filePath }));
+  const adapter = new CliAdapter(loadConfig({ AGY_PATH: filePath }));
   const result = await adapter.discover();
   assert.equal(result.installed, false);
   assert.ok(result.error?.includes('AGY_PERMISSION_DENIED'), `Expected AGY_PERMISSION_DENIED error, got: ${result.error}`);

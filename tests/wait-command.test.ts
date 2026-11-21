@@ -204,7 +204,6 @@ async function managerFixture() {
   execFileSync('git', ['init', '--quiet', source]);
   await writeFile(path.join(source, 'source.txt'), 'Public fixture\n');
   const config = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_STATE_DIRECTORY: path.join(dir, 'state'),
     BRIDGE_TEST_EXECUTOR: 'agy',
   });

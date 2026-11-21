@@ -115,7 +115,6 @@ async function fixture(
   execFileSync('git', ['init', '--quiet'], { cwd: source });
   await writeFile(path.join(source, 'source.txt'), INITIAL_SOURCE, 'utf8');
   const config = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_STATE_DIRECTORY: path.join(root, 'state'),
     BRIDGE_TEST_EXECUTOR: 'agy',
   });

@@ -492,7 +492,7 @@ test('strictly forbids runtime injection opt-ins in allowedEnvVars across all pl
     );
 
     // 3. Environment configuration via loadConfig
-    const cfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_ALLOWED_ENV_VARS: JSON.stringify([candidate.trim()]) });
+    const cfg = loadConfig({ BRIDGE_ALLOWED_ENV_VARS: JSON.stringify([candidate.trim()]) });
     assert.deepEqual(cfg.allowedEnvVars, []);
     assert.deepEqual(cfg.configurationIssues, [
       { variable: 'BRIDGE_ALLOWED_ENV_VARS', index: 0, reason: 'forbidden-name' },
@@ -532,7 +532,7 @@ test('injection rejection error message names the variable but never exposes its
   );
 
   // Rejection in loadConfig
-  const forbiddenConfig = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_ALLOWED_ENV_VARS: JSON.stringify(['NODE_OPTIONS']) });
+  const forbiddenConfig = loadConfig({ BRIDGE_ALLOWED_ENV_VARS: JSON.stringify(['NODE_OPTIONS']) });
   assert.deepEqual(forbiddenConfig.allowedEnvVars, []);
   assert.deepEqual(forbiddenConfig.configurationIssues, [
     { variable: 'BRIDGE_ALLOWED_ENV_VARS', index: 0, reason: 'forbidden-name' },

@@ -21,8 +21,8 @@ import type { ExecutionAdapter, ExecutionIdentity, ExecutionRequest, ExecutionRe
 import { terminateSubprocess, redactDiagnostic, redactionContextDigest, containsCredential } from './subprocess.js';
 import { reconcileOwnedProcesses } from './process-tree.js';
 import { sanitizePayload } from './payload-safety.js';
-import { providedSkillsSchema, MAX_TOTAL_BUNDLES_BYTES, verifyProvidedSkills } from './skills.js';
-import { prepareCraft, mergePermanentSkills, verifyCraftSelection, craftStatus, type CraftStatus } from './craft.js';
+import { providedSkillsSchema, MAX_TOTAL_BUNDLES_BYTES, verifyProvidedSkills, type StagedSkill } from './skills.js';
+import { prepareCraft, mergePermanentSkills, verifyCraftSelection, craftStatus, assertPermanentDelivery, CRAFT_REQUIRED_MESSAGE, PERMANENT_SKILLS, type CraftStatus } from './craft.js';
 import { convertCrlfToLf, listCopyFiles, normalizeEditedLineEndings, planLineEndings, restoreByteOrderMarks, restoreCrlfLineEndings, type LineEndingStyle } from './line-endings.js';
 import { assertForbiddenDirectoriesUsable, assertSecretExclusionsUsable, assertAgyPathUsable, assertWindowsNodeCacheDirectoryUsable, assertAntiAiCraftDirectoryUsable, type Config, type ApprovalMode, type ConfigurationIssue, type ConfigurationIssueReason, type TestExecutor } from './config.js';
 import { EventStore } from './event-store.js';
@@ -577,18 +577,18 @@ export class TaskManager {
       if (previous && options.includePaths !== undefined) throw new BridgeError('INVALID_INCLUDE_PATH', 'A resumed task reuses its original file selection');
       if (previous && options.acceptanceCriteria !== undefined) throw new BridgeError('INVALID_CRITERIA', 'A resumed task retains its original acceptance criteria');
       if ((previous || contextSource) && options.skills !== undefined) throw new BridgeError('INVALID_SKILLS', 'Resume and handoff retain supplied skills; new bundles require a new task');
-      if (this.config.antiAiCraft) assertAntiAiCraftDirectoryUsable(this.config);
+      assertAntiAiCraftDirectoryUsable(this.config);
       // Resumes and handoffs keep the snapshot they started with; only new sessions resolve the installed one.
-      if (previous || contextSource) options.craft = (previous ?? contextSource)!.options.craft;
-      else if (!options.sessionId) {
+      if (previous || contextSource) {
+        options.craft = (previous ?? contextSource)!.options.craft;
+        if (!options.craft) throw new BridgeError('CRAFT_REQUIRED', CRAFT_REQUIRED_MESSAGE);
+      } else if (!options.sessionId) {
         const craft = await prepareCraft(this.config);
-        if (craft) {
-          const skills = mergePermanentSkills(craft.permanent, options.skills ?? []);
-          if (!providedSkillsSchema.safeParse(skills).success) throw new BridgeError('INVALID_SKILL_INPUT', 'The two permanent Anti-AI Craft skills plus supplied skills exceed the bundle limits');
-          const bytes = skills.reduce((sum, skill) => sum + Buffer.byteLength(skill.content, 'utf8') + (skill.resources ?? []).reduce((n, file) => n + Buffer.byteLength(file.content, 'utf8'), 0), 0);
-          if (bytes > MAX_TOTAL_BUNDLES_BYTES) throw new BridgeError('COPY_LIMIT_EXCEEDED', 'Permanent and supplied skills exceed the 1 MiB text budget');
-          options = { ...options, skills, craft: craft.selection };
-        }
+        const skills = mergePermanentSkills(craft.permanent, options.skills ?? []);
+        if (!providedSkillsSchema.safeParse(skills).success) throw new BridgeError('INVALID_SKILL_INPUT', 'The two permanent Anti-AI Craft skills plus supplied skills exceed the bundle limits');
+        const bytes = skills.reduce((sum, skill) => sum + Buffer.byteLength(skill.content, 'utf8') + (skill.resources ?? []).reduce((n, file) => n + Buffer.byteLength(file.content, 'utf8'), 0), 0);
+        if (bytes > MAX_TOTAL_BUNDLES_BYTES) throw new BridgeError('COPY_LIMIT_EXCEEDED', 'Permanent and supplied skills exceed the 1 MiB text budget');
+        options = { ...options, skills, craft: craft.selection };
       }
       if (previous && options.outputSchema !== undefined) throw new BridgeError('INVALID_SCHEMA', 'A resumed task retains its original structured output schema');
       if (previous && options.artifactPaths !== undefined) throw new BridgeError('INVALID_ARTIFACT_PATHS', 'A resumed task retains its original artifact paths');
@@ -1108,7 +1108,7 @@ export class TaskManager {
   }
 
   private async queueLocalTest(backend: LocalTestBackend, sourceTaskId: string, source: TaskRecord, expectedSha256: string, command: TestCommand, retries: number, timeoutSeconds: number, sandbox: unknown): Promise<TaskRecord> {
-    if (this.config.antiAiCraft) assertAntiAiCraftDirectoryUsable(this.config);
+    assertAntiAiCraftDirectoryUsable(this.config);
     if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 86400) {
       throw new BridgeError('INVALID_TIMEOUT', 'timeoutSeconds must be between 1 and 86400');
     }
@@ -1668,6 +1668,13 @@ export class TaskManager {
     }
   }
 
+  private permanentDeliveredSkills(providedSkills: readonly StagedSkill[] | undefined): Array<{ name: string; sha256: string }> {
+    const permanentNames = new Set(PERMANENT_SKILLS.map(name => name.toLowerCase()));
+    return (providedSkills ?? [])
+      .filter(skill => permanentNames.has(skill.name.toLowerCase()))
+      .map(skill => ({ name: skill.name, sha256: skill.sha256 }));
+  }
+
   private async execute(task: InternalTask): Promise<void> {
     const record = task.record;
     if (task.options.nativeTest && 'backend' in task.options.nativeTest && (task.options.nativeTest.backend === 'windows-lpac' || task.options.nativeTest.backend === 'linux-bwrap')) {
@@ -1698,6 +1705,10 @@ export class TaskManager {
       record.providedSkills = task.project.providedSkills;
       task.options.providedSkills = task.project.providedSkills;
       delete task.options.skills;
+      record.craftLoad = {
+        delivered: this.permanentDeliveredSkills(task.project.providedSkills),
+        initListing: 'not-observed',
+      };
       task.releaseProject ??= this.state.acquire(this.projectLock(task.project));
       record.copyDirectory = task.project.copyDirectory;
       record.includedFiles = task.project.includedFiles;
@@ -1721,7 +1732,8 @@ export class TaskManager {
         policyReceiptOffset = (await readExecutionPolicyReceipt(task.project.executionPolicy, task.project.executionStateDirectory ?? this.config.stateDirectory)).nextOffset;
         task.editReceipts = { offset: policyReceiptOffset, pending: new Map(), ambiguous: new Set() };
       } else task.editReceipts = undefined;
-      if (task.options.craft) await verifyCraftSelection(task.options.craft);
+      assertPermanentDelivery(task.options.craft, task.project.providedSkills);
+      await verifyCraftSelection(task.options.craft!);
       const isReadOnly = record.mode === 'read-only';
       const { result: execResult, styles, boms } = await this.runAgyStep(
         task,
@@ -1904,7 +1916,12 @@ export class TaskManager {
     task.editReceipts = task.project.executionPolicy ? { offset: receiptOffset, pending: new Map(), ambiguous: new Set() } : undefined;
     task.record.result = undefined;
     task.record.usage = undefined;
-    if (options.craft) await verifyCraftSelection(options.craft);
+    assertPermanentDelivery(options.craft, task.project.providedSkills);
+    await verifyCraftSelection(options.craft!);
+    task.record.craftLoad = {
+      delivered: this.permanentDeliveredSkills(task.project.providedSkills),
+      initListing: 'not-observed',
+    };
     const { result: execResult, styles, boms } = await this.runAgyStep(task, options, {
       prepareLf: true,
       convertLf: true,
@@ -2086,6 +2103,29 @@ export class TaskManager {
             this.events.append(record.taskId, type, data, raw);
           },
           onInit: init => {
+            const delivered = record.craftLoad?.delivered ?? this.permanentDeliveredSkills(task.project?.providedSkills);
+            if (Array.isArray(init.skills)) {
+              const listed: string[] = [];
+              for (const entry of init.skills) {
+                if (listed.length >= 64) break;
+                const rawName = typeof entry === 'string'
+                  ? entry
+                  : entry && typeof entry === 'object' && !Array.isArray(entry) && typeof (entry as { name?: unknown }).name === 'string'
+                  ? (entry as { name: string }).name
+                  : undefined;
+                if (rawName !== undefined) listed.push(rawName.slice(0, 128));
+              }
+              record.craftLoad = {
+                delivered,
+                initListing: 'listed',
+                listed,
+              };
+            } else {
+              record.craftLoad = {
+                delivered,
+                initListing: 'not-exposed',
+              };
+            }
             const requested = record.execution?.requested.model ?? null;
             const classification = classifyInitModel(requested, init.model);
             if (record.execution && classification.observed.status === 'observed') {

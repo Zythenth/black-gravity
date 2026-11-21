@@ -303,7 +303,6 @@ async function managerFixture() {
   await writeFile(path.join(source, 'source.txt'), 'Public fixture\n');
   await writeFile(path.join(source, 'wait-cli.mjs'), await getWaitCliBundle());
   const config = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_STATE_DIRECTORY: path.join(dir, 'state'),
     DEFAULT_TIMEOUT_SECONDS: '20',
     ...(process.env.BRIDGE_WINDOWS_NODE_RUNTIME ? { BRIDGE_WINDOWS_NODE_RUNTIME: process.env.BRIDGE_WINDOWS_NODE_RUNTIME } : {}),

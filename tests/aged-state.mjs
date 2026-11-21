@@ -75,7 +75,7 @@ export async function withAgedServer(bin, root, name, prepare, verify, server = 
     await client.close().catch(() => {});
     // Copies live outside the fixture root, so they are recovered from its state even when the fixture failed midway.
     if (await exists(state)) {
-      const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: process.execPath, DEFAULT_TIMEOUT_SECONDS: '30', BRIDGE_TEST_EXECUTOR: 'agy', BRIDGE_STATE_DIRECTORY: state, BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: path.join(caseRoot, 'windows-node-cache') });
+      const config = loadConfig({ AGY_PATH: process.execPath, DEFAULT_TIMEOUT_SECONDS: '30', BRIDGE_TEST_EXECUTOR: 'agy', BRIDGE_STATE_DIRECTORY: state, BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: path.join(caseRoot, 'windows-node-cache') });
       const manager = new TaskManager(new CliAdapter(config), config), remaining = [];
       try {
         for (const task of manager.list()) if (task.copyDirectory && await exists(task.copyDirectory)) await manager.discard(task.taskId).catch(() => {});

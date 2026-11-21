@@ -86,6 +86,11 @@ export interface TaskRecord {
   agentPolicyReceipt?: { sha256: string; decisionCount: number; deniedCount: number };
   processCleanup?: { verified: boolean; spawnedAt: string; checkedAt: string; remaining: number };
   craft?: { revision: string; manifestSha256: string; permanent: string[]; catalog: string[] };
+  craftLoad?: {
+    delivered: Array<{ name: string; sha256: string }>;
+    initListing: 'listed' | 'not-exposed' | 'not-observed';
+    listed?: string[];
+  };
 }
 
 export type CallerReceiptState = 'queued' | 'sent' | 'failed' | 'cancelled';

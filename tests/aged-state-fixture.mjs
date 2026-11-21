@@ -27,7 +27,6 @@ if (!fs.existsSync(path.join(source, '.git'))) execFileSync('git', ['init', '--q
 if (!fs.existsSync(path.join(source, 'source.txt'))) fs.writeFileSync(path.join(source, 'source.txt'), 'source');
 
 const config = loadConfig({
-  BRIDGE_ANTI_AI_CRAFT: 'off',
   AGY_PATH: process.execPath,
   DEFAULT_TIMEOUT_SECONDS: '30',
   BRIDGE_TEST_EXECUTOR: 'agy',

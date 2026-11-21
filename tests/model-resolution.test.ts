@@ -305,7 +305,6 @@ test('MCP black_gravity_resolve_model validates output schema, handles errors, a
   writeFileSync(path.join(repoDir, 'README.md'), 'hello\n', 'utf8');
 
   const config = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_STATE_DIRECTORY: stateDir,
     BRIDGE_TEST_EXECUTOR: 'agy',
     AGY_PATH: process.execPath,

@@ -48,6 +48,7 @@ export type ConfigurationIssueReason =
   | 'link'
   | 'not-directory'
   | 'unusable'
+  | 'opt-out-unsupported'
   | 'legacy-state-busy'
   | 'legacy-state-conflict'
   | 'legacy-state-migration-failed';
@@ -78,7 +79,7 @@ export const DEFAULT_PROJECT_LIMITS: ProjectLimits = {
 
 export interface Config extends ProjectLimits {
   approvalMode: ApprovalMode;
-  antiAiCraft: boolean;
+  antiAiCraftOptOutRequested?: boolean;
   antiAiCraftDirectory?: string;
   antiAiCraftDirectoryInvalid?: boolean;
   toolProfile: ToolProfile;
@@ -115,10 +116,18 @@ export interface Config extends ProjectLimits {
   allowedEnvVars: string[];
 }
 
-// Enabled unless explicitly turned off; an override directory is still verified against its manifest.
-function antiAiCraft(value: string | undefined): boolean {
-  if (value === undefined || value === 'on') return true;
-  if (value === 'off') return false;
+// Opt-out is no longer supported: 'off' records a configuration issue and rejects opt-out while skills keep loading.
+function readAntiAiCraft(value: string | undefined): {
+  antiAiCraftOptOutRequested?: true;
+  issues: ConfigurationIssue[];
+} {
+  if (value === undefined || value === 'on') return { issues: [] };
+  if (value === 'off') {
+    return {
+      antiAiCraftOptOutRequested: true,
+      issues: [{ variable: 'BRIDGE_ANTI_AI_CRAFT', reason: 'opt-out-unsupported' }],
+    };
+  }
   throw new Error('BRIDGE_ANTI_AI_CRAFT must be on or off');
 }
 
@@ -631,6 +640,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const allowedAgyTools = readAllowedAgyTools(env.BRIDGE_ALLOWED_AGY_TOOLS);
   const secretExclusions = readSecretExclusionsConfig(env.BRIDGE_SECRET_EXCLUSIONS);
   const forbiddenDirs = readForbiddenDirectories(env.FORBIDDEN_DIRECTORIES);
+  const antiAiCraftSetting = readAntiAiCraft(env.BRIDGE_ANTI_AI_CRAFT);
   const antiAiCraftDir = readAntiAiCraftDirectory(env.BRIDGE_ANTI_AI_CRAFT_DIRECTORY);
   const windowsNodeCache = readWindowsNodeCacheDirectory(env.BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY);
   const agyPath = readAgyPath(env.AGY_PATH);
@@ -645,13 +655,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...allowedAgyTools.issues,
     ...secretExclusions.issues,
     ...forbiddenDirs.issues,
+    ...antiAiCraftSetting.issues,
     ...antiAiCraftDir.issues,
     ...windowsNodeCache.issues,
     ...agyPath.issues,
   ];
   return {
     approvalMode: approvalMode(env.BRIDGE_APPROVAL_MODE),
-    antiAiCraft: antiAiCraft(env.BRIDGE_ANTI_AI_CRAFT),
+    ...(antiAiCraftSetting.antiAiCraftOptOutRequested ? { antiAiCraftOptOutRequested: true } : {}),
     ...(antiAiCraftDir.antiAiCraftDirectory ? { antiAiCraftDirectory: antiAiCraftDir.antiAiCraftDirectory } : {}),
     ...(antiAiCraftDir.antiAiCraftDirectoryInvalid ? { antiAiCraftDirectoryInvalid: true } : {}),
     toolProfile: toolProfileSchema.parse(env.BRIDGE_TOOL_PROFILE ?? 'full'),

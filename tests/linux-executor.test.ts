@@ -757,7 +757,6 @@ test('TaskManager startTests refuses before queuing when linux-bwrap detection i
 
   const makeTasks = (stateDir: string, detection: { available: boolean; code?: string; reason?: string }) => {
     const config = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_STATE_DIRECTORY: stateDir,
       BRIDGE_TEST_EXECUTOR: 'linux-bwrap',
     });
@@ -2098,7 +2097,6 @@ test('TaskManager runs black_gravity_test with linux-bwrap, records linux-execut
   await writeFile(path.join(directory, 'source.txt'), 'source');
 
   const config = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     AGY_PATH: process.execPath,
     BRIDGE_STATE_DIRECTORY: stateDirectory,
     DEFAULT_TIMEOUT_SECONDS: '20',

@@ -131,7 +131,6 @@ function createWorkspace(t: { after(fn: () => Promise<void> | void): void }) {
   });
 
   const config = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_STATE_DIRECTORY: stateDir,
     BRIDGE_TEST_EXECUTOR: 'agy',
     AGY_PATH: process.execPath,
@@ -1260,7 +1259,6 @@ test('native-test continuation inherits copy-wide model mismatch in verify and i
 test('copy-level modelProofFailure survives retention eviction and StateStore reload', async t => {
   const ws = createWorkspace(t);
   const lowRetentionConfig = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_STATE_DIRECTORY: ws.stateDir,
     BRIDGE_TEST_EXECUTOR: 'agy',
     AGY_PATH: process.execPath,
@@ -1454,7 +1452,6 @@ test('reloaded legacy mismatch snapshot without project.modelProofFailure blocks
   {
     const ws = createWorkspace(t);
     const lowRetentionConfig = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_STATE_DIRECTORY: ws.stateDir,
       BRIDGE_TEST_EXECUTOR: 'agy',
       AGY_PATH: process.execPath,
@@ -1525,7 +1522,6 @@ test('reloaded legacy mismatch snapshot without project.modelProofFailure blocks
   {
     const ws = createWorkspace(t);
     const lowRetentionConfig = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_STATE_DIRECTORY: ws.stateDir,
       BRIDGE_TEST_EXECUTOR: 'agy',
       AGY_PATH: process.execPath,
@@ -1583,7 +1579,6 @@ test('reloaded legacy mismatch snapshot without project.modelProofFailure blocks
 test('reloaded legacy mismatch A and echo continuation B persist project.modelProofFailure onto B so evicting A by C survives refresh', async t => {
   const ws = createWorkspace(t);
   const retention2Config = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_STATE_DIRECTORY: ws.stateDir,
     BRIDGE_TEST_EXECUTOR: 'agy',
     AGY_PATH: process.execPath,

@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url';
 import { CliAdapter } from '../src/cli-adapter.js';
 import { loadConfig } from '../src/config.js';
 import { BUNDLED_CRAFT_MANIFEST_SHA256 } from '../src/craft-pin.js';
-import { craftStatus, PERMANENT_SKILLS } from '../src/craft.js';
+import { craftStatus, assertPermanentDelivery, PERMANENT_SKILLS } from '../src/craft.js';
 import { TaskManager } from '../src/task-manager.js';
 import { BridgeError, type TaskRecord } from '../src/types.js';
 
@@ -29,7 +29,7 @@ async function setup(env: Record<string, string> = {}) {
   const config = loadConfig({ AGY_PATH: process.execPath, BRIDGE_TEST_EXECUTOR: 'agy', BRIDGE_STATE_DIRECTORY: state, ...env });
   const adapter = new CliAdapter(config, [mock]);
   await adapter.discover();
-  return { root, source, state, tasks: new TaskManager(adapter, config) };
+  return { root, source, state, config, tasks: new TaskManager(adapter, config) };
 }
 
 async function finished(tasks: TaskManager, taskId: string, timeout = 20000): Promise<TaskRecord> {
@@ -90,8 +90,13 @@ test('opt-out, conflicting names and a tampered snapshot are explicit', async ()
   try {
     const started = await off.tasks.run({ prompt: 'read:off', workingDirectory: off.source, mode: 'read-only' });
     const record = await finished(off.tasks, started.taskId);
-    assert.equal(record.craft, undefined);
-    assert.equal(record.providedSkills, undefined);
+    assert.equal(record.status, 'completed', JSON.stringify(record.error));
+    assert.notEqual(record.craft, undefined);
+    assert.deepEqual(record.craft?.permanent, ['anti-ai-code', 'anti-ai-security']);
+    assert.ok(record.providedSkills?.some(skill => skill.name === 'anti-ai-code'));
+    assert.ok(record.providedSkills?.some(skill => skill.name === 'anti-ai-security'));
+    assert.equal(off.config.antiAiCraftOptOutRequested, true);
+    assert.ok(off.config.configurationIssues.some(issue => issue.variable === 'BRIDGE_ANTI_AI_CRAFT' && issue.reason === 'opt-out-unsupported'));
   } finally {
     await off.tasks.shutdown();
   }
@@ -200,7 +205,14 @@ test('craftStatus reports off, bundled ready, and tampered override without crea
 
   const off = await setup({ BRIDGE_ANTI_AI_CRAFT: 'off' });
   try {
-    assert.deepEqual(await off.tasks.antiAiCraftStatus(), { enabled: false });
+    const status = await off.tasks.antiAiCraftStatus();
+    assert.equal(status.enabled, true);
+    assert.equal(status.ready, true);
+    assert.equal(status.optOutRejected, true);
+    assert.equal(
+      status.migration,
+      'BRIDGE_ANTI_AI_CRAFT=off is no longer supported; anti-ai-code and anti-ai-security always load in every implementer and reviewer session. Remove the variable.',
+    );
     assert.equal(existsSync(path.join(off.state, 'anti-ai-craft')), false);
   } finally {
     await off.tasks.shutdown();
@@ -253,4 +265,108 @@ test('craftStatus reports off, bundled ready, and tampered override without crea
   assert.equal(malformedStatus.error?.code, 'CRAFT_SNAPSHOT_INVALID');
   assert.equal(malformedStatus.error?.message, 'The Anti-AI Craft snapshot failed verification; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY');
   assert.equal(malformedStatus.error?.message.includes('/secret/private/path'), false);
+});
+
+test('assertPermanentDelivery enforces snapshot and both permanent skills', () => {
+  const selection = {
+    revision: 'a'.repeat(40),
+    manifestSha256: 'b'.repeat(64),
+    root: '/unused/craft/root',
+    permanent: [...PERMANENT_SKILLS],
+    catalog: [],
+  };
+  assert.throws(
+    () => assertPermanentDelivery(undefined, [{ name: 'anti-ai-code' }, { name: 'anti-ai-security' }]),
+    (err: unknown) => err instanceof BridgeError && err.code === 'CRAFT_REQUIRED',
+  );
+  assert.throws(
+    () => assertPermanentDelivery({ ...selection, permanent: ['anti-ai-code'] }, [{ name: 'anti-ai-code' }, { name: 'anti-ai-security' }]),
+    (err: unknown) => err instanceof BridgeError && err.code === 'CRAFT_REQUIRED' && err.message.includes('anti-ai-security') && !err.message.includes('/unused/craft/root'),
+  );
+  assert.throws(
+    () => assertPermanentDelivery(selection, [{ name: 'anti-ai-code' }]),
+    (err: unknown) => err instanceof BridgeError && err.code === 'CRAFT_REQUIRED' && err.message.includes('anti-ai-security') && !err.message.includes('/unused/craft/root'),
+  );
+  assert.throws(
+    () => assertPermanentDelivery(selection, undefined),
+    (err: unknown) => err instanceof BridgeError && err.code === 'CRAFT_REQUIRED' && err.message.includes('anti-ai-code') && err.message.includes('anti-ai-security'),
+  );
+  assert.doesNotThrow(() => assertPermanentDelivery(selection, [{ name: 'Anti-AI-Code' }, { name: 'ANTI-AI-SECURITY' }]));
+});
+
+test('reviewer and implementer sessions record craftLoad delivery evidence without inventing reads', async () => {
+  const { source, tasks } = await setup();
+  try {
+    // Reviewer structured report fixture checks line 1 === 'source'
+    await writeFile(path.join(source, 'source.txt'), 'source');
+    for (const [role, mode, prompt] of [
+      ['reviewer', 'read-only', 'review:craft-load'],
+      ['implementer', 'write', 'write:craft-load'],
+    ] as const) {
+      const started = await tasks.run({ prompt, workingDirectory: source, role, mode });
+      const record = await finished(tasks, started.taskId);
+      assert.equal(record.status, 'completed', JSON.stringify(record.error));
+      assert.ok(record.craftLoad);
+      assert.equal(record.craftLoad.initListing, 'not-exposed');
+      assert.equal(record.craftLoad.listed, undefined);
+      const expectedDelivered = PERMANENT_SKILLS.map(name => {
+        const staged = record.providedSkills?.find(skill => skill.name === name);
+        assert.ok(staged, `expected staged permanent skill ${name}`);
+        return { name: staged.name, sha256: staged.sha256 };
+      });
+      assert.deepEqual(record.craftLoad.delivered, expectedDelivered);
+    }
+  } finally {
+    await tasks.shutdown();
+  }
+});
+
+test('craftLoad records initListing listed when CLI init exposes skills', async () => {
+  const { source, tasks } = await setup();
+  try {
+    const started = await tasks.run({ prompt: 'init-skills:craft', workingDirectory: source, mode: 'read-only' });
+    const record = await finished(tasks, started.taskId);
+    assert.equal(record.status, 'completed', JSON.stringify(record.error));
+    assert.ok(record.craftLoad);
+    assert.equal(record.craftLoad.initListing, 'listed');
+    assert.deepEqual(record.craftLoad.listed, ['anti-ai-code', 'anti-ai-security']);
+    assert.deepEqual(
+      record.craftLoad.delivered,
+      PERMANENT_SKILLS.map(name => {
+        const staged = record.providedSkills!.find(skill => skill.name === name)!;
+        return { name: staged.name, sha256: staged.sha256 };
+      }),
+    );
+  } finally {
+    await tasks.shutdown();
+  }
+});
+
+test('resume of a legacy session without persisted craft is refused with CRAFT_REQUIRED before starting a process', async () => {
+  const { source, state, config, tasks } = await setup();
+  let recovered: TaskManager | undefined;
+  try {
+    const started = await tasks.run({ prompt: 'read:legacy', workingDirectory: source, mode: 'read-only' });
+    const record = await finished(tasks, started.taskId);
+    assert.equal(record.status, 'completed', JSON.stringify(record.error));
+    await tasks.shutdown();
+
+    const snapshotPath = path.join(state, `${record.taskId}.json`);
+    const snapshot = JSON.parse(await readFile(snapshotPath, 'utf8'));
+    delete snapshot.options.craft;
+    delete snapshot.record.craft;
+    await writeFile(snapshotPath, JSON.stringify(snapshot));
+
+    const adapter = new CliAdapter(config, [mock]);
+    await adapter.discover();
+    recovered = new TaskManager(adapter, config);
+    await assert.rejects(
+      recovered.run({ prompt: 'read:resumed', workingDirectory: source, sessionId: record.sessionId, mode: 'read-only' }),
+      (err: unknown) => err instanceof BridgeError && err.code === 'CRAFT_REQUIRED',
+    );
+    assert.equal(recovered.list().length, 1);
+  } finally {
+    await recovered?.shutdown();
+    await tasks.shutdown();
+  }
 });

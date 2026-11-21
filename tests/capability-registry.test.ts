@@ -184,7 +184,6 @@ async function runCapabilitiesWithFakeAgy(options: {
       env: {
         ...process.env as Record<string, string>,
         AGY_PATH: fakeAgy,
-        BRIDGE_ANTI_AI_CRAFT: 'off',
         BRIDGE_TEST_EXECUTOR: 'agy',
         BRIDGE_TOOL_PROFILE: 'full',
         BRIDGE_STATE_DIRECTORY: path.join(dir, 'state'),

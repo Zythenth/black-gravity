@@ -472,7 +472,6 @@ test('TaskManager routes production runs and native tests through ExecutionAdapt
       AGY_PATH: process.execPath,
       BRIDGE_TEST_EXECUTOR: 'agy',
       MAX_CONCURRENT_TASKS: '1',
-      BRIDGE_ANTI_AI_CRAFT: 'off',
     });
     const nativePassScript = path.join(env.root, 'native-pass-cli.mjs');
     writeFileSync(nativePassScript, buildScenarioCliScript({
@@ -607,7 +606,7 @@ test('TaskManager timeout starts after process spawn rather than before async li
   const env = createWorkspace();
   let tasks: TaskManager | undefined;
   try {
-    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath, BRIDGE_ANTI_AI_CRAFT: 'off' });
+    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath });
     const cli = new CliAdapter(config, [env.scenarioScript]);
     await cli.discover();
     tasks = new TaskManager(cli, config, new AgyExecutionAdapter(cli, config));
@@ -657,7 +656,7 @@ test('TaskManager supports pure E02 ExecutionAdapter fixtures and rejects incomp
   const env = createWorkspace();
   let tasks: TaskManager | undefined;
   try {
-    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath, BRIDGE_ANTI_AI_CRAFT: 'off' });
+    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath });
     const cli = new CliAdapter(config);
 
     // 1. Pure E02 SUCCESS fixture without hooks.
@@ -721,7 +720,6 @@ test('Rejects soft tool denials (including stderr-only with exit 0) and every no
   let tasks: TaskManager | undefined;
   try {
     const config = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_STATE_DIRECTORY: env.stateDir,
       AGY_PATH: process.execPath,
       BRIDGE_TEST_EXECUTOR: 'agy',
@@ -1064,7 +1062,6 @@ test('Rejects soft tool denials (including stderr-only with exit 0) and every no
     const policyStateDir = path.join(env.root, 'policy-state');
     mkdirSync(policyStateDir, { recursive: true });
     const policyConfig = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_STATE_DIRECTORY: policyStateDir,
       AGY_PATH: process.execPath,
       BRIDGE_ALLOWED_AGY_TOOLS: JSON.stringify(['finish', 'view_file', 'write_to_file']),
@@ -1252,7 +1249,7 @@ test('Rejects soft tool denials (including stderr-only with exit 0) and every no
 test('ordinary command permission and OS errors complete on SUCCESS while explicit agy denials fail', async () => {
   const env = createWorkspace();
   try {
-    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath, BRIDGE_ANTI_AI_CRAFT: 'off' });
+    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath });
     const cli = new CliAdapter(config, [env.scenarioScript]);
     await cli.discover();
     const adapter = new AgyExecutionAdapter(cli, config);
@@ -1344,7 +1341,7 @@ test('ordinary command permission and OS errors complete on SUCCESS while explic
 test('TaskManager treats unsolicited provider cancelled/timeout/interrupted as failed retaining explicit reason', async () => {
   const env = createWorkspace();
   try {
-    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath, BRIDGE_ANTI_AI_CRAFT: 'off' });
+    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath });
     const cli = new CliAdapter(config, [env.scenarioScript]);
 
     const runWithPureAdapter = async (adapter: ExecutionAdapter) => {
@@ -1407,7 +1404,6 @@ test('TaskManager bounds hanging pure ExecutionAdapter against cancel and deadli
       BRIDGE_STATE_DIRECTORY: env.stateDir,
       AGY_PATH: process.execPath,
       MAX_CONCURRENT_TASKS: '1',
-      BRIDGE_ANTI_AI_CRAFT: 'off',
     });
     const cli = new CliAdapter(config, [env.scenarioScript]);
     const lateRejections: Array<(err: Error) => void> = [];
@@ -1475,7 +1471,7 @@ test('TaskManager bounds hanging pure ExecutionAdapter against cancel and deadli
 test('AgyExecutionAdapter fails uninspected line-limit loss while permitting safe post-inspection retention truncation', { timeout: 60_000 }, async () => {
   const env = createWorkspace();
   try {
-    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath, BRIDGE_ANTI_AI_CRAFT: 'off' });
+    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath });
     const overflowScript = path.join(env.root, 'overflow-cli.mjs');
     writeFileSync(overflowScript, `
 const args = process.argv.slice(2);
@@ -1596,7 +1592,7 @@ process.exitCode = 0;
 test('AgyExecutionAdapter terminates and reconciles real child without leaking when onProcessStarted throws', async () => {
   const env = createWorkspace();
   try {
-    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath, BRIDGE_ANTI_AI_CRAFT: 'off' });
+    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath });
     const cli = new CliAdapter(config, [env.scenarioScript]);
     await cli.discover();
     const adapter = new AgyExecutionAdapter(cli, config);
@@ -1636,7 +1632,6 @@ test('ControlledCliAdapter skips real agy probe with nonexistent AGY_PATH while 
   const missingConfig = loadConfig({
     BRIDGE_STATE_DIRECTORY: env.stateDir,
     AGY_PATH: path.join(env.root, 'nonexistent-agy-binary'),
-    BRIDGE_ANTI_AI_CRAFT: 'off',
   });
 
   class SimulatedProbeGuardAdapter extends ControlledCliAdapter {

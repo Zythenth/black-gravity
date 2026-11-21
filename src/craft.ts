@@ -115,22 +115,28 @@ export async function verifyBundledCraft(root: string, expected: string = BUNDLE
   return snapshot;
 }
 
-export type CraftStatus =
-  | { enabled: false }
-  | {
-      enabled: true;
-      source: 'bundled' | 'override';
-      ready: boolean;
-      revision?: string;
-      version?: string;
-      manifestSha256?: string;
-      expectedManifestSha256?: string;
-      files?: number;
-      totalBytes?: number;
-      skills?: string[];
-      permanent?: string[];
-      error?: { code: string; message: string };
-    };
+export type CraftStatus = {
+  enabled: true;
+  source: 'bundled' | 'override';
+  ready: boolean;
+  revision?: string;
+  version?: string;
+  manifestSha256?: string;
+  expectedManifestSha256?: string;
+  files?: number;
+  totalBytes?: number;
+  skills?: string[];
+  permanent?: string[];
+  optOutRejected?: true;
+  migration?: string;
+  error?: { code: string; message: string };
+};
+
+export const CRAFT_REQUIRED_MESSAGE =
+  'This session has no Anti-AI Craft snapshot; start a new task so anti-ai-code and anti-ai-security load in its own session';
+
+const CRAFT_OPT_OUT_MIGRATION =
+  'BRIDGE_ANTI_AI_CRAFT=off is no longer supported; anti-ai-code and anti-ai-security always load in every implementer and reviewer session. Remove the variable.';
 
 const CRAFT_STATUS_MESSAGES: Record<string, string> = {
   CRAFT_SNAPSHOT_MISSING: 'The Anti-AI Craft snapshot is missing; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY',
@@ -138,11 +144,17 @@ const CRAFT_STATUS_MESSAGES: Record<string, string> = {
   INVALID_CONFIGURATION: 'BRIDGE_ANTI_AI_CRAFT_DIRECTORY is invalid. See configurationIssues in black_gravity_health.',
 };
 
-export async function craftStatus(config: { antiAiCraft: boolean; antiAiCraftDirectory?: string; antiAiCraftDirectoryInvalid?: boolean }): Promise<CraftStatus> {
-  if (!config.antiAiCraft) return { enabled: false };
+export async function craftStatus(config: {
+  antiAiCraftDirectory?: string;
+  antiAiCraftDirectoryInvalid?: boolean;
+  antiAiCraftOptOutRequested?: boolean;
+}): Promise<CraftStatus> {
   const isOverride = config.antiAiCraftDirectory !== undefined || Boolean(config.antiAiCraftDirectoryInvalid);
   const source: 'bundled' | 'override' = isOverride ? 'override' : 'bundled';
   const expected = isOverride ? undefined : { expectedManifestSha256: BUNDLED_CRAFT_MANIFEST_SHA256 };
+  const optOutFields = config.antiAiCraftOptOutRequested
+    ? { optOutRejected: true as const, migration: CRAFT_OPT_OUT_MIGRATION }
+    : {};
   try {
     assertAntiAiCraftDirectoryUsable(config);
     const root = config.antiAiCraftDirectory ?? bundledSnapshot();
@@ -161,16 +173,16 @@ export async function craftStatus(config: { antiAiCraft: boolean; antiAiCraftDir
       totalBytes: snapshot.totalBytes,
       skills: [...snapshot.manifest.skills],
       permanent: [...PERMANENT_SKILLS],
+      ...optOutFields,
     };
   } catch (error) {
     const code = error instanceof BridgeError ? error.code : 'CRAFT_SNAPSHOT_INVALID';
     const message = CRAFT_STATUS_MESSAGES[code] ?? 'Anti-AI Craft snapshot verification failed';
-    return { enabled: true, source, ready: false, ...expected, error: { code, message } };
+    return { enabled: true, source, ready: false, ...expected, ...optOutFields, error: { code, message } };
   }
 }
 
-export async function prepareCraft(config: { antiAiCraft: boolean; antiAiCraftDirectory?: string; antiAiCraftDirectoryInvalid?: boolean; stateDirectory: string }): Promise<PreparedCraft | undefined> {
-  if (!config.antiAiCraft) return undefined;
+export async function prepareCraft(config: { antiAiCraftDirectory?: string; antiAiCraftDirectoryInvalid?: boolean; stateDirectory: string }): Promise<PreparedCraft> {
   assertAntiAiCraftDirectoryUsable(config);
   const source = config.antiAiCraftDirectory ?? bundledSnapshot();
   if (!source) throw new BridgeError('CRAFT_SNAPSHOT_MISSING', 'The bundled Anti-AI Craft snapshot is missing; reinstall this bridge version');
@@ -184,6 +196,24 @@ export async function prepareCraft(config: { antiAiCraft: boolean; antiAiCraftDi
   }));
   return { permanent, selection: { revision: snapshot.manifest.revision, manifestSha256: snapshot.manifestSha256, root: snapshot.root,
     permanent: [...PERMANENT_SKILLS], catalog: boundedCatalog(catalog) } };
+}
+
+export function assertPermanentDelivery(
+  craft: CraftSelection | undefined,
+  delivered: readonly { name: string }[] | undefined,
+): void {
+  if (!craft) {
+    throw new BridgeError('CRAFT_REQUIRED', CRAFT_REQUIRED_MESSAGE);
+  }
+  const missingSelected = PERMANENT_SKILLS.filter(name => !craft.permanent.includes(name));
+  if (missingSelected.length > 0) {
+    throw new BridgeError('CRAFT_REQUIRED', `Anti-AI Craft permanent skill missing from session snapshot: ${missingSelected.join(', ')}`);
+  }
+  const deliveredLower = new Set((delivered ?? []).map(skill => skill.name.toLowerCase()));
+  const missingDelivered = PERMANENT_SKILLS.filter(name => !deliveredLower.has(name.toLowerCase()));
+  if (missingDelivered.length > 0) {
+    throw new BridgeError('CRAFT_REQUIRED', `Anti-AI Craft permanent skill was not delivered to this session copy: ${missingDelivered.join(', ')}`);
+  }
 }
 
 // Resumes, handoffs and repairs must still read the exact snapshot the task started with.

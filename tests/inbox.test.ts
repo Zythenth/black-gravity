@@ -37,7 +37,7 @@ class InboxAdapter extends ControlledCliAdapter {
 async function fixture(hold = true, configOverrides: Record<string, string> = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'black-gravity-inbox-test-'));
   const source = path.join(directory, 'source'); execFileSync('git', ['init', '--quiet', source]); await writeFile(path.join(source, 'source.txt'), 'source');
-  const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_STATE_DIRECTORY: path.join(directory, 'state'), BRIDGE_TEST_EXECUTOR: 'agy', ...configOverrides });
+  const config = loadConfig({ BRIDGE_STATE_DIRECTORY: path.join(directory, 'state'), BRIDGE_TEST_EXECUTOR: 'agy', ...configOverrides });
   const adapter = new InboxAdapter(config, hold); const managers: TaskManager[] = [new TaskManager(adapter, config)]; const tasks = managers[0]!;
   return { source, config, adapter, tasks, managers, async close() {
     for (const manager of managers) await manager.shutdown();
@@ -71,7 +71,7 @@ test('active inputs are scoped and idempotent, and two inputs resume sequentiall
     assert.deepEqual(f.adapter.calls.map(call => call.options.prompt), ['initial request', 'first reply', 'second reply']);
     assert.equal(f.adapter.maxActive, 1);
     assert.equal(new Set(f.adapter.calls.map(call => call.directory)).size, 1);
-    for (const call of f.adapter.calls.slice(1)) { assert.equal(call.options.mode, 'read-only'); assert.equal(call.options.sessionId, 'inbox-conversation'); assert.equal(call.options.deliveryMode, 'messages'); assert.equal(call.options.acceptanceCriteria?.[0]?.id, 'source'); assert.equal(call.options.providedSkills?.[0]?.name, 'inbox-style'); }
+    for (const call of f.adapter.calls.slice(1)) { assert.equal(call.options.mode, 'read-only'); assert.equal(call.options.sessionId, 'inbox-conversation'); assert.equal(call.options.deliveryMode, 'messages'); assert.equal(call.options.acceptanceCriteria?.[0]?.id, 'source'); assert.deepEqual(call.options.providedSkills?.map(skill => skill.name), ['anti-ai-code', 'anti-ai-security', 'inbox-style']); }
     const receipts = f.tasks.inbox(id); const b = receipts[0]!.receipt.continuationTaskId!, c = receipts[1]!.receipt.continuationTaskId!;
     assert.equal(f.tasks.status(id).continuationTaskId, b); assert.equal(f.tasks.status(b).continuationTaskId, c); assert.equal(f.tasks.status(c).parentTaskId, b);
     assert.equal((await f.tasks.sendMessage(id, one, 'first reply')).receipt.continuationTaskId, b);

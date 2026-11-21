@@ -36126,11 +36126,15 @@ var DEFAULT_PROJECT_LIMITS = {
   secretExclusions: [],
   secretExceptions: { version: 2, namePatterns: [] }
 };
-function antiAiCraft(value) {
+function readAntiAiCraft(value) {
   if (value === void 0 || value === "on")
-    return true;
-  if (value === "off")
-    return false;
+    return { issues: [] };
+  if (value === "off") {
+    return {
+      antiAiCraftOptOutRequested: true,
+      issues: [{ variable: "BRIDGE_ANTI_AI_CRAFT", reason: "opt-out-unsupported" }]
+    };
+  }
   throw new Error("BRIDGE_ANTI_AI_CRAFT must be on or off");
 }
 function approvalMode(value) {
@@ -36571,6 +36575,7 @@ function loadConfig(env = process.env) {
   const allowedAgyTools = readAllowedAgyTools(env.BRIDGE_ALLOWED_AGY_TOOLS);
   const secretExclusions = readSecretExclusionsConfig(env.BRIDGE_SECRET_EXCLUSIONS);
   const forbiddenDirs = readForbiddenDirectories(env.FORBIDDEN_DIRECTORIES);
+  const antiAiCraftSetting = readAntiAiCraft(env.BRIDGE_ANTI_AI_CRAFT);
   const antiAiCraftDir = readAntiAiCraftDirectory(env.BRIDGE_ANTI_AI_CRAFT_DIRECTORY);
   const windowsNodeCache = readWindowsNodeCacheDirectory(env.BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY);
   const agyPath = readAgyPath(env.AGY_PATH);
@@ -36585,13 +36590,14 @@ function loadConfig(env = process.env) {
     ...allowedAgyTools.issues,
     ...secretExclusions.issues,
     ...forbiddenDirs.issues,
+    ...antiAiCraftSetting.issues,
     ...antiAiCraftDir.issues,
     ...windowsNodeCache.issues,
     ...agyPath.issues
   ];
   return {
     approvalMode: approvalMode(env.BRIDGE_APPROVAL_MODE),
-    antiAiCraft: antiAiCraft(env.BRIDGE_ANTI_AI_CRAFT),
+    ...antiAiCraftSetting.antiAiCraftOptOutRequested ? { antiAiCraftOptOutRequested: true } : {},
     ...antiAiCraftDir.antiAiCraftDirectory ? { antiAiCraftDirectory: antiAiCraftDir.antiAiCraftDirectory } : {},
     ...antiAiCraftDir.antiAiCraftDirectoryInvalid ? { antiAiCraftDirectoryInvalid: true } : {},
     toolProfile: toolProfileSchema.parse(env.BRIDGE_TOOL_PROFILE ?? "full"),
@@ -47939,23 +47945,22 @@ var timestamp = external_exports.string().datetime();
 var status = external_exports.enum(["queued", "starting", "running", "streaming", "completed", "failed", "cancelled", "timeout"]);
 var verificationStatus = external_exports.enum(["passed", "failed", "unverified"]);
 var portableNodeIdentity = external_exports.object({ buildId: external_exports.string(), nodeVersion: external_exports.string(), libuvVersion: external_exports.string(), sha256: hash2 }).strict();
-var antiAiCraftStatusSchema = external_exports.discriminatedUnion("enabled", [
-  external_exports.object({ enabled: external_exports.literal(false) }).strict(),
-  external_exports.object({
-    enabled: external_exports.literal(true),
-    source: external_exports.enum(["bundled", "override"]),
-    ready: external_exports.boolean(),
-    revision: external_exports.string().regex(/^[a-f0-9]{40}$/).optional(),
-    version: external_exports.string().optional(),
-    manifestSha256: hash2.optional(),
-    expectedManifestSha256: hash2.optional(),
-    files: count.optional(),
-    totalBytes: count.optional(),
-    skills: external_exports.array(external_exports.string()).optional(),
-    permanent: external_exports.array(external_exports.string()).optional(),
-    error: external_exports.object({ code: external_exports.string(), message: external_exports.string() }).strict().optional()
-  }).strict()
-]);
+var antiAiCraftStatusSchema = external_exports.object({
+  enabled: external_exports.literal(true),
+  source: external_exports.enum(["bundled", "override"]),
+  ready: external_exports.boolean(),
+  revision: external_exports.string().regex(/^[a-f0-9]{40}$/).optional(),
+  version: external_exports.string().optional(),
+  manifestSha256: hash2.optional(),
+  expectedManifestSha256: hash2.optional(),
+  files: count.optional(),
+  totalBytes: count.optional(),
+  skills: external_exports.array(external_exports.string()).optional(),
+  permanent: external_exports.array(external_exports.string()).optional(),
+  optOutRejected: external_exports.literal(true).optional(),
+  migration: external_exports.string().optional(),
+  error: external_exports.object({ code: external_exports.string(), message: external_exports.string() }).strict().optional()
+}).strict();
 var testEvidenceSchema = external_exports.object({
   command: external_exports.string(),
   exitCode: external_exports.number().int().min(0).max(4294967295),
@@ -48045,7 +48050,12 @@ var taskRecordSchema = external_exports.object({
   agentPolicy: resolvedAgentPolicySchema.optional(),
   agentPolicyReceipt: external_exports.object({ sha256: hash2, decisionCount: count, deniedCount: count }).strict().optional(),
   processCleanup: external_exports.object({ verified: external_exports.boolean(), spawnedAt: timestamp, checkedAt: timestamp, remaining: count }).strict().optional(),
-  craft: external_exports.object({ revision: external_exports.string(), manifestSha256: hash2, permanent: external_exports.array(external_exports.string()), catalog: external_exports.array(external_exports.string()) }).strict().optional()
+  craft: external_exports.object({ revision: external_exports.string(), manifestSha256: hash2, permanent: external_exports.array(external_exports.string()), catalog: external_exports.array(external_exports.string()) }).strict().optional(),
+  craftLoad: external_exports.object({
+    delivered: external_exports.array(external_exports.object({ name: external_exports.string(), sha256: hash2 }).strict()),
+    initListing: external_exports.enum(["listed", "not-exposed", "not-observed"]),
+    listed: external_exports.array(external_exports.string().max(128)).max(64).optional()
+  }).strict().optional()
 }).strict();
 var waitCommandSchema = external_exports.object({ argv: external_exports.array(external_exports.string().min(1)).min(5).max(37), sh: external_exports.string().min(1), recommendedMode: external_exports.enum(WAIT_MODES), reason: external_exports.enum(WAIT_MODE_REASONS) }).strict();
 var task = external_exports.object({ task: taskRecordSchema }).strict();
@@ -48140,7 +48150,7 @@ var successOutputSchemas = {
   black_gravity_health: external_exports.object({
     toolProfile: toolProfileSchema.optional(),
     approvalMode: external_exports.enum(["auto", "ask"]).optional(),
-    configurationIssues: external_exports.array(external_exports.object({ variable: external_exports.string(), index: count.optional(), reason: external_exports.enum(["invalid-json", "not-a-list", "too-many-entries", "not-a-string", "not-absolute", "not-found", "access-denied", "not-a-directory", "volume-root", "unresolvable", "not-an-object", "legacy-format", "invalid-format", "invalid-name", "forbidden-name", "invalid-pattern", "invalid-entry", "duplicate", "too-large", "unsafe-file", "link", "not-directory", "unusable", "legacy-state-busy", "legacy-state-conflict", "legacy-state-migration-failed"]) }).strict()).optional(),
+    configurationIssues: external_exports.array(external_exports.object({ variable: external_exports.string(), index: count.optional(), reason: external_exports.enum(["invalid-json", "not-a-list", "too-many-entries", "not-a-string", "not-absolute", "not-found", "access-denied", "not-a-directory", "volume-root", "unresolvable", "not-an-object", "legacy-format", "invalid-format", "invalid-name", "forbidden-name", "invalid-pattern", "invalid-entry", "duplicate", "too-large", "unsafe-file", "link", "not-directory", "unusable", "opt-out-unsupported", "legacy-state-busy", "legacy-state-conflict", "legacy-state-migration-failed"]) }).strict()).optional(),
     maintenanceIssues: external_exports.array(external_exports.object({ operation: external_exports.literal("copy-cleanup"), code: external_exports.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/), since: external_exports.string(), failures: count }).strict()).optional(),
     installed: external_exports.boolean(),
     path: external_exports.string(),
@@ -51393,17 +51403,18 @@ async function verifyBundledCraft(root, expected = BUNDLED_CRAFT_MANIFEST_SHA256
   }
   return snapshot;
 }
+var CRAFT_REQUIRED_MESSAGE = "This session has no Anti-AI Craft snapshot; start a new task so anti-ai-code and anti-ai-security load in its own session";
+var CRAFT_OPT_OUT_MIGRATION = "BRIDGE_ANTI_AI_CRAFT=off is no longer supported; anti-ai-code and anti-ai-security always load in every implementer and reviewer session. Remove the variable.";
 var CRAFT_STATUS_MESSAGES = {
   CRAFT_SNAPSHOT_MISSING: "The Anti-AI Craft snapshot is missing; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY",
   CRAFT_SNAPSHOT_INVALID: "The Anti-AI Craft snapshot failed verification; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY",
   INVALID_CONFIGURATION: "BRIDGE_ANTI_AI_CRAFT_DIRECTORY is invalid. See configurationIssues in black_gravity_health."
 };
 async function craftStatus(config2) {
-  if (!config2.antiAiCraft)
-    return { enabled: false };
   const isOverride = config2.antiAiCraftDirectory !== void 0 || Boolean(config2.antiAiCraftDirectoryInvalid);
   const source = isOverride ? "override" : "bundled";
   const expected = isOverride ? void 0 : { expectedManifestSha256: BUNDLED_CRAFT_MANIFEST_SHA256 };
+  const optOutFields = config2.antiAiCraftOptOutRequested ? { optOutRejected: true, migration: CRAFT_OPT_OUT_MIGRATION } : {};
   try {
     assertAntiAiCraftDirectoryUsable(config2);
     const root = config2.antiAiCraftDirectory ?? bundledSnapshot();
@@ -51422,17 +51433,16 @@ async function craftStatus(config2) {
       files: snapshot.manifest.files.length,
       totalBytes: snapshot.totalBytes,
       skills: [...snapshot.manifest.skills],
-      permanent: [...PERMANENT_SKILLS]
+      permanent: [...PERMANENT_SKILLS],
+      ...optOutFields
     };
   } catch (error62) {
     const code = error62 instanceof BridgeError ? error62.code : "CRAFT_SNAPSHOT_INVALID";
     const message = CRAFT_STATUS_MESSAGES[code] ?? "Anti-AI Craft snapshot verification failed";
-    return { enabled: true, source, ready: false, ...expected, error: { code, message } };
+    return { enabled: true, source, ready: false, ...expected, ...optOutFields, error: { code, message } };
   }
 }
 async function prepareCraft(config2) {
-  if (!config2.antiAiCraft)
-    return void 0;
   assertAntiAiCraftDirectoryUsable(config2);
   const source = config2.antiAiCraftDirectory ?? bundledSnapshot();
   if (!source)
@@ -51452,6 +51462,20 @@ async function prepareCraft(config2) {
     permanent: [...PERMANENT_SKILLS],
     catalog: boundedCatalog(catalog)
   } };
+}
+function assertPermanentDelivery(craft, delivered) {
+  if (!craft) {
+    throw new BridgeError("CRAFT_REQUIRED", CRAFT_REQUIRED_MESSAGE);
+  }
+  const missingSelected = PERMANENT_SKILLS.filter((name) => !craft.permanent.includes(name));
+  if (missingSelected.length > 0) {
+    throw new BridgeError("CRAFT_REQUIRED", `Anti-AI Craft permanent skill missing from session snapshot: ${missingSelected.join(", ")}`);
+  }
+  const deliveredLower = new Set((delivered ?? []).map((skill) => skill.name.toLowerCase()));
+  const missingDelivered = PERMANENT_SKILLS.filter((name) => !deliveredLower.has(name.toLowerCase()));
+  if (missingDelivered.length > 0) {
+    throw new BridgeError("CRAFT_REQUIRED", `Anti-AI Craft permanent skill was not delivered to this session copy: ${missingDelivered.join(", ")}`);
+  }
 }
 async function verifyCraftSelection(selection) {
   const status2 = await realDirectory(selection.root);
@@ -56622,21 +56646,20 @@ var TaskManager = class {
         throw new BridgeError("INVALID_CRITERIA", "A resumed task retains its original acceptance criteria");
       if ((previous || contextSource) && options.skills !== void 0)
         throw new BridgeError("INVALID_SKILLS", "Resume and handoff retain supplied skills; new bundles require a new task");
-      if (this.config.antiAiCraft)
-        assertAntiAiCraftDirectoryUsable(this.config);
-      if (previous || contextSource)
+      assertAntiAiCraftDirectoryUsable(this.config);
+      if (previous || contextSource) {
         options.craft = (previous ?? contextSource).options.craft;
-      else if (!options.sessionId) {
+        if (!options.craft)
+          throw new BridgeError("CRAFT_REQUIRED", CRAFT_REQUIRED_MESSAGE);
+      } else if (!options.sessionId) {
         const craft = await prepareCraft(this.config);
-        if (craft) {
-          const skills = mergePermanentSkills(craft.permanent, options.skills ?? []);
-          if (!providedSkillsSchema.safeParse(skills).success)
-            throw new BridgeError("INVALID_SKILL_INPUT", "The two permanent Anti-AI Craft skills plus supplied skills exceed the bundle limits");
-          const bytes = skills.reduce((sum2, skill) => sum2 + Buffer.byteLength(skill.content, "utf8") + (skill.resources ?? []).reduce((n, file3) => n + Buffer.byteLength(file3.content, "utf8"), 0), 0);
-          if (bytes > MAX_TOTAL_BUNDLES_BYTES)
-            throw new BridgeError("COPY_LIMIT_EXCEEDED", "Permanent and supplied skills exceed the 1 MiB text budget");
-          options = { ...options, skills, craft: craft.selection };
-        }
+        const skills = mergePermanentSkills(craft.permanent, options.skills ?? []);
+        if (!providedSkillsSchema.safeParse(skills).success)
+          throw new BridgeError("INVALID_SKILL_INPUT", "The two permanent Anti-AI Craft skills plus supplied skills exceed the bundle limits");
+        const bytes = skills.reduce((sum2, skill) => sum2 + Buffer.byteLength(skill.content, "utf8") + (skill.resources ?? []).reduce((n, file3) => n + Buffer.byteLength(file3.content, "utf8"), 0), 0);
+        if (bytes > MAX_TOTAL_BUNDLES_BYTES)
+          throw new BridgeError("COPY_LIMIT_EXCEEDED", "Permanent and supplied skills exceed the 1 MiB text budget");
+        options = { ...options, skills, craft: craft.selection };
       }
       if (previous && options.outputSchema !== void 0)
         throw new BridgeError("INVALID_SCHEMA", "A resumed task retains its original structured output schema");
@@ -57295,8 +57318,7 @@ var TaskManager = class {
     });
   }
   async queueLocalTest(backend, sourceTaskId, source, expectedSha256, command2, retries, timeoutSeconds, sandbox) {
-    if (this.config.antiAiCraft)
-      assertAntiAiCraftDirectoryUsable(this.config);
+    assertAntiAiCraftDirectoryUsable(this.config);
     if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 86400) {
       throw new BridgeError("INVALID_TIMEOUT", "timeoutSeconds must be between 1 and 86400");
     }
@@ -58023,6 +58045,10 @@ var TaskManager = class {
       });
     }
   }
+  permanentDeliveredSkills(providedSkills) {
+    const permanentNames = new Set(PERMANENT_SKILLS.map((name) => name.toLowerCase()));
+    return (providedSkills ?? []).filter((skill) => permanentNames.has(skill.name.toLowerCase())).map((skill) => ({ name: skill.name, sha256: skill.sha256 }));
+  }
   async execute(task2) {
     const record2 = task2.record;
     if (task2.options.nativeTest && "backend" in task2.options.nativeTest && (task2.options.nativeTest.backend === "windows-lpac" || task2.options.nativeTest.backend === "linux-bwrap")) {
@@ -58057,6 +58083,10 @@ var TaskManager = class {
       record2.providedSkills = task2.project.providedSkills;
       task2.options.providedSkills = task2.project.providedSkills;
       delete task2.options.skills;
+      record2.craftLoad = {
+        delivered: this.permanentDeliveredSkills(task2.project.providedSkills),
+        initListing: "not-observed"
+      };
       task2.releaseProject ??= this.state.acquire(this.projectLock(task2.project));
       record2.copyDirectory = task2.project.copyDirectory;
       record2.includedFiles = task2.project.includedFiles;
@@ -58089,8 +58119,8 @@ var TaskManager = class {
         task2.editReceipts = { offset: policyReceiptOffset, pending: /* @__PURE__ */ new Map(), ambiguous: /* @__PURE__ */ new Set() };
       } else
         task2.editReceipts = void 0;
-      if (task2.options.craft)
-        await verifyCraftSelection(task2.options.craft);
+      assertPermanentDelivery(task2.options.craft, task2.project.providedSkills);
+      await verifyCraftSelection(task2.options.craft);
       const isReadOnly = record2.mode === "read-only";
       const { result: execResult, styles, boms } = await this.runAgyStep(task2, native ? { ...task2.options, prompt: native.prompt } : task2.options, { prepareLf: !isReadOnly, convertLf: !isReadOnly && !native });
       if (task2.termination) {
@@ -58318,8 +58348,12 @@ var TaskManager = class {
     task2.editReceipts = task2.project.executionPolicy ? { offset: receiptOffset, pending: /* @__PURE__ */ new Map(), ambiguous: /* @__PURE__ */ new Set() } : void 0;
     task2.record.result = void 0;
     task2.record.usage = void 0;
-    if (options.craft)
-      await verifyCraftSelection(options.craft);
+    assertPermanentDelivery(options.craft, task2.project.providedSkills);
+    await verifyCraftSelection(options.craft);
+    task2.record.craftLoad = {
+      delivered: this.permanentDeliveredSkills(task2.project.providedSkills),
+      initListing: "not-observed"
+    };
     const { result: execResult, styles, boms } = await this.runAgyStep(task2, options, {
       prepareLf: true,
       convertLf: true,
@@ -58529,6 +58563,27 @@ var TaskManager = class {
             this.events.append(record2.taskId, type, data, raw);
           },
           onInit: (init) => {
+            const delivered = record2.craftLoad?.delivered ?? this.permanentDeliveredSkills(task2.project?.providedSkills);
+            if (Array.isArray(init.skills)) {
+              const listed = [];
+              for (const entry2 of init.skills) {
+                if (listed.length >= 64)
+                  break;
+                const rawName = typeof entry2 === "string" ? entry2 : entry2 && typeof entry2 === "object" && !Array.isArray(entry2) && typeof entry2.name === "string" ? entry2.name : void 0;
+                if (rawName !== void 0)
+                  listed.push(rawName.slice(0, 128));
+              }
+              record2.craftLoad = {
+                delivered,
+                initListing: "listed",
+                listed
+              };
+            } else {
+              record2.craftLoad = {
+                delivered,
+                initListing: "not-exposed"
+              };
+            }
             const requested = record2.execution?.requested.model ?? null;
             const classification = classifyInitModel(requested, init.model);
             if (record2.execution && classification.observed.status === "observed") {

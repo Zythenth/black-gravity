@@ -550,7 +550,7 @@ test('concurrent copies maintain complete isolation without interference', async
 
 test('config validation: BRIDGE_SECRET_EXCLUSIONS and BRIDGE_SECRET_EXCEPTIONS validation', () => {
   // Valid JSON array of relative glob patterns
-  const valid = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off',
+  const valid = loadConfig({
     BRIDGE_SECRET_EXCLUSIONS: JSON.stringify(['*.env', 'secrets/**']),
     BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 2, namePatterns: ['.env.template'] }),
   });
@@ -558,7 +558,7 @@ test('config validation: BRIDGE_SECRET_EXCLUSIONS and BRIDGE_SECRET_EXCEPTIONS v
   assert.deepEqual(valid.secretExceptions, { version: 2, namePatterns: ['.env.template'] });
 
   // Invalid JSON format
-  const invalidJsonExcl = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCLUSIONS: 'not-json' });
+  const invalidJsonExcl = loadConfig({ BRIDGE_SECRET_EXCLUSIONS: 'not-json' });
   assert.deepEqual(invalidJsonExcl.secretExclusions, []);
   assert.equal(invalidJsonExcl.secretExclusionsInvalid, true);
   assert.deepEqual(invalidJsonExcl.configurationIssues, [
@@ -567,7 +567,6 @@ test('config validation: BRIDGE_SECRET_EXCLUSIONS and BRIDGE_SECRET_EXCEPTIONS v
 
   // Invalid traversal pattern
   const traversalExcl = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_SECRET_EXCLUSIONS: JSON.stringify(['../outside']),
   });
   assert.deepEqual(traversalExcl.secretExclusions, []);
@@ -578,7 +577,6 @@ test('config validation: BRIDGE_SECRET_EXCLUSIONS and BRIDGE_SECRET_EXCEPTIONS v
 
   // Invalid absolute path pattern
   const invalidAbsConfig = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 2, namePatterns: ['/root/secret'] }),
   });
   assert.deepEqual(invalidAbsConfig.secretExceptions, { version: 2, namePatterns: [] });
@@ -611,7 +609,7 @@ test('BRIDGE_SECRET_EXCLUSIONS: failure modes report issues, mark exclusions unu
     ];
 
     for (const c of cases) {
-      const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCLUSIONS: c.raw });
+      const config = loadConfig({ BRIDGE_SECRET_EXCLUSIONS: c.raw });
       assert.deepEqual(config.secretExclusions, [], `${c.name} must result in empty secretExclusions`);
       assert.equal(config.secretExclusionsInvalid, true, `${c.name} must mark secretExclusionsInvalid`);
       assert.deepEqual(config.configurationIssues, [c.expectedIssue], `${c.name} issue mismatch`);
@@ -674,7 +672,7 @@ test('BRIDGE_SECRET_EXCLUSIONS: failure modes report issues, mark exclusions unu
     ];
 
     for (const c of mixedExclusionCases) {
-      const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCLUSIONS: c.raw });
+      const config = loadConfig({ BRIDGE_SECRET_EXCLUSIONS: c.raw });
       assert.deepEqual(config.secretExclusions, [], `${c.name} must result in empty secretExclusions`);
       assert.equal(config.secretExclusionsInvalid, true, `${c.name} must mark secretExclusionsInvalid`);
       assert.deepEqual(config.configurationIssues, [c.expectedIssue], `${c.name} issue mismatch`);
@@ -694,7 +692,6 @@ test('BRIDGE_SECRET_EXCLUSIONS: failure modes report issues, mark exclusions unu
 
     // Valid exclusions behave unchanged (trim + dedupe)
     const validConfig = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_SECRET_EXCLUSIONS: JSON.stringify(['  *.env  ', 'secrets/**', '*.env']),
     });
     assert.deepEqual(validConfig.secretExclusions, ['*.env', 'secrets/**']);
@@ -705,7 +702,6 @@ test('BRIDGE_SECRET_EXCLUSIONS: failure modes report issues, mark exclusions unu
 
     // Valid exclusions with ./ prefix and whitespace remain accepted and normalized
     const validNormalizedConfig = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_SECRET_EXCLUSIONS: JSON.stringify(['./secrets/**', '  *.env  ']),
     });
     assert.deepEqual(validNormalizedConfig.secretExclusions, ['secrets/**', '*.env']);
@@ -717,7 +713,6 @@ test('BRIDGE_SECRET_EXCLUSIONS: failure modes report issues, mark exclusions unu
     // Diagnostics and warnings never contain raw value
     const sensitivePattern = 'SENSITIVE_SECRET_PATTERN_998877';
     const sensitiveConfig = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_SECRET_EXCLUSIONS: JSON.stringify(['/abs/' + sensitivePattern]),
     });
     const issuesJson = JSON.stringify(sensitiveConfig.configurationIssues);
@@ -729,7 +724,6 @@ test('BRIDGE_SECRET_EXCLUSIONS: failure modes report issues, mark exclusions unu
     // Invalid exclusions refuse tasks at TaskManager level without creating tasks
     const exclStateDir = await mkdtemp(path.join(os.tmpdir(), 'black-gravity-excl-state-'));
     const exclConfig = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_SECRET_EXCLUSIONS: 'not-json',
       BRIDGE_STATE_DIRECTORY: exclStateDir,
     });
@@ -763,14 +757,14 @@ test('FORBIDDEN_DIRECTORIES: relative or NUL entries report issues, mark unusabl
   try {
     // 1. Relative entry is never resolved against cwd
     const relativeRaw = 'relative-non-absolute-dir';
-    const relConfig = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', FORBIDDEN_DIRECTORIES: relativeRaw });
+    const relConfig = loadConfig({ FORBIDDEN_DIRECTORIES: relativeRaw });
     assert.deepEqual(relConfig.forbiddenDirectories, []);
     assert.equal(relConfig.forbiddenDirectoriesInvalid, true);
     assert.deepEqual(relConfig.configurationIssues, [
       { variable: 'FORBIDDEN_DIRECTORIES', index: 0, reason: 'not-absolute' },
     ]);
     if (process.platform === 'win32') {
-      const rootRelConfig = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', FORBIDDEN_DIRECTORIES: '\\root-relative-dir' });
+      const rootRelConfig = loadConfig({ FORBIDDEN_DIRECTORIES: '\\root-relative-dir' });
       assert.deepEqual(rootRelConfig.forbiddenDirectories, []);
       assert.equal(rootRelConfig.forbiddenDirectoriesInvalid, true);
       assert.deepEqual(rootRelConfig.configurationIssues, [
@@ -779,7 +773,7 @@ test('FORBIDDEN_DIRECTORIES: relative or NUL entries report issues, mark unusabl
 
       const winIncompleteRoots = ['//privado', '\\\\\\\\privado', '//servidor'];
       for (const badRoot of winIncompleteRoots) {
-        const badConfig = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', FORBIDDEN_DIRECTORIES: badRoot });
+        const badConfig = loadConfig({ FORBIDDEN_DIRECTORIES: badRoot });
         assert.deepEqual(badConfig.forbiddenDirectories, [], `${badRoot} must not resolve against cwd`);
         assert.equal(badConfig.forbiddenDirectoriesInvalid, true, `${badRoot} must mark forbiddenDirectoriesInvalid`);
         assert.deepEqual(badConfig.configurationIssues, [
@@ -787,7 +781,6 @@ test('FORBIDDEN_DIRECTORIES: relative or NUL entries report issues, mark unusabl
         ]);
 
         const mixedBad = loadConfig({
-          BRIDGE_ANTI_AI_CRAFT: 'off',
           FORBIDDEN_DIRECTORIES: `${validForbidden};${badRoot}`,
         });
         assert.deepEqual(mixedBad.forbiddenDirectories, [path.resolve(validForbidden)]);
@@ -800,7 +793,7 @@ test('FORBIDDEN_DIRECTORIES: relative or NUL entries report issues, mark unusabl
 
     // 2. NUL entry is never resolved
     const nulRaw = `${validForbidden}\0bad`;
-    const nulConfig = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', FORBIDDEN_DIRECTORIES: nulRaw });
+    const nulConfig = loadConfig({ FORBIDDEN_DIRECTORIES: nulRaw });
     assert.deepEqual(nulConfig.forbiddenDirectories, []);
     assert.equal(nulConfig.forbiddenDirectoriesInvalid, true);
     assert.deepEqual(nulConfig.configurationIssues, [
@@ -809,7 +802,6 @@ test('FORBIDDEN_DIRECTORIES: relative or NUL entries report issues, mark unusabl
 
     // 3. Mixed valid and relative: valid entries stay in forbiddenDirectories and keep being forbidden
     const mixedConfig = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       FORBIDDEN_DIRECTORIES: `${validForbidden}${path.delimiter}relative-bad`,
       BRIDGE_STATE_DIRECTORY: stateDir,
     });
@@ -855,7 +847,7 @@ test('FORBIDDEN_DIRECTORIES: relative or NUL entries report issues, mark unusabl
     }
 
     // 4. Valid configuration only: workingDirectory inside forbidden directory is rejected as forbidden
-    const cleanConfig = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', FORBIDDEN_DIRECTORIES: validForbidden });
+    const cleanConfig = loadConfig({ FORBIDDEN_DIRECTORIES: validForbidden });
     assert.deepEqual(cleanConfig.configurationIssues, []);
     assert.equal(cleanConfig.forbiddenDirectoriesInvalid, undefined);
     await assert.rejects(
@@ -869,7 +861,6 @@ test('FORBIDDEN_DIRECTORIES: relative or NUL entries report issues, mark unusabl
     const sensitive = 'SENSITIVE_FORBIDDEN_DIR_998877';
     const leakStateDir = await mkdtemp(path.join(os.tmpdir(), 'black-gravity-leak-state-'));
     const leakConfig = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       FORBIDDEN_DIRECTORIES: 'relative/' + sensitive,
       BRIDGE_STATE_DIRECTORY: leakStateDir,
     });
@@ -1606,7 +1597,7 @@ test('v2 secret exceptions: legacy non-empty arrays fail with migration guidance
     const sensitivePatternName = 'sensitive-token-file-xyz.local';
 
     // 1. In environment config: non-empty legacy array is ignored with legacy-format issue without echoing pattern
-    const legacyCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: JSON.stringify([sensitivePatternName]) });
+    const legacyCfg = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: JSON.stringify([sensitivePatternName]) });
     assert.deepEqual(legacyCfg.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(legacyCfg.configurationIssues, [
       { variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'legacy-format' },
@@ -1644,10 +1635,10 @@ test('v2 secret exceptions: legacy non-empty arrays fail with migration guidance
     assert.deepEqual(omittedPreflight.eligible, ['source.txt']);
 
     // 4. Env config: empty array and omitted normalize to empty policy
-    const emptyConfig = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: '[]' });
+    const emptyConfig = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: '[]' });
     assert.deepEqual(emptyConfig.secretExceptions, { version: 2, namePatterns: [] });
 
-    const omittedConfig = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off' });
+    const omittedConfig = loadConfig({});
     assert.deepEqual(omittedConfig.secretExceptions, { version: 2, namePatterns: [] });
   } finally {
     await rm(dir, { recursive: true, force: true });
@@ -1658,34 +1649,34 @@ test('v2 secret exceptions: strict validation rejects unsupported versions, extr
   const dir = await createRepo();
   try {
     // Unsupported versions (v1, v3)
-    const cfgV1 = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 1, namePatterns: ['.env.local'] }) });
+    const cfgV1 = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 1, namePatterns: ['.env.local'] }) });
     assert.deepEqual(cfgV1.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(cfgV1.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'invalid-format' }]);
 
-    const cfgV3 = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 3, namePatterns: ['.env.local'] }) });
+    const cfgV3 = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 3, namePatterns: ['.env.local'] }) });
     assert.deepEqual(cfgV3.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(cfgV3.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'invalid-format' }]);
 
     // Extra fields
-    const cfgExtra = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 2, namePatterns: ['.env.local'], extraField: true }) });
+    const cfgExtra = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 2, namePatterns: ['.env.local'], extraField: true }) });
     assert.deepEqual(cfgExtra.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(cfgExtra.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'invalid-format' }]);
 
     // Missing fields
-    const cfgMissingPatterns = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 2 }) });
+    const cfgMissingPatterns = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 2 }) });
     assert.deepEqual(cfgMissingPatterns.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(cfgMissingPatterns.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'invalid-format' }]);
 
-    const cfgMissingVersion = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ namePatterns: ['.env.local'] }) });
+    const cfgMissingVersion = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ namePatterns: ['.env.local'] }) });
     assert.deepEqual(cfgMissingVersion.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(cfgMissingVersion.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'invalid-format' }]);
 
     // Malformed / null
-    const cfgNull = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: 'null' });
+    const cfgNull = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: 'null' });
     assert.deepEqual(cfgNull.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(cfgNull.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'not-an-object' }]);
 
-    const cfgNum = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: '123' });
+    const cfgNum = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: '123' });
     assert.deepEqual(cfgNum.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(cfgNum.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'not-an-object' }]);
 
@@ -1713,7 +1704,7 @@ test('v2 secret exceptions: strict validation rejects unsupported versions, extr
 
 test('v2 policy rejects blank configuration and hides invalid version values', () => {
   for (const input of ['', ' \t\n', '{']) {
-    const blankCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: input });
+    const blankCfg = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: input });
     assert.deepEqual(blankCfg.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(blankCfg.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'invalid-json' }]);
   }

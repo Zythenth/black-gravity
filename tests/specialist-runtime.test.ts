@@ -52,7 +52,7 @@ async function fixture(customRoles: unknown[], body: (f: { root: string; repo: s
     for (const args of [['init'], ['config', 'user.name', 'Test'], ['config', 'user.email', 'test@example.com'], ['config', 'commit.gpgsign', 'false'], ['add', '.'], ['commit', '-m', 'fixture']]) {
       execFileSync('git', args, { cwd: repo, stdio: 'ignore' });
     }
-    const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_CUSTOM_ROLES: JSON.stringify(customRoles), BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_EXECUTOR: 'agy', BRIDGE_DEFAULT_MODEL: 'model-b' });
+    const config = loadConfig({ BRIDGE_CUSTOM_ROLES: JSON.stringify(customRoles), BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_EXECUTOR: 'agy', BRIDGE_DEFAULT_MODEL: 'model-b' });
     const adapter = new RecordingAdapter(config), tasks = new TaskManager(adapter, config); managers.push(tasks);
     await body({ root, repo, state, config, adapter, tasks, managers });
   } finally {
@@ -78,7 +78,7 @@ test('specialist defaults reach copy selection, skills, adapter and validated re
   await fixture([role], async ({ repo, tasks, adapter }) => {
     const current = await completed(tasks, await tasks.run({ workingDirectory: repo, role: 'specialist', prompt: 'Inspect the public fixture.' }));
     assert.equal(current.model, 'model-a'); assert.equal(current.effort, 'high'); assert.equal(current.deliveryMode, 'messages');
-    assert.deepEqual(current.includedFiles, ['chosen.txt']); assert.equal(current.providedSkills?.length, 1);
+    assert.deepEqual(current.includedFiles, ['chosen.txt']); assert.deepEqual(current.providedSkills?.map(skill => skill.name), ['anti-ai-code', 'anti-ai-security', 'fixture-skill']);
     assert.equal(await readFile(path.join(current.copyDirectory!, '.agents/skills/fixture-skill/SKILL.md'), 'utf8'), role.defaults.skills[0]!.content);
     assert.equal(adapter.calls[0]!.options.timeoutSeconds, 77); assert.equal(adapter.calls[0]!.options.effort, 'high');
     assert.equal(adapter.calls[0]!.model, 'model-a'); assert.deepEqual(current.structuredResult?.value, { marker: 'profile-result' });
@@ -94,7 +94,7 @@ test('task overrides replace profile defaults without merging selections or skil
   await fixture([role], async ({ repo, tasks, adapter }) => {
     const current = await completed(tasks, await tasks.run({ workingDirectory: repo, role: 'specialist', prompt: 'Inspect other fixture.', model: 'model-b', effort: 'low', timeoutSeconds: 42, skills: [], includePaths: ['other.txt'], artifactPaths: ['other.txt'], deliveryMode: 'events' }));
     assert.equal(current.model, 'model-b'); assert.equal(current.effort, 'low'); assert.equal(current.deliveryMode, 'events');
-    assert.deepEqual(current.includedFiles, ['other.txt']); assert.deepEqual(current.providedSkills ?? [], []);
+    assert.deepEqual(current.includedFiles, ['other.txt']); assert.deepEqual(current.providedSkills?.map(skill => skill.name), ['anti-ai-code', 'anti-ai-security']);
     assert.equal(adapter.calls[0]!.options.timeoutSeconds, 42);
     assert.deepEqual(tasks.listArtifacts(current.taskId).artifacts.map(item => item.path), ['other.txt']);
   });
@@ -106,7 +106,7 @@ test('resume after restart retains original specialist snapshot, model, effort, 
     await tasks.shutdown();
     const changedRole = structuredClone(role); changedRole.defaults.model = 'model-b'; changedRole.defaults.effort = 'low'; changedRole.defaults.timeoutSeconds = 12;
     changedRole.defaults.skills[0]!.content += '\nChanged configuration.';
-    const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_CUSTOM_ROLES: JSON.stringify([changedRole]), BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_EXECUTOR: 'agy', BRIDGE_DEFAULT_MODEL: 'model-b' });
+    const config = loadConfig({ BRIDGE_CUSTOM_ROLES: JSON.stringify([changedRole]), BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_EXECUTOR: 'agy', BRIDGE_DEFAULT_MODEL: 'model-b' });
     const adapter = new RecordingAdapter(config), resumedManager = new TaskManager(adapter, config); managers.push(resumedManager);
     const resumed = await completed(resumedManager, await resumedManager.run({ workingDirectory: repo, sessionId: original.sessionId, prompt: 'Continue original fixture.' }));
     assert.equal(resumed.model, 'model-a'); assert.equal(resumed.effort, 'high');
@@ -144,7 +144,7 @@ const args=process.argv.slice(2);
 if(args.includes('--version'))console.log('1');
 else if(args.includes('--help'))console.log('--sandbox --effort stream-json --output-format --conversation');
 else {process.stdin.resume();process.stdin.once('end',()=>{fs.writeFileSync(${JSON.stringify(receipt)},JSON.stringify(args));console.log(JSON.stringify({event:'result',result:{status:'SUCCESS'}}));});}`);
-    const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: process.execPath, BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_EXECUTOR: 'agy' });
+    const config = loadConfig({ AGY_PATH: process.execPath, BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_EXECUTOR: 'agy' });
     const actual = new CliAdapter(config, [script]); await actual.discover();
     const child = actual.spawnTask({ prompt: 'Public capture fixture.', workingDirectory: repo, effort: 'high' }, 'model-a', repo);
     await new Promise<void>((resolve, reject) => { child.once('error', reject); child.once('close', () => resolve()); });

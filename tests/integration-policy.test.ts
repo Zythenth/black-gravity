@@ -127,11 +127,11 @@ test('remembered roots reject corrupt, oversized, noncanonical and linked state 
 });
 
 test('loadConfig validates BRIDGE_APPROVAL_MODE defaulting to auto, accepting ask, and rejecting invalid modes', () => {
-  assert.equal(loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off' }).approvalMode, 'auto');
-  assert.equal(loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_APPROVAL_MODE: 'auto' }).approvalMode, 'auto');
-  assert.equal(loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_APPROVAL_MODE: 'ask' }).approvalMode, 'ask');
+  assert.equal(loadConfig({}).approvalMode, 'auto');
+  assert.equal(loadConfig({ BRIDGE_APPROVAL_MODE: 'auto' }).approvalMode, 'auto');
+  assert.equal(loadConfig({ BRIDGE_APPROVAL_MODE: 'ask' }).approvalMode, 'ask');
   for (const invalid of ['', 'manual', 'prompt', 'true', 'false', 'AUTO', 'ASK', '1']) {
-    assert.throws(() => loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_APPROVAL_MODE: invalid }), {
+    assert.throws(() => loadConfig({ BRIDGE_APPROVAL_MODE: invalid }), {
       message: 'BRIDGE_APPROVAL_MODE must be auto or ask',
     });
   }
@@ -140,7 +140,7 @@ test('loadConfig validates BRIDGE_APPROVAL_MODE defaulting to auto, accepting as
 test('MCP server instructions and health accurately expose automatic versus ask mode', async () => {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'black-gravity-approval-instructions-test-'));
   try {
-    const configAuto = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: process.execPath, BRIDGE_STATE_DIRECTORY: path.join(directory, 'state-auto') });
+    const configAuto = loadConfig({ AGY_PATH: process.execPath, BRIDGE_STATE_DIRECTORY: path.join(directory, 'state-auto') });
     const adapterAuto = new CliAdapter(configAuto, [mockPath]);
     const tasksAuto = new TaskManager(adapterAuto, configAuto);
     const serverAuto = createMcpServer(adapterAuto, tasksAuto);
@@ -155,7 +155,7 @@ test('MCP server instructions and health accurately expose automatic versus ask 
     assert.ok(autoInstructions?.includes('BRIDGE_APPROVAL_MODE=auto'));
     assert.ok(autoInstructions?.includes('authorized automatically without human forms'));
 
-    const configAsk = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: process.execPath, BRIDGE_APPROVAL_MODE: 'ask', BRIDGE_STATE_DIRECTORY: path.join(directory, 'state-ask') });
+    const configAsk = loadConfig({ AGY_PATH: process.execPath, BRIDGE_APPROVAL_MODE: 'ask', BRIDGE_STATE_DIRECTORY: path.join(directory, 'state-ask') });
     const adapterAsk = new CliAdapter(configAsk, [mockPath]);
     const tasksAsk = new TaskManager(adapterAsk, configAsk);
     const serverAsk = createMcpServer(adapterAsk, tasksAsk);
@@ -239,7 +239,7 @@ test('automatic mode preserves verification, test evidence, readonly and review 
   const source = path.join(directory, 'source');
   execFileSync('git', ['init', '--quiet', source]);
   writeFileSync(path.join(source, 'source.txt'), 'original');
-  const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: process.execPath, BRIDGE_STATE_DIRECTORY: path.join(directory, 'state') });
+  const config = loadConfig({ AGY_PATH: process.execPath, BRIDGE_STATE_DIRECTORY: path.join(directory, 'state') });
   const adapter = new CliAdapter(config, [mockPath]);
   const tasks = new TaskManager(adapter, config);
   try {
@@ -281,7 +281,7 @@ test('ask mode requires forms, handles accept/deny/unavailable, and prevents rem
   execFileSync('git', ['init', '--quiet', source]);
   writeFileSync(path.join(source, 'source.txt'), 'original');
 
-  const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off',
+  const config = loadConfig({
     AGY_PATH: process.execPath,
     BRIDGE_APPROVAL_MODE: 'ask',
     BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS: JSON.stringify([source]),
@@ -569,7 +569,7 @@ test('readPreauthorizedIntegrationRoots handles mixed lists without permissions 
 });
 
 test('loadConfig tolerates invalid BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS and configurationWarning formats properly', () => {
-  const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS: '{' });
+  const config = loadConfig({ BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS: '{' });
   assert.deepEqual(config.preauthorizedIntegrationRoots, []);
   assert.deepEqual(config.configurationIssues, [
     { variable: 'BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS', reason: 'invalid-json' },
@@ -601,7 +601,6 @@ test('ask mode with invalid preauthorized root requires confirmation and does no
   writeFileSync(path.join(source, 'source.txt'), 'original');
 
   const config = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     AGY_PATH: process.execPath,
     BRIDGE_APPROVAL_MODE: 'ask',
     BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS: JSON.stringify([source + '-renamed', otherValid]),
@@ -653,7 +652,6 @@ test('server startup handles invalid BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS with
       args: [entryPath],
       env: {
         ...process.env as Record<string, string>,
-        BRIDGE_ANTI_AI_CRAFT: 'off',
         AGY_PATH: nonexistentAgy,
         BRIDGE_STATE_DIRECTORY: path.join(tmpDir, 'state'),
         BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS: JSON.stringify([nonexistentRoot, validRoot]),
@@ -696,7 +694,6 @@ test('server startup handles invalid BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS with
       args: [entryPath],
       env: {
         ...process.env as Record<string, string>,
-        BRIDGE_ANTI_AI_CRAFT: 'off',
         AGY_PATH: nonexistentAgy,
         BRIDGE_STATE_DIRECTORY: path.join(tmpDir, 'state2'),
         BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS: '{',
@@ -725,7 +722,6 @@ test('server startup handles invalid BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS with
       args: [entryPath],
       env: {
         ...process.env as Record<string, string>,
-        BRIDGE_ANTI_AI_CRAFT: 'off',
         AGY_PATH: nonexistentAgy,
         BRIDGE_STATE_DIRECTORY: state3Dir,
         BRIDGE_PREAUTHORIZED_INTEGRATION_ROOTS: JSON.stringify([nonexistentRoot, validRoot]),
@@ -790,7 +786,6 @@ test('server startup handles unreadable BRIDGE_ALLOWED_AGY_TOOLS, invalid BRIDGE
       args: [entryPath],
       env: {
         ...process.env as Record<string, string>,
-        BRIDGE_ANTI_AI_CRAFT: 'off',
         AGY_PATH: nonexistentAgy,
         BRIDGE_STATE_DIRECTORY: stateDir,
         BRIDGE_ALLOWED_AGY_TOOLS: sensitiveToolsMarker,
@@ -864,16 +859,15 @@ test('server startup handles unreadable BRIDGE_ALLOWED_AGY_TOOLS, invalid BRIDGE
 });
 
 test('BRIDGE_ALLOWED_ENV_VARS tolerates invalid values and keeps valid names', () => {
-  const jsonCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_ALLOWED_ENV_VARS: '{' });
+  const jsonCfg = loadConfig({ BRIDGE_ALLOWED_ENV_VARS: '{' });
   assert.deepEqual(jsonCfg.allowedEnvVars, []);
   assert.deepEqual(jsonCfg.configurationIssues, [{ variable: 'BRIDGE_ALLOWED_ENV_VARS', reason: 'invalid-json' }]);
 
-  const listCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_ALLOWED_ENV_VARS: '{"a": 1}' });
+  const listCfg = loadConfig({ BRIDGE_ALLOWED_ENV_VARS: '{"a": 1}' });
   assert.deepEqual(listCfg.allowedEnvVars, []);
   assert.deepEqual(listCfg.configurationIssues, [{ variable: 'BRIDGE_ALLOWED_ENV_VARS', reason: 'not-a-list' }]);
 
   const mixedCfg = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_ALLOWED_ENV_VARS: JSON.stringify([
       123,
       '',
@@ -904,20 +898,20 @@ test('BRIDGE_ALLOWED_ENV_VARS tolerates invalid values and keeps valid names', (
 });
 
 test('BRIDGE_SECRET_EXCEPTIONS tolerates invalid values and keeps valid patterns', () => {
-  const jsonCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: '{' });
+  const jsonCfg = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: '{' });
   assert.deepEqual(jsonCfg.secretExceptions, { version: 2, namePatterns: [] });
   assert.deepEqual(jsonCfg.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'invalid-json' }]);
 
-  const emptyListCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: '[]' });
+  const emptyListCfg = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: '[]' });
   assert.deepEqual(emptyListCfg.secretExceptions, { version: 2, namePatterns: [] });
   assert.deepEqual(emptyListCfg.configurationIssues, []);
 
-  const legacyCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: '["old/pattern"]' });
+  const legacyCfg = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: '["old/pattern"]' });
   assert.deepEqual(legacyCfg.secretExceptions, { version: 2, namePatterns: [] });
   assert.deepEqual(legacyCfg.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'legacy-format' }]);
 
   for (const notObj of ['null', '123', '"a string"', 'false']) {
-    const cfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: notObj });
+    const cfg = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: notObj });
     assert.deepEqual(cfg.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(cfg.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'not-an-object' }]);
   }
@@ -931,13 +925,12 @@ test('BRIDGE_SECRET_EXCEPTIONS tolerates invalid values and keeps valid patterns
     { version: 2, namePatterns: 'not-a-list' },
   ];
   for (const badFormat of formatCases) {
-    const cfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_SECRET_EXCEPTIONS: JSON.stringify(badFormat) });
+    const cfg = loadConfig({ BRIDGE_SECRET_EXCEPTIONS: JSON.stringify(badFormat) });
     assert.deepEqual(cfg.secretExceptions, { version: 2, namePatterns: [] });
     assert.deepEqual(cfg.configurationIssues, [{ variable: 'BRIDGE_SECRET_EXCEPTIONS', reason: 'invalid-format' }]);
   }
 
   const mixedCfg = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({
       version: 2,
       namePatterns: [
@@ -969,17 +962,17 @@ test('BRIDGE_SECRET_EXCEPTIONS tolerates invalid values and keeps valid patterns
 });
 
 test('BRIDGE_MCP_CATALOG tolerates invalid values, duplicate ids, and large payloads', () => {
-  const jsonCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_MCP_CATALOG: '{' });
+  const jsonCfg = loadConfig({ BRIDGE_MCP_CATALOG: '{' });
   assert.deepEqual(jsonCfg.mcpCatalog, []);
   assert.deepEqual(jsonCfg.configurationIssues, [{ variable: 'BRIDGE_MCP_CATALOG', reason: 'invalid-json' }]);
   assert.equal(jsonCfg.enforceAgentPolicy, true);
 
-  const listCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_MCP_CATALOG: '{"server": 1}' });
+  const listCfg = loadConfig({ BRIDGE_MCP_CATALOG: '{"server": 1}' });
   assert.deepEqual(listCfg.mcpCatalog, []);
   assert.deepEqual(listCfg.configurationIssues, [{ variable: 'BRIDGE_MCP_CATALOG', reason: 'not-a-list' }]);
 
   const tooMany = Array(21).fill({ id: 'srv', serverUrl: 'https://example.com/mcp', tools: [{ name: 't', readOnly: true }] });
-  const countCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_MCP_CATALOG: JSON.stringify(tooMany) });
+  const countCfg = loadConfig({ BRIDGE_MCP_CATALOG: JSON.stringify(tooMany) });
   assert.deepEqual(countCfg.mcpCatalog, []);
   assert.deepEqual(countCfg.configurationIssues, [{ variable: 'BRIDGE_MCP_CATALOG', reason: 'too-many-entries' }]);
 
@@ -989,7 +982,6 @@ test('BRIDGE_MCP_CATALOG tolerates invalid values, duplicate ids, and large payl
   const invalid = { id: 'bad-entry', command: 'relative-not-abs', tools: [{ name: 'query', readOnly: true }] };
 
   const mixedCfg = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_MCP_CATALOG: JSON.stringify([valid1, invalid, valid2, validDup]),
   });
   assert.deepEqual(mixedCfg.mcpCatalog, [valid2]);
@@ -1008,7 +1000,6 @@ test('BRIDGE_MCP_CATALOG tolerates invalid values, duplicate ids, and large payl
   };
   assert.ok(Buffer.byteLength(JSON.stringify([largeEntry]), 'utf8') > 1024 * 1024);
   const largeCfg = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_MCP_CATALOG: JSON.stringify([largeEntry]),
   });
   assert.deepEqual(largeCfg.mcpCatalog, []);
@@ -1016,17 +1007,16 @@ test('BRIDGE_MCP_CATALOG tolerates invalid values, duplicate ids, and large payl
 });
 
 test('BRIDGE_CUSTOM_ROLES tolerates invalid values, built-in names, and duplicates', () => {
-  const jsonCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_CUSTOM_ROLES: '{' });
+  const jsonCfg = loadConfig({ BRIDGE_CUSTOM_ROLES: '{' });
   assert.deepEqual(jsonCfg.customRoles, []);
   assert.deepEqual(jsonCfg.configurationIssues, [{ variable: 'BRIDGE_CUSTOM_ROLES', reason: 'invalid-json' }]);
 
-  const listCfg = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_CUSTOM_ROLES: '"string-role"' });
+  const listCfg = loadConfig({ BRIDGE_CUSTOM_ROLES: '"string-role"' });
   assert.deepEqual(listCfg.customRoles, []);
   assert.deepEqual(listCfg.configurationIssues, [{ variable: 'BRIDGE_CUSTOM_ROLES', reason: 'not-a-list' }]);
 
   const validRole = { name: 'role-valid', baseRole: 'reviewer', instruction: 'Audit the files.' };
   const countCfg = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_CUSTOM_ROLES: JSON.stringify(Array(21).fill(validRole)),
   });
   assert.deepEqual(countCfg.customRoles, []);
@@ -1040,7 +1030,6 @@ test('BRIDGE_CUSTOM_ROLES tolerates invalid values, built-in names, and duplicat
   const roleOk = { name: 'role-ok', baseRole: 'implementer', instruction: 'Valid instructions.' };
 
   const mixedCfg = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     BRIDGE_CUSTOM_ROLES: JSON.stringify([roleBuiltin, roleDup1, roleEmpty, roleBadBase, roleOk, roleDup2]),
   });
   assert.deepEqual(mixedCfg.customRoles, [roleOk]);
@@ -1168,7 +1157,6 @@ test('StateStore readIntegrationRoots tolerates filesystem faults and maps acces
       assert.equal(issuesJson.includes('SEGREDO-IO'), false);
 
       const config = loadConfig({
-        BRIDGE_ANTI_AI_CRAFT: 'off',
         BRIDGE_STATE_DIRECTORY: directory,
       });
       const adapter = new CliAdapter(config, [mockPath]);
@@ -1211,7 +1199,6 @@ test('configurationWarning and configurationIssues never leak sensitive values',
     writeFileSync(file, JSON.stringify({ version: 1, roots: ['relative/' + SENSITIVE] }));
 
     const config = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_STATE_DIRECTORY: directory,
       BRIDGE_ALLOWED_ENV_VARS: JSON.stringify(['NODE_OPTIONS_' + SENSITIVE]),
       BRIDGE_SECRET_EXCEPTIONS: JSON.stringify({ version: 2, namePatterns: ['/abs/' + SENSITIVE] }),
@@ -1260,7 +1247,6 @@ test('black_gravity_health continues to respond when integration-approvals.json 
     writeFileSync(file, '{"invalidJson": true');
 
     const config = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_STATE_DIRECTORY: directory,
     });
     const adapter = new CliAdapter(config, [mockPath]);
@@ -1495,27 +1481,30 @@ test('operations refuse invalid path configurations with INVALID_CONFIGURATION a
       },
     );
 
-    // Permitted when BRIDGE_ANTI_AI_CRAFT='off'
+    // Still refused even when BRIDGE_ANTI_AI_CRAFT='off'
     const configCraftOff = loadConfig({
       BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_ANTI_AI_CRAFT_DIRECTORY: 'relative/craft/path',
       AGY_PATH: process.execPath,
       BRIDGE_STATE_DIRECTORY: path.join(directory, 'state-craft-off'),
     });
+    assert.equal(configCraftOff.antiAiCraftOptOutRequested, true);
+    assert.ok(configCraftOff.configurationIssues.some(i => i.variable === 'BRIDGE_ANTI_AI_CRAFT' && i.reason === 'opt-out-unsupported'));
     const adapterCraftOff = new CliAdapter(configCraftOff, [mockPath]);
     const tasksCraftOff = new TaskManager(adapterCraftOff, configCraftOff);
     await adapterCraftOff.discover();
-    const craftOffTask = await tasksCraftOff.run({
-      prompt: 'read:test',
-      workingDirectory: source,
-      mode: 'read-only',
-    });
-    assert.ok(craftOffTask.taskId);
+    await assert.rejects(
+      tasksCraftOff.run({
+        prompt: 'read:test',
+        workingDirectory: source,
+        mode: 'read-only',
+      }),
+      (err: unknown) => err instanceof BridgeError && err.code === 'INVALID_CONFIGURATION',
+    );
     await tasksCraftOff.shutdown();
 
     // 2. AGY_PATH invalid: CliAdapter.discover returns installed:false, path: '', error with INVALID_CONFIGURATION without leaking value
     const configAgyInvalid = loadConfig({
-      BRIDGE_ANTI_AI_CRAFT: 'off',
       AGY_PATH: 'bin/agy-secret-test',
       BRIDGE_STATE_DIRECTORY: path.join(directory, 'state-agy'),
     });
@@ -1698,7 +1687,7 @@ test('resumed and handoff tasks refuse invalid craft directory with INVALID_CONF
     );
     await tasksCraftInvalid.shutdown();
 
-    // 3. When BRIDGE_ANTI_AI_CRAFT='off', resume is not refused for this reason
+    // 3. Even when BRIDGE_ANTI_AI_CRAFT='off', resume and handoff still refuse invalid craft directory
     const configCraftOff = loadConfig({
       BRIDGE_ANTI_AI_CRAFT: 'off',
       BRIDGE_ANTI_AI_CRAFT_DIRECTORY: invalidCraftMarker,
@@ -1708,13 +1697,25 @@ test('resumed and handoff tasks refuse invalid craft directory with INVALID_CONF
     const adapterCraftOff = new CliAdapter(configCraftOff, [mockPath]);
     await adapterCraftOff.discover();
     const tasksCraftOff = new TaskManager(adapterCraftOff, configCraftOff);
-    const resumedOff = await tasksCraftOff.run({
-      prompt: 'read:resumed-off',
-      workingDirectory: source,
-      sessionId: completed.sessionId,
-      mode: 'read-only',
-    });
-    assert.ok(resumedOff.taskId);
+    await assert.rejects(
+      tasksCraftOff.run({
+        prompt: 'read:resumed-off',
+        workingDirectory: source,
+        sessionId: completed.sessionId,
+        mode: 'read-only',
+      }),
+      (err: unknown) => err instanceof BridgeError && err.code === 'INVALID_CONFIGURATION' && !err.message.includes(invalidCraftMarker),
+    );
+    await assert.rejects(
+      tasksCraftOff.run({
+        prompt: 'read:handoff-off',
+        workingDirectory: source,
+        contextTaskId: completed.taskId,
+        expectedContextSha256: contextInfo.treeSha256,
+        mode: 'read-only',
+      }),
+      (err: unknown) => err instanceof BridgeError && err.code === 'INVALID_CONFIGURATION' && !err.message.includes(invalidCraftMarker),
+    );
     await tasksCraftOff.shutdown();
   } finally {
     rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });

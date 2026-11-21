@@ -20,7 +20,7 @@ async function fixture(extra: Record<string, string> = {}) {
   const source = path.join(dir, 'source');
   execFileSync('git', ['init', '--quiet', source]);
   await writeFile(path.join(source, 'source.txt'), 'source');
-  const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', AGY_PATH: process.execPath, BRIDGE_STATE_DIRECTORY: path.join(dir, 'state'), BRIDGE_TEST_EXECUTOR: 'agy', ...extra });
+  const config = loadConfig({ AGY_PATH: process.execPath, BRIDGE_STATE_DIRECTORY: path.join(dir, 'state'), BRIDGE_TEST_EXECUTOR: 'agy', ...extra });
   const adapter = new CliAdapter(config, [fileURLToPath(new URL('../../tests/mock-agy.mjs', import.meta.url))]);
   await adapter.discover();
   const managers = [new TaskManager(adapter, config)];
@@ -51,8 +51,12 @@ test('supplied skill bytes and resources reach only the isolated CLI copy with b
     const response = JSON.parse((end.result as { response: string }).response);
     assert.equal(response.skill, skillContent);
     assert.equal(response.reference, 'REFERENCE_BYTES_942C');
-    assert.equal(end.providedSkills?.[0]?.name, 'Presentations');
-    assert.equal(end.providedSkills?.[0]?.files.length, 2);
+    const names = end.providedSkills?.map(skill => skill.name) ?? [];
+    assert.ok(names.includes('anti-ai-code'));
+    assert.ok(names.includes('anti-ai-security'));
+    const presentations = end.providedSkills?.find(skill => skill.name === 'Presentations');
+    assert.ok(presentations);
+    assert.equal(presentations.files.length, 2);
     assert.ok(!JSON.stringify(end.providedSkills).includes('PRESERVE_SKILL_BYTES'));
     const saved = new StateStore(f.config.stateDirectory).load()[0]!;
     assert.equal(saved.options.skills, undefined);
@@ -139,7 +143,7 @@ test('read-only CLI cannot modify a supplied skill and existing project skills c
     const legacy = await f.tasks.run({ prompt: 'split:legacy', workingDirectory: f.source, mode: 'read-only' });
     const legacyEnd = await finished(f.tasks, legacy.taskId);
     assert.equal(legacyEnd.status, 'completed');
-    assert.equal(legacyEnd.providedSkills, undefined);
+    assert.deepEqual(legacyEnd.providedSkills?.map(skill => skill.name), ['anti-ai-code', 'anti-ai-security']);
   } finally { await f.close(); }
 });
 

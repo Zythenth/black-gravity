@@ -55,7 +55,7 @@ async function waitUntilReady(client: Client, taskId: string, timeoutMs = 180_00
 }
 
 test('tool profiles reduce the MCP catalog and reject writes in query/review', async () => {
-  assert.throws(() => loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_TOOL_PROFILE: 'unknown' }));
+  assert.throws(() => loadConfig({ BRIDGE_TOOL_PROFILE: 'unknown' }));
   for (const [profile, count] of [['full', 52], ['query', 38], ['review', 41], ['implementation', 52]] as const) {
     const f = await fixture(profile);
     try {
@@ -85,13 +85,13 @@ test('tool profiles reduce the MCP catalog and reject writes in query/review', a
 
 test('custom roles inherit read-only contracts and freeze instructions across configuration changes', async () => {
   const role = { name: 'security-review', baseRole: 'reviewer', instruction: 'Inspect the requested access-control boundary.', description: 'Review requested access controls.' };
-  const cfgNotJson = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_CUSTOM_ROLES: 'not-json' });
+  const cfgNotJson = loadConfig({ BRIDGE_CUSTOM_ROLES: 'not-json' });
   assert.deepEqual(cfgNotJson.customRoles, []);
   assert.deepEqual(cfgNotJson.configurationIssues, [{ variable: 'BRIDGE_CUSTOM_ROLES', reason: 'invalid-json' }]);
-  const cfgBuiltin = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_CUSTOM_ROLES: JSON.stringify([{ ...role, name: 'reviewer' }]) });
+  const cfgBuiltin = loadConfig({ BRIDGE_CUSTOM_ROLES: JSON.stringify([{ ...role, name: 'reviewer' }]) });
   assert.deepEqual(cfgBuiltin.customRoles, []);
   assert.deepEqual(cfgBuiltin.configurationIssues, [{ variable: 'BRIDGE_CUSTOM_ROLES', index: 0, reason: 'invalid-entry' }]);
-  const cfgDuplicate = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_CUSTOM_ROLES: JSON.stringify([role, role]) });
+  const cfgDuplicate = loadConfig({ BRIDGE_CUSTOM_ROLES: JSON.stringify([role, role]) });
   assert.deepEqual(cfgDuplicate.customRoles, []);
   assert.deepEqual(cfgDuplicate.configurationIssues, [
     { variable: 'BRIDGE_CUSTOM_ROLES', index: 0, reason: 'duplicate' },

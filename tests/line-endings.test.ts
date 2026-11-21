@@ -189,7 +189,7 @@ async function withTaskManager(attributes: string | undefined, body: (repo: stri
   const state = path.join(root, 'state');
   await mkdir(state);
   const repo = await fixtureRepository(root, attributes);
-  const config = loadConfig({ BRIDGE_ANTI_AI_CRAFT: 'off', BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_EXECUTOR: 'agy' });
+  const config = loadConfig({ BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_EXECUTOR: 'agy' });
   const adapter = new CopyAdapter(config);
   const tasks = new TaskManager(adapter, config);
   try {

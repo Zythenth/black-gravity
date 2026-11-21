@@ -152,7 +152,6 @@ function snapshotOf(dir: string, id: string): Snapshot {
 
 function createManager(stateDir: string): TaskManager {
   const config = loadConfig({
-    BRIDGE_ANTI_AI_CRAFT: 'off',
     AGY_PATH: process.execPath,
     BRIDGE_TEST_EXECUTOR: 'agy',
     BRIDGE_STATE_DIRECTORY: stateDir,
