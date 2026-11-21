@@ -5,6 +5,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { z } from 'zod';
 import { verifyCraftSnapshot, type VerifiedCraftSnapshot } from './craft-snapshot.js';
+import { BUNDLED_CRAFT_MANIFEST_SHA256 } from './craft-pin.js';
 import type { ProvidedSkill } from './skills.js';
 import { BridgeError } from './types.js';
 import { assertAntiAiCraftDirectoryUsable } from './config.js';
@@ -101,14 +102,81 @@ function boundedCatalog(entries: CraftSelection['catalog']): CraftSelection['cat
   throw new BridgeError('CRAFT_SNAPSHOT_INVALID', 'Skill catalog does not fit its prompt budget');
 }
 
+function assertPermanentSkills(snapshot: VerifiedCraftSnapshot): void {
+  const missing = PERMANENT_SKILLS.filter(name => !snapshot.manifest.skills.includes(name));
+  if (missing.length) throw new BridgeError('CRAFT_SNAPSHOT_INVALID', 'Permanent skills are missing: ' + missing.join(', '));
+}
+
+export async function verifyBundledCraft(root: string, expected: string = BUNDLED_CRAFT_MANIFEST_SHA256): Promise<VerifiedCraftSnapshot> {
+  const snapshot = await verifyCraftSnapshot(root);
+  if (snapshot.manifestSha256 !== expected) {
+    throw new BridgeError('CRAFT_SNAPSHOT_INVALID', 'The bundled Anti-AI Craft manifest digest does not match this release; reinstall this bridge version');
+  }
+  return snapshot;
+}
+
+export type CraftStatus =
+  | { enabled: false }
+  | {
+      enabled: true;
+      source: 'bundled' | 'override';
+      ready: boolean;
+      revision?: string;
+      version?: string;
+      manifestSha256?: string;
+      expectedManifestSha256?: string;
+      files?: number;
+      totalBytes?: number;
+      skills?: string[];
+      permanent?: string[];
+      error?: { code: string; message: string };
+    };
+
+const CRAFT_STATUS_MESSAGES: Record<string, string> = {
+  CRAFT_SNAPSHOT_MISSING: 'The Anti-AI Craft snapshot is missing; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY',
+  CRAFT_SNAPSHOT_INVALID: 'The Anti-AI Craft snapshot failed verification; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY',
+  INVALID_CONFIGURATION: 'BRIDGE_ANTI_AI_CRAFT_DIRECTORY is invalid. See configurationIssues in black_gravity_health.',
+};
+
+export async function craftStatus(config: { antiAiCraft: boolean; antiAiCraftDirectory?: string; antiAiCraftDirectoryInvalid?: boolean }): Promise<CraftStatus> {
+  if (!config.antiAiCraft) return { enabled: false };
+  const isOverride = config.antiAiCraftDirectory !== undefined || Boolean(config.antiAiCraftDirectoryInvalid);
+  const source: 'bundled' | 'override' = isOverride ? 'override' : 'bundled';
+  const expected = isOverride ? undefined : { expectedManifestSha256: BUNDLED_CRAFT_MANIFEST_SHA256 };
+  try {
+    assertAntiAiCraftDirectoryUsable(config);
+    const root = config.antiAiCraftDirectory ?? bundledSnapshot();
+    if (!root) throw new BridgeError('CRAFT_SNAPSHOT_MISSING', 'The bundled Anti-AI Craft snapshot is missing; reinstall this bridge version');
+    const snapshot = isOverride ? await verifyCraftSnapshot(root) : await verifyBundledCraft(root);
+    assertPermanentSkills(snapshot);
+    return {
+      enabled: true,
+      source,
+      ready: true,
+      revision: snapshot.manifest.revision,
+      version: snapshot.manifest.version,
+      manifestSha256: snapshot.manifestSha256,
+      ...expected,
+      files: snapshot.manifest.files.length,
+      totalBytes: snapshot.totalBytes,
+      skills: [...snapshot.manifest.skills],
+      permanent: [...PERMANENT_SKILLS],
+    };
+  } catch (error) {
+    const code = error instanceof BridgeError ? error.code : 'CRAFT_SNAPSHOT_INVALID';
+    const message = CRAFT_STATUS_MESSAGES[code] ?? 'Anti-AI Craft snapshot verification failed';
+    return { enabled: true, source, ready: false, ...expected, error: { code, message } };
+  }
+}
+
 export async function prepareCraft(config: { antiAiCraft: boolean; antiAiCraftDirectory?: string; antiAiCraftDirectoryInvalid?: boolean; stateDirectory: string }): Promise<PreparedCraft | undefined> {
   if (!config.antiAiCraft) return undefined;
   assertAntiAiCraftDirectoryUsable(config);
   const source = config.antiAiCraftDirectory ?? bundledSnapshot();
   if (!source) throw new BridgeError('CRAFT_SNAPSHOT_MISSING', 'The bundled Anti-AI Craft snapshot is missing; reinstall this bridge version');
-  const snapshot = await cachedSnapshot(await verifyCraftSnapshot(source), config.stateDirectory);
-  const missing = PERMANENT_SKILLS.filter(name => !snapshot.manifest.skills.includes(name));
-  if (missing.length) throw new BridgeError('CRAFT_SNAPSHOT_INVALID', 'Permanent skills are missing: ' + missing.join(', '));
+  const verified = config.antiAiCraftDirectory !== undefined ? await verifyCraftSnapshot(source) : await verifyBundledCraft(source);
+  const snapshot = await cachedSnapshot(verified, config.stateDirectory);
+  assertPermanentSkills(snapshot);
   const permanent = await Promise.all(PERMANENT_SKILLS.map(name => permanentBundle(snapshot, name)));
   const catalog = await Promise.all(snapshot.manifest.skills.filter(name => !PERMANENT_SKILLS.includes(name)).map(async name => {
     const skillFile = path.join(snapshot.root, 'skills', name, 'SKILL.md');

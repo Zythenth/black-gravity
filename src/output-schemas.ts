@@ -33,6 +33,23 @@ const timestamp = z.string().datetime();
 const status = z.enum(['queued', 'starting', 'running', 'streaming', 'completed', 'failed', 'cancelled', 'timeout']);
 const verificationStatus = z.enum(['passed', 'failed', 'unverified']);
 const portableNodeIdentity = z.object({ buildId: z.string(), nodeVersion: z.string(), libuvVersion: z.string(), sha256: hash }).strict();
+const antiAiCraftStatusSchema = z.discriminatedUnion('enabled', [
+  z.object({ enabled: z.literal(false) }).strict(),
+  z.object({
+    enabled: z.literal(true),
+    source: z.enum(['bundled', 'override']),
+    ready: z.boolean(),
+    revision: z.string().regex(/^[a-f0-9]{40}$/).optional(),
+    version: z.string().optional(),
+    manifestSha256: hash.optional(),
+    expectedManifestSha256: hash.optional(),
+    files: count.optional(),
+    totalBytes: count.optional(),
+    skills: z.array(z.string()).optional(),
+    permanent: z.array(z.string()).optional(),
+    error: z.object({ code: z.string(), message: z.string() }).strict().optional(),
+  }).strict(),
+]);
 export const testEvidenceSchema = z.object({
   command: z.string(), exitCode: z.number().int().min(0).max(0xffffffff), output: z.string(), sha256: hash, beforeSha256: hash.optional(), recordedAt: timestamp,
   source: z.enum(['client-reported', 'agy-tool', 'windows-executor', 'linux-executor']), treeSha256: hash.optional(), beforeTreeSha256: hash.optional(),
@@ -186,6 +203,7 @@ export const successOutputSchemas = {
         reason: z.string().optional(),
       }).strict().optional(),
     }).strict().optional(),
+    antiAiCraft: antiAiCraftStatusSchema.optional(),
     waitCommand: waitCommandSchema.optional(),
   }).strict(),
   black_gravity_list_models: z.object({ models: z.array(z.object({ id: z.string(), name: z.string() }).strict()) }).strict(),

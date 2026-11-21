@@ -22,6 +22,10 @@ for (const root of [...roots].sort()) {
 // The bundled skill content is verified against its pinned manifest before the plugin counts as built.
 const { verifyCraftSnapshot } = await import('../dist/src/craft-snapshot.js');
 const craft = await verifyCraftSnapshot(path.resolve('plugin', 'anti-ai-craft'));
+const { BUNDLED_CRAFT_MANIFEST_SHA256 } = await import('../dist/src/craft-pin.js');
+if (craft.manifestSha256 !== BUNDLED_CRAFT_MANIFEST_SHA256) {
+  throw new Error(`Bundled Anti-AI Craft manifest digest (${craft.manifestSha256}) differs from BUNDLED_CRAFT_MANIFEST_SHA256 (${BUNDLED_CRAFT_MANIFEST_SHA256})`);
+}
 const craftNotice = `## Anti-AI Craft ${craft.manifest.version}\n\nSkill content distributed in \`plugin/anti-ai-craft/\`, obtained from ${craft.manifest.origin} at revision \`${craft.manifest.revision}\` ` +
   `(${craft.manifest.files.length} files, SHA-256 manifest \`${craft.manifestSha256}\`). The images in \`skills/anti-ai-design/references/visual-library/images/\` ` +
   'remain under the licenses and attributions of their sources, described in `ATTRIBUTIONS.md`, `catalog.jsonl`, and `LICENSES/` in the same directory; the MIT license of this package does not apply to them.\n';

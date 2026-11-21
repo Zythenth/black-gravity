@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
+import { BUNDLED_CRAFT_MANIFEST_SHA256 } from '../src/craft-pin.js';
+import { verifyBundledCraft } from '../src/craft.js';
 import { verifyCraftSnapshot, type CraftManifest } from '../src/craft-snapshot.js';
 import { BridgeError } from '../src/types.js';
 
@@ -51,5 +53,23 @@ test('a snapshot is refused when bytes, files or manifest paths diverge', async 
     }
   } finally {
     for (const root of roots) await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('BUNDLED_CRAFT_MANIFEST_SHA256 matches the packaged manifest bytes and verifyBundledCraft', async () => {
+  const bytes = await readFile(path.join(packaged, 'manifest.json'));
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  assert.equal(BUNDLED_CRAFT_MANIFEST_SHA256, digest);
+  const snapshot = await verifyBundledCraft(packaged);
+  assert.equal(snapshot.manifestSha256, BUNDLED_CRAFT_MANIFEST_SHA256);
+});
+
+test('verifyBundledCraft refuses an internally consistent unpinned snapshot', async () => {
+  const root = await synthetic();
+  try {
+    await verifyCraftSnapshot(root);
+    await assert.rejects(verifyBundledCraft(root), invalid);
+  } finally {
+    await rm(root, { recursive: true, force: true });
   }
 });

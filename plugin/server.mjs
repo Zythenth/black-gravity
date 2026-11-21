@@ -47939,6 +47939,23 @@ var timestamp = external_exports.string().datetime();
 var status = external_exports.enum(["queued", "starting", "running", "streaming", "completed", "failed", "cancelled", "timeout"]);
 var verificationStatus = external_exports.enum(["passed", "failed", "unverified"]);
 var portableNodeIdentity = external_exports.object({ buildId: external_exports.string(), nodeVersion: external_exports.string(), libuvVersion: external_exports.string(), sha256: hash2 }).strict();
+var antiAiCraftStatusSchema = external_exports.discriminatedUnion("enabled", [
+  external_exports.object({ enabled: external_exports.literal(false) }).strict(),
+  external_exports.object({
+    enabled: external_exports.literal(true),
+    source: external_exports.enum(["bundled", "override"]),
+    ready: external_exports.boolean(),
+    revision: external_exports.string().regex(/^[a-f0-9]{40}$/).optional(),
+    version: external_exports.string().optional(),
+    manifestSha256: hash2.optional(),
+    expectedManifestSha256: hash2.optional(),
+    files: count.optional(),
+    totalBytes: count.optional(),
+    skills: external_exports.array(external_exports.string()).optional(),
+    permanent: external_exports.array(external_exports.string()).optional(),
+    error: external_exports.object({ code: external_exports.string(), message: external_exports.string() }).strict().optional()
+  }).strict()
+]);
 var testEvidenceSchema = external_exports.object({
   command: external_exports.string(),
   exitCode: external_exports.number().int().min(0).max(4294967295),
@@ -48172,6 +48189,7 @@ var successOutputSchemas = {
         reason: external_exports.string().optional()
       }).strict().optional()
     }).strict().optional(),
+    antiAiCraft: antiAiCraftStatusSchema.optional(),
     waitCommand: waitCommandSchema.optional()
   }).strict(),
   black_gravity_list_models: external_exports.object({ models: external_exports.array(external_exports.object({ id: external_exports.string(), name: external_exports.string() }).strict()) }).strict(),
@@ -49659,6 +49677,7 @@ function createMcpServer(adapter, tasks, options = {}) {
         maintenanceIssues: tasks.maintenanceIssues,
         windowsRuntime: await tasks.windowsRuntimeStatus(),
         testExecutor: tasks.testExecutorStatus(),
+        antiAiCraft: await tasks.antiAiCraftStatus(),
         ...tasks.isStateDirectoryUsable() ? waitCommand() : {},
         bridgeLimitations: {
           interactiveReplies: { available: false, reason: "The verified agy headless protocol rejects control_request/control_response. This bridge cannot answer pending permission requests; use supported sandbox permissions and inspect failures." },
@@ -51277,6 +51296,9 @@ async function verifyCraftSnapshot(root) {
   };
 }
 
+// dist/src/craft-pin.js
+var BUNDLED_CRAFT_MANIFEST_SHA256 = "147a53ce170842441c0fc01cdfc21852ee91906e62cea6a8070e6e0d39f0a5aa";
+
 // dist/src/craft.js
 var PERMANENT_SKILLS = ["anti-ai-code", "anti-ai-security"];
 var MAX_CATALOG_BYTES = 8 * 1024;
@@ -51359,6 +51381,55 @@ function boundedCatalog(entries2) {
   }
   throw new BridgeError("CRAFT_SNAPSHOT_INVALID", "Skill catalog does not fit its prompt budget");
 }
+function assertPermanentSkills(snapshot) {
+  const missing = PERMANENT_SKILLS.filter((name) => !snapshot.manifest.skills.includes(name));
+  if (missing.length)
+    throw new BridgeError("CRAFT_SNAPSHOT_INVALID", "Permanent skills are missing: " + missing.join(", "));
+}
+async function verifyBundledCraft(root, expected = BUNDLED_CRAFT_MANIFEST_SHA256) {
+  const snapshot = await verifyCraftSnapshot(root);
+  if (snapshot.manifestSha256 !== expected) {
+    throw new BridgeError("CRAFT_SNAPSHOT_INVALID", "The bundled Anti-AI Craft manifest digest does not match this release; reinstall this bridge version");
+  }
+  return snapshot;
+}
+var CRAFT_STATUS_MESSAGES = {
+  CRAFT_SNAPSHOT_MISSING: "The Anti-AI Craft snapshot is missing; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY",
+  CRAFT_SNAPSHOT_INVALID: "The Anti-AI Craft snapshot failed verification; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY",
+  INVALID_CONFIGURATION: "BRIDGE_ANTI_AI_CRAFT_DIRECTORY is invalid. See configurationIssues in black_gravity_health."
+};
+async function craftStatus(config2) {
+  if (!config2.antiAiCraft)
+    return { enabled: false };
+  const isOverride = config2.antiAiCraftDirectory !== void 0 || Boolean(config2.antiAiCraftDirectoryInvalid);
+  const source = isOverride ? "override" : "bundled";
+  const expected = isOverride ? void 0 : { expectedManifestSha256: BUNDLED_CRAFT_MANIFEST_SHA256 };
+  try {
+    assertAntiAiCraftDirectoryUsable(config2);
+    const root = config2.antiAiCraftDirectory ?? bundledSnapshot();
+    if (!root)
+      throw new BridgeError("CRAFT_SNAPSHOT_MISSING", "The bundled Anti-AI Craft snapshot is missing; reinstall this bridge version");
+    const snapshot = isOverride ? await verifyCraftSnapshot(root) : await verifyBundledCraft(root);
+    assertPermanentSkills(snapshot);
+    return {
+      enabled: true,
+      source,
+      ready: true,
+      revision: snapshot.manifest.revision,
+      version: snapshot.manifest.version,
+      manifestSha256: snapshot.manifestSha256,
+      ...expected,
+      files: snapshot.manifest.files.length,
+      totalBytes: snapshot.totalBytes,
+      skills: [...snapshot.manifest.skills],
+      permanent: [...PERMANENT_SKILLS]
+    };
+  } catch (error62) {
+    const code = error62 instanceof BridgeError ? error62.code : "CRAFT_SNAPSHOT_INVALID";
+    const message = CRAFT_STATUS_MESSAGES[code] ?? "Anti-AI Craft snapshot verification failed";
+    return { enabled: true, source, ready: false, ...expected, error: { code, message } };
+  }
+}
 async function prepareCraft(config2) {
   if (!config2.antiAiCraft)
     return void 0;
@@ -51366,10 +51437,9 @@ async function prepareCraft(config2) {
   const source = config2.antiAiCraftDirectory ?? bundledSnapshot();
   if (!source)
     throw new BridgeError("CRAFT_SNAPSHOT_MISSING", "The bundled Anti-AI Craft snapshot is missing; reinstall this bridge version");
-  const snapshot = await cachedSnapshot(await verifyCraftSnapshot(source), config2.stateDirectory);
-  const missing = PERMANENT_SKILLS.filter((name) => !snapshot.manifest.skills.includes(name));
-  if (missing.length)
-    throw new BridgeError("CRAFT_SNAPSHOT_INVALID", "Permanent skills are missing: " + missing.join(", "));
+  const verified = config2.antiAiCraftDirectory !== void 0 ? await verifyCraftSnapshot(source) : await verifyBundledCraft(source);
+  const snapshot = await cachedSnapshot(verified, config2.stateDirectory);
+  assertPermanentSkills(snapshot);
   const permanent = await Promise.all(PERMANENT_SKILLS.map((name) => permanentBundle(snapshot, name)));
   const catalog = await Promise.all(snapshot.manifest.skills.filter((name) => !PERMANENT_SKILLS.includes(name)).map(async (name) => {
     const skillFile = path23.join(snapshot.root, "skills", name, "SKILL.md");
@@ -56301,6 +56371,9 @@ var TaskManager = class {
   }
   windowsRuntimeStatus() {
     return portableNodeStatus(this.config.windowsNodeRuntime, this.config.windowsNodeCacheDirectory, void 0, { cacheDirectoryInvalid: this.config.windowsNodeCacheDirectoryInvalid });
+  }
+  antiAiCraftStatus() {
+    return craftStatus(this.config);
   }
   effectiveTestExecutor() {
     if (!this.config.testExecutorExplicit && this.config.testExecutor === "agy" && this.linuxBwrapStatus?.available) {

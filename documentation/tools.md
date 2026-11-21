@@ -19,7 +19,7 @@ Every tool publishes an `outputSchema` describing fields and types in its struct
 
 | Tool | Purpose |
 | --- | --- |
-| `black_gravity_health` | Checks executable, version, apparent authentication and capabilities. |
+| `black_gravity_health` | Checks executable, version, apparent authentication, capabilities and `antiAiCraft` snapshot status. |
 | `black_gravity_list_models` | Lists IDs returned by `agy models`. |
 | `black_gravity_capabilities` | Reports each CLI capability as observed, absent or unknown from version and help output only, whether the CLI exposes the model actually used, and recorded edit-tool restrictions. |
 | `black_gravity_resolve_model` | Resolves the `flash` or `argon` alias and requested effort to an exact ID from `agy models`, without substituting or downgrading, and reports effective-model observability. |

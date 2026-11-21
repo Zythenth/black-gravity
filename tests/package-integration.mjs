@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { cp, mkdir, mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -17,6 +17,7 @@ const npmCli = process.env.npm_execpath;
 if (!npmCli) throw Error('Run with npm run test:package');
 const directory = await realpath(await mkdtemp(path.join(os.tmpdir(), 'black-gravity-package-test-')));
 const cacheEnv = { BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: path.join(directory, 'windows-node-cache') };
+let packagedCraftSha256;
 const expectedFiles = [
   'package.json', 'bin/black-gravity.mjs', 'plugin/server.mjs',
   'plugin/.codex-plugin/plugin.json', 'plugin/.mcp.json',
@@ -41,10 +42,10 @@ async function waitForExit(pid, timeoutMs = 10000) {
   }
 }
 
-async function check(command, args, label) {
+async function check(command, args, label, extraEnv = {}) {
   const client = new Client({ name: 'package-test', version: '1' });
   const transport = new StdioClientTransport({ command, args, cwd: directory, stderr: 'pipe',
-    env: { ...cacheEnv, AGY_PATH: path.join(directory, 'missing-agy'), BRIDGE_STATE_DIRECTORY: path.join(directory, 'state-' + label) } });
+    env: { ...cacheEnv, ...extraEnv, AGY_PATH: path.join(directory, 'missing-agy'), BRIDGE_STATE_DIRECTORY: path.join(directory, 'state-' + label) } });
   let diagnostics = '';
   let pid;
   transport.stderr.on('data', chunk => { diagnostics = (diagnostics + String(chunk)).slice(-4000); });
@@ -61,13 +62,20 @@ async function check(command, args, label) {
     assert.equal(health.isError, undefined, JSON.stringify(health.structuredContent));
     assert.equal(health.structuredContent.installed, false);
     assert.equal(typeof health.structuredContent.error, 'string');
+    const craftHealth = health.structuredContent.antiAiCraft;
+    assert.equal(craftHealth?.enabled, true);
+    assert.equal(craftHealth?.source, 'bundled');
+    assert.equal(craftHealth?.ready, true);
+    assert.equal(craftHealth?.revision, craft.revision);
+    assert.equal(craftHealth?.manifestSha256, packagedCraftSha256);
+    assert.equal(craftHealth?.expectedManifestSha256, packagedCraftSha256);
     const argv = health.structuredContent.waitCommand.argv;
     assert.deepEqual(argv.slice(2), ['wait', '--state-directory', path.join(directory, 'state-' + label)]);
     if (label === 'tarball') assert.equal(argv[1], path.join(directory, 'package/bin/black-gravity.mjs'));
     const waitResult = spawnSync(argv[0], [...argv.slice(1), randomUUID()], {
       cwd: directory,
       encoding: 'utf8',
-      env: { ...cacheEnv, AGY_PATH: path.join(directory, 'missing-agy') },
+      env: { ...cacheEnv, ...extraEnv, AGY_PATH: path.join(directory, 'missing-agy') },
     });
     assert.equal(waitResult.status, 7, waitResult.stderr);
     assert.equal(JSON.parse(waitResult.stdout.trim()).outcome, 'unknown-task');
@@ -133,6 +141,7 @@ try {
   assert.deepEqual(packagedManifest.bin, { 'black-gravity': 'bin/black-gravity.mjs' });
   assert.equal(JSON.parse(await readFile(path.join(directory, 'package/plugin/.codex-plugin/plugin.json'), 'utf8')).version, manifest.version);
   assert.equal((await verifyCraftSnapshot(path.join(directory, 'package/plugin/anti-ai-craft'))).manifest.revision, craft.revision);
+  packagedCraftSha256 = createHash('sha256').update(await readFile(path.join(directory, 'package/plugin/anti-ai-craft/manifest.json'))).digest('hex');
   const packagedSkill = await readFile(path.join(directory, 'package/plugin/skills/black-gravity/SKILL.md'));
   assert.ok(packagedSkill.length <= 12000, `Skill core has ${packagedSkill.length} bytes; the limit is 12000`);
   const linkedReferences = [...packagedSkill.toString('utf8').matchAll(/\]\((references\/[^)]+\.md)\)/g)].map(match => `plugin/skills/black-gravity/${match[1]}`).sort();
@@ -143,6 +152,24 @@ try {
   checkPermissionsCommand(bin);
   await check(process.execPath, [bin], 'tarball');
   await check(process.platform === 'win32' ? 'npx.cmd' : 'npx', ['--offline', '--yes', '--ignore-scripts', '--cache', path.join(directory, 'cache'), '--package', archive, 'black-gravity'], 'npx');
+  const spacedCopy = path.join(directory, 'clean install, a b');
+  const emptyHome = path.join(directory, 'empty-home');
+  const emptyAppData = path.join(directory, 'empty-appdata');
+  await cp(path.join(directory, 'package'), spacedCopy, { recursive: true });
+  await mkdir(emptyHome, { recursive: true });
+  await mkdir(path.join(emptyAppData, 'Roaming'), { recursive: true });
+  await mkdir(path.join(emptyAppData, 'Local'), { recursive: true });
+  await check(process.execPath, [path.join(spacedCopy, 'bin/black-gravity.mjs')], 'spaced', {
+    HOME: emptyHome,
+    USERPROFILE: emptyHome,
+    APPDATA: path.join(emptyAppData, 'Roaming'),
+    LOCALAPPDATA: path.join(emptyAppData, 'Local'),
+  });
+  // Windows creates its empty per-user shell folders under an overridden USERPROFILE on demand; files are never allowed.
+  const homeEntries = await readdir(emptyHome, { recursive: true, withFileTypes: true });
+  const homeFiles = homeEntries.filter(entry => !entry.isDirectory()).map(entry => path.relative(emptyHome, path.join(entry.parentPath, entry.name)));
+  assert.deepEqual(homeFiles, [], 'the clean install wrote files into the personal folder');
+  if (process.platform !== 'win32') assert.deepEqual(homeEntries.map(entry => entry.name), [], 'the clean install wrote into the personal folder');
   await checkAgedState(bin, directory);
   await checkFailedCleanup(bin, directory);
   await checkToolContracts(bin, directory);

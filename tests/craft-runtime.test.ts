@@ -9,6 +9,8 @@ import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { CliAdapter } from '../src/cli-adapter.js';
 import { loadConfig } from '../src/config.js';
+import { BUNDLED_CRAFT_MANIFEST_SHA256 } from '../src/craft-pin.js';
+import { craftStatus, PERMANENT_SKILLS } from '../src/craft.js';
 import { TaskManager } from '../src/task-manager.js';
 import { BridgeError, type TaskRecord } from '../src/types.js';
 
@@ -184,4 +186,71 @@ test('Windows test tasks keep the Anti-AI Craft selection of their source task',
   } finally {
     await tasks.shutdown();
   }
+});
+
+test('craftStatus reports off, bundled ready, and tampered override without creating state', async () => {
+  const scratch = await mkdtemp(path.join(os.tmpdir(), 'black-gravity-craft-status-'));
+  directories.push(scratch);
+  const untouchedState = path.join(scratch, 'untouched-state');
+  const direct = await craftStatus(loadConfig({ BRIDGE_STATE_DIRECTORY: untouchedState }));
+  assert.equal(existsSync(untouchedState), false);
+  if (!direct.enabled) assert.fail('expected craftStatus to be enabled for default config');
+  assert.equal(direct.source, 'bundled');
+  assert.equal(direct.ready, true);
+
+  const off = await setup({ BRIDGE_ANTI_AI_CRAFT: 'off' });
+  try {
+    assert.deepEqual(await off.tasks.antiAiCraftStatus(), { enabled: false });
+    assert.equal(existsSync(path.join(off.state, 'anti-ai-craft')), false);
+  } finally {
+    await off.tasks.shutdown();
+  }
+
+  const def = await setup();
+  try {
+    const status = await def.tasks.antiAiCraftStatus();
+    if (!status.enabled) assert.fail('expected antiAiCraftStatus to be enabled');
+    const manifest = JSON.parse(await readFile(path.join(packaged, 'manifest.json'), 'utf8'));
+    assert.equal(status.source, 'bundled');
+    assert.equal(status.ready, true);
+    assert.equal(status.revision, '201fec54431bdf7e4c8bb3660100601b41b97b08');
+    assert.equal(status.manifestSha256, BUNDLED_CRAFT_MANIFEST_SHA256);
+    assert.equal(status.expectedManifestSha256, BUNDLED_CRAFT_MANIFEST_SHA256);
+    assert.equal(status.skills?.length, 6);
+    assert.deepEqual(status.skills, manifest.skills);
+    assert.equal(status.files, manifest.files.length);
+    assert.deepEqual(status.permanent, PERMANENT_SKILLS);
+    assert.equal(existsSync(path.join(def.state, 'anti-ai-craft')), false);
+  } finally {
+    await def.tasks.shutdown();
+  }
+
+  const snapshot = await syntheticSnapshot(scratch);
+  await writeFile(path.join(snapshot, 'skills', 'anti-ai-design', 'SKILL.md'), 'tampered');
+  const tampered = await setup({ BRIDGE_ANTI_AI_CRAFT_DIRECTORY: snapshot });
+  try {
+    const status = await tampered.tasks.antiAiCraftStatus();
+    if (!status.enabled) assert.fail('expected antiAiCraftStatus to be enabled for tampered override');
+    assert.equal(status.source, 'override');
+    assert.equal(status.ready, false);
+    assert.equal(status.expectedManifestSha256, undefined);
+    assert.equal(status.error?.code, 'CRAFT_SNAPSHOT_INVALID');
+    assert.equal(status.error?.message, 'The Anti-AI Craft snapshot failed verification; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY');
+    assert.equal(status.error?.message.includes('skills/'), false);
+    assert.equal(status.error?.message.includes(snapshot), false);
+    assert.equal(existsSync(path.join(tampered.state, 'anti-ai-craft')), false);
+  } finally {
+    await tampered.tasks.shutdown();
+  }
+
+  const malformed = path.join(scratch, 'malformed-craft');
+  await mkdir(malformed, { recursive: true });
+  await writeFile(path.join(malformed, 'manifest.json'), '{ "/secret/private/path": ');
+  const malformedStatus = await craftStatus(loadConfig({ BRIDGE_ANTI_AI_CRAFT_DIRECTORY: malformed }));
+  if (!malformedStatus.enabled) assert.fail('expected craftStatus to be enabled for malformed override');
+  assert.equal(malformedStatus.source, 'override');
+  assert.equal(malformedStatus.ready, false);
+  assert.equal(malformedStatus.error?.code, 'CRAFT_SNAPSHOT_INVALID');
+  assert.equal(malformedStatus.error?.message, 'The Anti-AI Craft snapshot failed verification; reinstall this bridge version or fix BRIDGE_ANTI_AI_CRAFT_DIRECTORY');
+  assert.equal(malformedStatus.error?.message.includes('/secret/private/path'), false);
 });

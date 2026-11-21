@@ -22,7 +22,7 @@ import { terminateSubprocess, redactDiagnostic, redactionContextDigest, contains
 import { reconcileOwnedProcesses } from './process-tree.js';
 import { sanitizePayload } from './payload-safety.js';
 import { providedSkillsSchema, MAX_TOTAL_BUNDLES_BYTES, verifyProvidedSkills } from './skills.js';
-import { prepareCraft, mergePermanentSkills, verifyCraftSelection } from './craft.js';
+import { prepareCraft, mergePermanentSkills, verifyCraftSelection, craftStatus, type CraftStatus } from './craft.js';
 import { convertCrlfToLf, listCopyFiles, normalizeEditedLineEndings, planLineEndings, restoreByteOrderMarks, restoreCrlfLineEndings, type LineEndingStyle } from './line-endings.js';
 import { assertForbiddenDirectoriesUsable, assertSecretExclusionsUsable, assertAgyPathUsable, assertWindowsNodeCacheDirectoryUsable, assertAntiAiCraftDirectoryUsable, type Config, type ApprovalMode, type ConfigurationIssue, type ConfigurationIssueReason, type TestExecutor } from './config.js';
 import { EventStore } from './event-store.js';
@@ -355,6 +355,7 @@ export class TaskManager {
     return this.state.loadSandboxPolicy();
   }
   windowsRuntimeStatus(): Promise<PortableNodeStatus> { return portableNodeStatus(this.config.windowsNodeRuntime, this.config.windowsNodeCacheDirectory, undefined, { cacheDirectoryInvalid: this.config.windowsNodeCacheDirectoryInvalid }); }
+  antiAiCraftStatus(): Promise<CraftStatus> { return craftStatus(this.config); }
   private effectiveTestExecutor(): TestExecutor {
     if (!this.config.testExecutorExplicit && this.config.testExecutor === 'agy' && this.linuxBwrapStatus?.available) {
       return 'linux-bwrap';
