@@ -99,6 +99,7 @@ export async function writeLineEndingConversions(project: ProjectCopy, conversio
 }
 
 export async function readLineEndingConversions(project: ProjectCopy): Promise<LineEndingConversions | undefined> {
+  await assertManagedCopyPresent(project);
   const marker = path.join(project.gitDirectory, LINE_ENDINGS_MARKER_NAME);
   let text: string;
   try {
@@ -131,7 +132,35 @@ export async function clearLineEndingConversions(project: ProjectCopy): Promise<
   await rm(path.join(project.gitDirectory, LINE_ENDINGS_MARKER_NAME), { force: true });
 }
 
+const COPY_MISSING_MESSAGE =
+  'The isolated copy of this task no longer exists; a restart or a temporary-directory cleanup may have removed it. The bridge does not recreate it and never runs in the original project. Discard the task and start a new one.';
+const BASELINE_MISSING_MESSAGE =
+  "The private baseline of this task's isolated copy no longer exists; a restart or a temporary-directory cleanup may have removed it. The bridge does not recreate it and never runs in the original project. Discard the task and start a new one.";
+
+async function lstatManagedEntry(target: string, kind: 'dir' | 'file', missingMessage: string): Promise<void> {
+  let info;
+  try {
+    info = await lstat(target);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new BridgeError('COPY_MISSING', missingMessage);
+    }
+    throw error;
+  }
+  const validType = kind === 'dir' ? info.isDirectory() : info.isFile();
+  if (info.isSymbolicLink() || !validType) {
+    throw new BridgeError('UNSAFE_PROJECT_PATH', 'Refusing a replaced copy directory');
+  }
+}
+
+export async function assertManagedCopyPresent(project: ProjectCopy): Promise<void> {
+  await lstatManagedEntry(project.copyDirectory, 'dir', COPY_MISSING_MESSAGE);
+  await lstatManagedEntry(project.gitDirectory, 'dir', BASELINE_MISSING_MESSAGE);
+  await lstatManagedEntry(path.join(project.gitDirectory, 'HEAD'), 'file', BASELINE_MISSING_MESSAGE);
+}
+
 export async function verifyManagedCopy(project: ProjectCopy): Promise<void> {
+  await assertManagedCopyPresent(project);
   await checkFenceMarker(project);
   await verifyProvidedSkills(project.copyDirectory, project.providedSkills ?? []);
   if (project.executionPolicy) {

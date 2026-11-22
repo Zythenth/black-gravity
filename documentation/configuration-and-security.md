@@ -76,6 +76,10 @@ To change the ceiling, read the policy and call `black_gravity_set_sandbox_polic
 
 Use specific verified directories, such as `"<approved-read-root>"` and `"<approved-write-root>"`, instead of entire disks or paths assumed to exist on another computer. In `ask`, confirm the ceiling in the form. In `auto`, submit the validated proposal. Select narrow subsets for the test.
 
+## Temporary directory
+
+Copies and their private baselines are created directly under the server's temporary directory (`os.tmpdir()`: `TMPDIR` on Linux and macOS, `TEMP` or `TMP` on Windows) with the `black-gravity-copy-` and `black-gravity-baseline-` prefixes. When that directory is a RAM `tmpfs` cleared at boot, retained copies are lost on restart and their tasks fail with `COPY_MISSING`. To keep copies across restarts, set `TMPDIR` in the MCP server entry's environment to a private directory on disk (owned by the server user, mode `0700`, a canonical absolute path without symbolic links, outside projects, the state directory and synced folders). Keep the value constant, because persisted copies must stay directly under the current temporary directory: if the server starts with a different temporary directory while the state directory still retains tasks that reference a copy, it starts degraded with `BRIDGE_STATE_DIRECTORY` `unusable` in `configurationIssues`; discard every retained task that still has a copy before changing it (discarded tasks stay listed in `black_gravity_tasks` with `discardedAt`), or restore the previous value to recover.
+
 ## Server configuration
 
 | Variable | Default | Purpose |

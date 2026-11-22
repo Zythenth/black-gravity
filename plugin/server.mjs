@@ -33833,6 +33833,7 @@ async function writeLineEndingConversions(project, conversions) {
   await writeFile4(path10.join(project.gitDirectory, LINE_ENDINGS_MARKER_NAME), JSON.stringify({ version: 1, taskId: conversions.taskId, files, existingBefore: conversions.existingBefore }) + "\n", { encoding: "utf8", flag: "wx", mode: 384, flush: true });
 }
 async function readLineEndingConversions(project) {
+  await assertManagedCopyPresent(project);
   const marker = path10.join(project.gitDirectory, LINE_ENDINGS_MARKER_NAME);
   let text;
   try {
@@ -33870,7 +33871,30 @@ async function assertLineEndingsRestored(project) {
 async function clearLineEndingConversions(project) {
   await rm2(path10.join(project.gitDirectory, LINE_ENDINGS_MARKER_NAME), { force: true });
 }
+var COPY_MISSING_MESSAGE = "The isolated copy of this task no longer exists; a restart or a temporary-directory cleanup may have removed it. The bridge does not recreate it and never runs in the original project. Discard the task and start a new one.";
+var BASELINE_MISSING_MESSAGE = "The private baseline of this task's isolated copy no longer exists; a restart or a temporary-directory cleanup may have removed it. The bridge does not recreate it and never runs in the original project. Discard the task and start a new one.";
+async function lstatManagedEntry(target, kind2, missingMessage) {
+  let info;
+  try {
+    info = await lstat5(target);
+  } catch (error62) {
+    if (error62.code === "ENOENT") {
+      throw new BridgeError("COPY_MISSING", missingMessage);
+    }
+    throw error62;
+  }
+  const validType = kind2 === "dir" ? info.isDirectory() : info.isFile();
+  if (info.isSymbolicLink() || !validType) {
+    throw new BridgeError("UNSAFE_PROJECT_PATH", "Refusing a replaced copy directory");
+  }
+}
+async function assertManagedCopyPresent(project) {
+  await lstatManagedEntry(project.copyDirectory, "dir", COPY_MISSING_MESSAGE);
+  await lstatManagedEntry(project.gitDirectory, "dir", BASELINE_MISSING_MESSAGE);
+  await lstatManagedEntry(path10.join(project.gitDirectory, "HEAD"), "file", BASELINE_MISSING_MESSAGE);
+}
 async function verifyManagedCopy(project) {
+  await assertManagedCopyPresent(project);
   await checkFenceMarker(project);
   await verifyProvidedSkills(project.copyDirectory, project.providedSkills ?? []);
   if (project.executionPolicy) {
@@ -56790,6 +56814,8 @@ var TaskManager = class {
         options.artifactPaths = [...artifactPathsSchema.parse(options.artifactPaths)];
       if (previous)
         await this.assertProcessesReconciled(previous.record);
+      if (previous?.project)
+        await assertManagedCopyPresent(previous.project);
       if (previous?.project)
         await verifyProvidedSkills(previous.project.copyDirectory, previous.project.providedSkills ?? []);
       options.handoff ??= previous?.record.handoff;
