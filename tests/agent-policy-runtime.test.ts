@@ -15,13 +15,18 @@ import { discardProjectCopy, fingerprintProjectCopy } from '../src/isolation.js'
 import type { RunOptions, TaskRecord } from '../src/types.js';
 import { waitForTask } from './wait-for-task.js';
 
-function hook(cwd: string, conversationId: string, name: string, args: unknown) {
+function hookResult(cwd: string, conversationId: string, name: string, args: unknown): { decision: string; reason: string } {
   const child = spawnSync(process.execPath, ['bridge-execution-hook.mjs'], { cwd: path.join(cwd, '.agents'), input: JSON.stringify({ workspacePaths: [cwd], conversationId, toolCall: { name, args } }), encoding: 'utf8', windowsHide: true, timeout: 60000 });
-  assert.equal(child.status, 0, child.stderr); return JSON.parse(child.stdout).decision as string;
+  assert.equal(child.status, 0, child.stderr);
+  const parsed = JSON.parse(child.stdout) as { decision: string; reason: string };
+  return { decision: parsed.decision, reason: parsed.reason };
+}
+function hook(cwd: string, conversationId: string, name: string, args: unknown) {
+  return hookResult(cwd, conversationId, name, args).decision;
 }
 class GuardedAdapter extends ControlledCliAdapter {
   calls: Array<{ options: RunOptions; cwd: string }> = [];
-  behavior: 'guarded' | 'guarded-with-silent-denials' | 'bypass' | 'tamper' = 'guarded';
+  behavior: 'guarded' | 'guarded-with-silent-denials' | 'guarded-with-denied-read' | 'guarded-with-inflated-read-steps' | 'guarded-with-silent-denied-read' | 'guarded-with-denied-write' | 'bypass' | 'tamper' = 'guarded';
   override spawnTask(options: RunOptions, _model: string | undefined, cwd: string): ChildProcessWithoutNullStreams {
     this.calls.push({ options, cwd });
     const child = new EventEmitter() as ChildProcessWithoutNullStreams, stdout = new PassThrough(), stderr = new PassThrough();
@@ -34,6 +39,71 @@ class GuardedAdapter extends ControlledCliAdapter {
         if (this.behavior === 'guarded-with-silent-denials') {
           assert.equal(hook(cwd, session, 'run_command', { CommandLine: 'inert fixture' }), 'deny');
           assert.equal(hook(cwd, session, 'call_mcp_tool', { ServerName: 'unselected', ToolName: 'echo', Arguments: {} }), 'deny');
+        }
+        if (this.behavior === 'guarded-with-denied-read') {
+          let stepIndex = 10;
+          for (const targetPath of [path.join(cwd, 'missing-inside.txt'), path.join(path.dirname(cwd), 'outside-copy.txt')]) {
+            const res = hookResult(cwd, session, 'view_file', { AbsolutePath: targetPath });
+            assert.equal(res.decision, 'deny');
+            stdout.write(JSON.stringify({
+              event: 'step_update',
+              step_update: {
+                step_index: stepIndex++,
+                step_type: 'tool',
+                state: 'ERROR',
+                tool_name: 'view_file',
+                tool_info: {
+                  name: 'view_file',
+                  parameters: { AbsolutePath: targetPath },
+                  error: { type: 'TOOL_ERROR', message: `tool call denied by pre-tool hook: ${res.reason}` },
+                },
+              },
+            }) + '\n');
+          }
+        }
+        if (this.behavior === 'guarded-with-inflated-read-steps') {
+          const targetPath = path.join(cwd, 'missing-inside.txt');
+          const res = hookResult(cwd, session, 'view_file', { AbsolutePath: targetPath });
+          assert.equal(res.decision, 'deny');
+          for (const stepIndex of [10, 11]) {
+            stdout.write(JSON.stringify({
+              event: 'step_update',
+              step_update: {
+                step_index: stepIndex,
+                step_type: 'tool',
+                state: 'ERROR',
+                tool_name: 'view_file',
+                tool_info: {
+                  name: 'view_file',
+                  parameters: { AbsolutePath: targetPath },
+                  error: { type: 'TOOL_ERROR', message: `tool call denied by pre-tool hook: ${res.reason}` },
+                },
+              },
+            }) + '\n');
+          }
+        }
+        if (this.behavior === 'guarded-with-silent-denied-read') {
+          const res = hookResult(cwd, session, 'view_file', { AbsolutePath: path.join(cwd, 'missing-inside.txt') });
+          assert.equal(res.decision, 'deny');
+        }
+        if (this.behavior === 'guarded-with-denied-write') {
+          const gitTarget = path.join(cwd, '.git', 'config');
+          const res = hookResult(cwd, session, 'write_to_file', { TargetFile: gitTarget });
+          assert.equal(res.decision, 'deny');
+          stdout.write(JSON.stringify({
+            event: 'step_update',
+            step_update: {
+              step_index: 10,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'write_to_file',
+              tool_info: {
+                name: 'write_to_file',
+                parameters: { TargetFile: gitTarget },
+                error: { type: 'TOOL_ERROR', message: `tool call denied by pre-tool hook: ${res.reason}` },
+              },
+            },
+          }) + '\n');
         }
         if (options.mode === 'write') {
           assert.equal(hook(cwd, session, 'write_to_file', { TargetFile: path.join(cwd, 'created.txt') }), 'allow');
@@ -164,5 +234,139 @@ test('silent pre-tool hook denial receipt fails completed CLI run and preserves 
     assert.ok(task.agentPolicyReceipt);
     assert.ok(task.agentPolicyReceipt.decisionCount >= 5);
     assert.equal(task.agentPolicyReceipt.deniedCount, 2);
+  });
+});
+
+test('hook-denied reads with successful CLI complete with deniedReads and allow verify and integrate', async () => {
+  await fixture(async ({ source, tasks, adapter }) => {
+    adapter.behavior = 'guarded-with-denied-read';
+    const task = await end(tasks, await tasks.run({
+      prompt: 'Denied read fixture.',
+      workingDirectory: source,
+      allowedTools: ['view_file', 'write_to_file'],
+      mcpServers: [],
+      acceptanceCriteria: [{ id: 'created', description: 'Create created.txt', check: { kind: 'file-exists', path: 'created.txt' } }],
+    }));
+    assert.equal(task.status, 'completed', JSON.stringify(task.error));
+    assert.equal(task.agentPolicyReceipt?.deniedCount, 2);
+    assert.equal(task.agentPolicyReceipt?.deniedReadCount, 2);
+    assert.equal(task.deniedReads?.total, 2);
+    assert.equal(task.deniedReads?.items.length, 2);
+    assert.ok(task.deniedReads?.items.every(item => item.toolName === 'view_file' && /pre-tool hook/i.test(item.reason)));
+    const deniedReadEvents = tasks.readEvents(task.taskId).events.filter(event => event.type === 'task.denied-reads');
+    assert.equal(deniedReadEvents.length, 1);
+    assert.deepEqual(deniedReadEvents[0]!.data, task.deniedReads);
+
+    const preview = await tasks.preview(task.taskId);
+    assert.deepEqual(preview.files, [{ status: 'A', path: 'created.txt' }]);
+    const verification = await tasks.verify(task.taskId, preview.sha256, [{
+      criterionId: 'created',
+      verdict: 'passed',
+      path: 'created.txt',
+      line: 1,
+      quote: 'created by controlled adapter',
+      explanation: 'Created file exists with expected content',
+    }]);
+    assert.equal(verification.status, 'passed');
+    const integrated = await tasks.integrate(task.taskId, preview.sha256, async () => true);
+    assert.deepEqual(integrated.files, [{ status: 'A', path: 'created.txt' }]);
+    assert.equal(await readFile(path.join(source, 'created.txt'), 'utf8'), 'created by controlled adapter\n');
+  });
+});
+
+test('hook-denied write fails even when CLI exits 0 with SUCCESS', async () => {
+  await fixture(async ({ source, tasks, adapter }) => {
+    adapter.behavior = 'guarded-with-denied-write';
+    const task = await end(tasks, await tasks.run({
+      prompt: 'Denied write fixture.',
+      workingDirectory: source,
+      allowedTools: ['view_file', 'write_to_file'],
+      mcpServers: [],
+    }));
+    assert.equal(task.status, 'failed');
+    assert.equal(task.error?.code, 'AGY_PROCESS_FAILED');
+    assert.match(task.error?.message ?? '', /pre-tool hook/i);
+  });
+});
+
+test('adapter reporting more denied reads than receipt fails with AGY_PROCESS_FAILED', async () => {
+  await fixture(async ({ source, tasks, adapter }) => {
+    adapter.behavior = 'guarded-with-inflated-read-steps';
+    const task = await end(tasks, await tasks.run({
+      prompt: 'Inflated denied read steps fixture.',
+      workingDirectory: source,
+      allowedTools: ['view_file', 'write_to_file'],
+      mcpServers: [],
+    }));
+    assert.equal(task.status, 'failed');
+    assert.equal(task.error?.code, 'AGY_PROCESS_FAILED');
+    assert.match(task.error?.message ?? '', /receipt recorded 1/);
+  });
+});
+
+test('receipt-only denied read without ERROR step completes with deniedReads and task.denied-reads event', async () => {
+  await fixture(async ({ source, tasks, adapter }) => {
+    adapter.behavior = 'guarded-with-silent-denied-read';
+    const task = await end(tasks, await tasks.run({
+      prompt: 'Silent denied read fixture.',
+      workingDirectory: source,
+      allowedTools: ['view_file', 'write_to_file'],
+      mcpServers: [],
+    }));
+    assert.equal(task.status, 'completed', JSON.stringify(task.error));
+    assert.equal(task.agentPolicyReceipt?.deniedReadCount, 1);
+    assert.deepEqual(task.deniedReads, { total: 1, items: [] });
+    const deniedReadEvents = tasks.readEvents(task.taskId).events.filter(event => event.type === 'task.denied-reads');
+    assert.equal(deniedReadEvents.length, 1);
+    assert.deepEqual(deniedReadEvents[0]!.data, { total: 1, items: [] });
+  });
+});
+
+test('repair path accumulates deniedReads across windows, caps items at 50, and emits per-window event', async () => {
+  await fixture(async ({ source, tasks, adapter }) => {
+    const task = await end(tasks, await tasks.run({
+      prompt: 'Repair accumulation fixture.',
+      workingDirectory: source,
+      allowedTools: ['view_file', 'write_to_file'],
+      mcpServers: [],
+    }));
+    assert.equal(task.status, 'completed', JSON.stringify(task.error));
+
+    const internal = tasks as unknown as {
+      tasks: Map<string, { record: TaskRecord }>;
+      repairLocalTest: (task: unknown, request: unknown, observedExitCode: number, timeoutSeconds: number) => Promise<void>;
+    };
+    const internalTask = internal.tasks.get(task.taskId)!;
+    const repairRequest = { executable: process.execPath, args: ['-e', 'process.exit(0)'] };
+
+    adapter.behavior = 'guarded-with-denied-read';
+    await internal.repairLocalTest(internalTask, repairRequest, 1, 30);
+    assert.equal(internalTask.record.deniedReads?.total, 2);
+    assert.equal(internalTask.record.deniedReads?.items.length, 2);
+
+    await internal.repairLocalTest(internalTask, repairRequest, 1, 30);
+    assert.equal(internalTask.record.deniedReads?.total, 4);
+    assert.equal(internalTask.record.deniedReads?.items.length, 4);
+
+    internalTask.record.deniedReads = {
+      total: 49,
+      items: Array.from({ length: 49 }, (_, index) => ({
+        toolName: 'view_file',
+        path: `prior-${index}.txt`,
+        reason: 'denied by pre-tool hook',
+      })),
+    };
+    await internal.repairLocalTest(internalTask, repairRequest, 1, 30);
+    assert.equal(internalTask.record.deniedReads?.total, 51);
+    assert.equal(internalTask.record.deniedReads?.items.length, 50);
+    assert.match(internalTask.record.deniedReads?.items[49]?.path ?? '', /missing-inside\.txt$/);
+
+    const deniedReadEvents = tasks.readEvents(task.taskId).events.filter(event => event.type === 'task.denied-reads');
+    assert.equal(deniedReadEvents.length, 3);
+    for (const event of deniedReadEvents) {
+      const payload = event.data as { total: number; items: unknown[] };
+      assert.equal(payload.total, 2);
+      assert.equal(payload.items.length, 2);
+    }
   });
 });

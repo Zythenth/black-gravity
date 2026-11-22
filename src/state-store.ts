@@ -56,7 +56,15 @@ const snapshotSchema = z.object({
     lastObservedCliUsage: usageCountersSchema.optional(), usageProvenance: z.literal('local-executor').optional(),
     deliveryMode: deliveryModeSchema.optional(), messages: z.array(persistedBridgeMessageSchema).max(100).optional(), messageCursor: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
     effort: effortSchema.optional(), execution: executionIdentitySchema.optional(), roleDefinition: roleDefinitionSchema.optional(), providedSkills: stagedSkillsSchema.optional(),
-    agentPolicyReceipt: z.object({ sha256: z.string().regex(/^[a-f0-9]{64}$/), decisionCount: z.number().int().nonnegative(), deniedCount: z.number().int().nonnegative() }).strict().optional(),
+    agentPolicyReceipt: z.object({ sha256: z.string().regex(/^[a-f0-9]{64}$/), decisionCount: z.number().int().nonnegative(), deniedCount: z.number().int().nonnegative(), deniedReadCount: z.number().int().nonnegative().optional() }).strict().optional(),
+    deniedReads: z.object({
+      total: z.number().int().nonnegative(),
+      items: z.array(z.object({
+        toolName: z.string().max(128),
+        path: z.string().max(1000).optional(),
+        reason: z.string().max(500),
+      }).strict()).max(50),
+    }).strict().optional(),
     peerRequests: z.array(z.lazy(() => peerMessageInputSchema)).max(20).optional(),
     peerRequestsTruncated: z.boolean().optional(),
     group: z.lazy(() => groupAssignmentSchema).optional(),

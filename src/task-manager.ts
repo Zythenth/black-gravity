@@ -16,7 +16,7 @@ import { integrationPreauthorized, type IntegrationApproval } from './integratio
 import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { appendMessage, deliveryModeSchema, extractAgentMessages, readMessages, resultReference, type DeliveryMode } from './messages.js';
 import { CliAdapter, taskPrompt } from './cli-adapter.js';
-import { AgyExecutionAdapter, type AgyExecutionHooks, type AgyExecutionResult } from './agy-execution-adapter.js';
+import { AgyExecutionAdapter, MAX_DENIED_READS, type AgyExecutionHooks, type AgyExecutionResult } from './agy-execution-adapter.js';
 import type { ExecutionAdapter, ExecutionIdentity, ExecutionRequest, ExecutionResult } from './execution-contract.js';
 import { terminateSubprocess, redactDiagnostic, redactionContextDigest, containsCredential } from './subprocess.js';
 import { reconcileOwnedProcesses } from './process-tree.js';
@@ -27,7 +27,7 @@ import { convertCrlfToLf, listCopyFiles, normalizeEditedLineEndings, planLineEnd
 import { assertForbiddenDirectoriesUsable, assertSecretExclusionsUsable, assertAgyPathUsable, assertWindowsNodeCacheDirectoryUsable, assertAntiAiCraftDirectoryUsable, type Config, type ApprovalMode, type ConfigurationIssue, type ConfigurationIssueReason, type TestExecutor } from './config.js';
 import { EventStore } from './event-store.js';
 import { assertTextIsUtf8, createProjectCopy, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, forkProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, clearLineEndingConversions, type ChangePreview, type ProjectCopy } from './isolation.js';
-import { BridgeError, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt, type TestEvidence } from './types.js';
+import { BridgeError, type DeniedReads, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt, type TestEvidence } from './types.js';
 import { validatePrompt, validateRuntimeCacheSeparation, validateWorkingDirectory, validateStateSeparation } from './validation.js';
 import { processAlive, StateStore, StateStoreLinkError, stateDirectoryProblem } from './state-store.js';
 import { criteriaSchema, verifyCriteria, type ReviewEvidence } from './verification.js';
@@ -1787,7 +1787,7 @@ export class TaskManager {
         this.finish(task, this.terminalStateFromResult(task, execResult), nonCompleteError.code, nonCompleteError.message);
         return;
       }
-      await this.verifyAndRecordExecutionPolicy(task, policyReceiptOffset, 'No new guarded finish was observed for this conversation');
+      const deniedReads = await this.verifyPolicyAndReadDenials(task, execResult, policyReceiptOffset, 'No new guarded finish was observed for this conversation');
       if (record.mode !== 'read-only') await this.normalizeEditedFiles(task, styles!, boms!);
       const structuredOutput = (record.result as { structured_output?: unknown } | undefined)?.structured_output ?? execResult.structuredOutput;
       record.report = await validateRoleReport((record.roleDefinition ?? resolveRole(record.role ?? 'implementer')).baseRole,
@@ -1797,6 +1797,10 @@ export class TaskManager {
       }
       if (!task.options.nativeTest && record.artifactPaths !== undefined) {
         record.artifacts = await collectArtifacts(task.project, record.artifactPaths, this.config);
+      }
+      if (deniedReads) {
+        record.deniedReads = deniedReads;
+        this.events.append(record.taskId, 'task.denied-reads', deniedReads);
       }
       this.finish(task, 'completed');
     } catch (error) {
@@ -1932,7 +1936,15 @@ export class TaskManager {
       const failure = this.resultFailure(task, execResult);
       throw new BridgeError(failure.code, failure.message);
     }
-    await this.verifyAndRecordExecutionPolicy(task, receiptOffset, 'Repair did not produce a new guarded finish');
+    const deniedReads = await this.verifyPolicyAndReadDenials(task, execResult, receiptOffset, 'Repair did not produce a new guarded finish');
+    if (deniedReads) {
+      const previous = task.record.deniedReads;
+      task.record.deniedReads = {
+        total: (previous?.total ?? 0) + deniedReads.total,
+        items: [...(previous?.items ?? []), ...deniedReads.items].slice(0, MAX_DENIED_READS),
+      };
+      this.events.append(task.record.taskId, 'task.denied-reads', deniedReads);
+    }
     await this.normalizeEditedFiles(task, styles!, boms!);
   }
 
@@ -2280,6 +2292,35 @@ export class TaskManager {
     });
   }
 
+  private async verifyPolicyAndReadDenials(
+    task: InternalTask,
+    execResult: ExecutionResult,
+    receiptOffset: number,
+    unverifiedMessage: string,
+  ): Promise<DeniedReads | undefined> {
+    await this.verifyAndRecordExecutionPolicy(task, receiptOffset, unverifiedMessage);
+    const deniedReads = (execResult as Partial<AgyExecutionResult>).deniedReads;
+    const receiptDeniedReads = task.record.agentPolicyReceipt?.deniedReadCount ?? 0;
+    const reportedTotal = deniedReads?.total ?? 0;
+    if (!task.project?.executionPolicy) {
+      if (reportedTotal > 0) {
+        throw new BridgeError('AGY_PROCESS_FAILED', deniedReads?.items[0]?.reason || 'Read tool call denied by pre-tool hook');
+      }
+      return undefined;
+    }
+    if (reportedTotal > receiptDeniedReads) {
+      throw new BridgeError(
+        'AGY_PROCESS_FAILED',
+        `CLI reported ${reportedTotal} denied read call${reportedTotal === 1 ? '' : 's'} but the execution policy receipt recorded ${receiptDeniedReads}`,
+      );
+    }
+    if (receiptDeniedReads === 0) return undefined;
+    return {
+      total: receiptDeniedReads,
+      items: deniedReads?.items ?? [],
+    };
+  }
+
   private async verifyAndRecordExecutionPolicy(task: InternalTask, receiptOffset: number, unverifiedMessage: string): Promise<void> {
     if (!task.project?.executionPolicy) return;
     const record = task.record;
@@ -2297,11 +2338,13 @@ export class TaskManager {
       sha256: receipt.sha256,
       decisionCount: receipt.decisionCount,
       deniedCount: receipt.deniedCount,
+      ...(receipt.deniedReadCount > 0 ? { deniedReadCount: receipt.deniedReadCount } : {}),
     };
-    if (receipt.deniedCount > 0) {
+    const nonReadDeniedCount = receipt.deniedCount - receipt.deniedReadCount;
+    if (nonReadDeniedCount > 0) {
       throw new BridgeError(
         'AGY_PROCESS_FAILED',
-        `Execution policy pre-tool hook denied ${receipt.deniedCount} tool call${receipt.deniedCount === 1 ? '' : 's'}`,
+        `Execution policy pre-tool hook denied ${nonReadDeniedCount} tool call${nonReadDeniedCount === 1 ? '' : 's'}`,
       );
     }
     if (!receipt.guardedFinish) {

@@ -33160,7 +33160,8 @@ async function readExecutionPolicyReceipt(staged, stateDirectory, offset = 0, co
       sha256: sha2562,
       guardedFinish: false,
       decisionCount: 0,
-      deniedCount: 0
+      deniedCount: 0,
+      deniedReadCount: 0
     };
   }
   const handle = await fsp.open(authorizedReceiptPath, "r");
@@ -33196,7 +33197,8 @@ async function readExecutionPolicyReceipt(staged, stateDirectory, offset = 0, co
       sha256,
       guardedFinish: false,
       decisionCount: 0,
-      deniedCount: 0
+      deniedCount: 0,
+      deniedReadCount: 0
     };
   }
   const windowText = windowBuffer.toString("utf8");
@@ -33206,6 +33208,7 @@ async function readExecutionPolicyReceipt(staged, stateDirectory, offset = 0, co
   const lines = windowText.split("\n").slice(0, -1);
   let decisionCount = 0;
   let deniedCount = 0;
+  let deniedReadCount = 0;
   let guardedFinish = false;
   for (const line of lines) {
     const parsed = validateExecutionPolicyReceiptLine(line, staged);
@@ -33215,6 +33218,9 @@ async function readExecutionPolicyReceipt(staged, stateDirectory, offset = 0, co
     decisionCount++;
     if (parsed.decision === "deny") {
       deniedCount++;
+      if (parsed.toolName === "read_file" || parsed.toolName === "view_file") {
+        deniedReadCount++;
+      }
     }
     if (parsed.toolName === "finish" && parsed.decision === "allow") {
       guardedFinish = true;
@@ -33226,7 +33232,8 @@ async function readExecutionPolicyReceipt(staged, stateDirectory, offset = 0, co
     sha256,
     guardedFinish,
     decisionCount,
-    deniedCount
+    deniedCount,
+    deniedReadCount
   };
 }
 var EDIT_MISMATCHES = /* @__PURE__ */ new Set(["none", "line-endings", "whitespace", "unicode", "unknown"]);
@@ -35099,6 +35106,7 @@ function compactTask(task2) {
     ...task2.group ? { group: structuredClone(task2.group) } : {},
     ...task2.memory !== void 0 ? { memory: structuredClone(task2.memory) } : {},
     ...task2.agentPolicy ? { agentPolicy: task2.agentPolicy, agentPolicyReceipt: task2.agentPolicyReceipt } : {},
+    ...task2.deniedReads ? { deniedReads: task2.deniedReads } : {},
     ...task2.providedSkills?.length ? { providedSkillSummaries: task2.providedSkills.map((skill) => ({ name: skill.name, sha256: skill.sha256, fileCount: skill.files.length })) } : {},
     ...task2.continuationTaskId ? { continuationTaskId: task2.continuationTaskId } : {},
     ...task2.structuredResult ? { structuredResultSha256: task2.structuredResult.sha256 } : {},
@@ -38085,6 +38093,7 @@ var MAX_BUFFERED_RESPONSE_STEPS = 16;
 var MAX_RESPONSE_STEPS = 1e3;
 var MAX_HELD_RESPONSE_LINES = 100;
 var STDERR_BUFFER_LIMIT = 1e4;
+var MAX_DENIED_READS = 50;
 var ResponseRedactor = class {
   pending = /* @__PURE__ */ new Map();
   releaseDelta(index, delta, done, onTruncated) {
@@ -38174,6 +38183,22 @@ var ResponseRedactor = class {
 var MCP_PERMISSION_RE = /no output produced[^\r\n]{0,200}["']mcp["'][^\r\n]{0,200}permission[^\r\n]{0,200}headless|(?:permission check failed|tool call denied|denied tool|action denied|cannot request approval)[^\r\n]{0,200}\bmcp\b|\bmcp\b[^\r\n]{0,200}(?:permission denied|permission check failed|requires? approval|not authorized)/iu;
 var SOFT_DENIAL_RE = /permission check failed|tool(?:\s+call|\s+execution)?\s+(?:was\s+)?denied|(?:soft\s+)?tool\s+denial|(?:action|command|operation)\s+(?:was\s+)?denied\s+(?:by\s+(?:the\s+)?(?:pre-?tool\s+hook|execution\s+policy|hook|policy|sandbox|security|user|headless|agy|\bmcp\b|permission\s+(?:check|policy))|in\s+(?:headless|non-?interactive)\s+mode)|(?:headless|non-?interactive|agy|pre-?tool\s+hook|execution\s+policy|sandbox|\bmcp\b)[^\r\n]{0,200}(?:confirmation|approval|permission)\s+(?:required|denied|rejected)|(?:confirmation|approval|permission)\s+(?:required|denied|rejected)[^\r\n]{0,200}(?:headless|non-?interactive|pre-?tool\s+hook|execution\s+policy|sandbox|agy|\bmcp\b)|headless\s+mode\s+cannot\s+(?:prompt|request)\s+(?:for\s+)?(?:permission|approval|confirmation)|user\s+denied\s+(?:permission|the\s+tool|tool\s+execution)|denied\s+by\s+(?:the\s+)?(?:pre-?tool\s+hook|execution\s+policy|hook|policy|sandbox|security|user|headless|agy|\bmcp\b|permission\s+(?:check|policy))|(?:not\s+allowed|blocked)\s+by\s+(?:the\s+)?(?:bridge\s+)?(?:pre-?tool\s+hook|execution\s+policy|hook|policy|sandbox|security|headless|agy|\bmcp\b)|failed to prompt user for /i;
 var SOFT_TOOL_STATES = /* @__PURE__ */ new Set(["DENIED", "BLOCKED", "REJECTED", "CANCELED", "CANCELLED"]);
+var HOOK_READ_DENIAL_RE = /^(?:tool (?:call|execution) )?denied by (?:the )?pre-?tool hook: ([^\r\n\u0085\u2028\u2029]*)$/i;
+function isSoleHookDenial(text) {
+  const match = HOOK_READ_DENIAL_RE.exec(text.trim());
+  return match !== null && classifyCliTextError(match[1] ?? "", "tool-error") === void 0;
+}
+function toDeniedRead(toolName, denial, onlyPreToolHookDenials, params) {
+  if (!denial || !onlyPreToolHookDenials || toolName !== "read_file" && toolName !== "view_file") {
+    return void 0;
+  }
+  const rawPath = typeof params?.Path === "string" ? params.Path : typeof params?.AbsolutePath === "string" ? params.AbsolutePath : void 0;
+  return {
+    toolName,
+    ...rawPath !== void 0 ? { path: redactDiagnostic(rawPath).slice(0, 1e3) } : {},
+    reason: redactDiagnostic(denial.message).slice(0, 500)
+  };
+}
 function errorPriority(code) {
   switch (code) {
     case "AGY_AUTH_REQUIRED":
@@ -38396,6 +38421,8 @@ var AgyExecutionAdapter = class {
     let lastUsage;
     let resultFrame;
     let observedDenial;
+    let deniedReadTotal = 0;
+    const deniedReadItems = [];
     const redactor = new ResponseRedactor();
     const recordHookFailure = (error62) => {
       if (hookFailure === void 0)
@@ -38473,6 +38500,12 @@ var AgyExecutionAdapter = class {
           type = result.type;
           eventData = result.eventData;
           recordDenial(result.denial);
+          if (result.deniedRead) {
+            deniedReadTotal += 1;
+            if (deniedReadItems.length < MAX_DENIED_READS) {
+              deniedReadItems.push(result.deniedRead);
+            }
+          }
         } else if (step.step_type === "agent_response" && typeof step.text_delta === "string") {
           type = "response.chunk";
         }
@@ -38733,11 +38766,13 @@ var AgyExecutionAdapter = class {
       };
     }
     const finalResponse = typeof resultFrame.response === "string" ? resultFrame.response : "";
+    const deniedReads = deniedReadTotal > 0 ? { total: deniedReadTotal, items: deniedReadItems } : void 0;
     return {
       ...common,
       status: "completed",
       response: finalResponse,
-      structuredOutput: resultFrame.structured_output
+      structuredOutput: resultFrame.structured_output,
+      ...deniedReads ? { deniedReads } : {}
     };
   }
   handleToolStep(step, hooks) {
@@ -38748,21 +38783,39 @@ var AgyExecutionAdapter = class {
     const params = toolInfo?.parameters && typeof toolInfo.parameters === "object" ? toolInfo.parameters : void 0;
     const editSearch = hooks?.resolveEditMismatch?.(step.tool_name, step.state, rawErrorMsg, params);
     let denial;
+    let onlyPreToolHookDenials = true;
+    const addDenial = (candidate, source) => {
+      if (!candidate)
+        return;
+      if (source === void 0 || errorPriority(candidate.code) !== 1 || candidate.code !== "AGY_PROCESS_FAILED" || !isSoleHookDenial(source)) {
+        onlyPreToolHookDenials = false;
+      }
+      denial = pickHigherPriority(denial, candidate);
+    };
+    const toolDeniedActions = toolInfo?.denied_actions;
+    const stepDeniedActions = step.denied_actions;
+    const hasToolDeniedActions = Array.isArray(toolDeniedActions) && toolDeniedActions.length > 0;
+    const hasStepDeniedActions = Array.isArray(stepDeniedActions) && stepDeniedActions.length > 0;
+    if (hasToolDeniedActions || hasStepDeniedActions) {
+      onlyPreToolHookDenials = false;
+    }
     const stepDenied = classifyDeniedActions(toolInfo?.denied_actions) ?? classifyDeniedActions(step.denied_actions);
-    if (stepDenied)
-      denial = pickHigherPriority(denial, stepDenied);
+    addDenial(stepDenied, void 0);
+    if (hasToolDeniedActions) {
+      addDenial(classifyDeniedActions(step.denied_actions), void 0);
+    }
     const stateUpper = typeof step.state === "string" ? step.state.toUpperCase() : "";
     if (step.denied === true || step.permission_denied === true || toolInfo?.denied === true || toolInfo?.permission_denied === true || SOFT_TOOL_STATES.has(stateUpper)) {
       const reason = rawErrorMsg ?? (typeof toolInfo?.output === "string" ? toolInfo.output : void 0);
-      denial = pickHigherPriority(denial, classifyCliTextError(reason ?? "", "tool-error") ?? new BridgeError("AGY_PROCESS_FAILED", redactDiagnostic(reason || `Tool step ${String(step.tool_name ?? "")} ended with state ${stateUpper || "DENIED"}`)));
+      addDenial(classifyCliTextError(reason ?? "", "tool-error") ?? new BridgeError("AGY_PROCESS_FAILED", redactDiagnostic(reason || `Tool step ${String(step.tool_name ?? "")} ended with state ${stateUpper || "DENIED"}`)), reason);
     }
     if (step.state === "ERROR") {
       if (rawErrorMsg)
-        denial = pickHigherPriority(denial, classifyCliTextError(rawErrorMsg, "tool-error"));
+        addDenial(classifyCliTextError(rawErrorMsg, "tool-error"), rawErrorMsg);
       if (typeof toolInfo?.output === "string")
-        denial = pickHigherPriority(denial, classifyCliTextError(toolInfo.output, "tool-error"));
+        addDenial(classifyCliTextError(toolInfo.output, "tool-error"), toolInfo.output);
       if (!denial && typeof toolError?.type === "string" && /(?:hook|permission|policy|deni|reject|block)/i.test(toolError.type)) {
-        denial = new BridgeError("AGY_PROCESS_FAILED", redactDiagnostic(rawErrorMsg || `Tool step ${String(step.tool_name ?? "")} denied (${toolError.type})`).slice(0, 2e3));
+        addDenial(new BridgeError("AGY_PROCESS_FAILED", redactDiagnostic(rawErrorMsg || `Tool step ${String(step.tool_name ?? "")} denied (${toolError.type})`).slice(0, 2e3)), rawErrorMsg);
       }
       const failure3 = {
         ...typeof toolError?.type === "string" && toolError.type.length <= 64 ? { type: toolError.type } : {},
@@ -38783,13 +38836,13 @@ var AgyExecutionAdapter = class {
           truncated: true
         };
       }
-      return { type, eventData, denial };
+      const deniedRead = toDeniedRead(step.tool_name, denial, onlyPreToolHookDenials, params);
+      return deniedRead ? { type, eventData, deniedRead } : { type, eventData, denial };
     }
     if (step.state === "DONE" && step.tool_name === "run_command" && typeof toolInfo?.output === "string") {
       const trimmedOutput = toolInfo.output.trim();
       const cmdDenial = classifyCliTextError(trimmedOutput, "run-command-output");
-      if (cmdDenial)
-        denial = pickHigherPriority(denial, cmdDenial);
+      addDenial(cmdDenial, void 0);
     }
     return { type, eventData: step, denial };
   }
@@ -48048,7 +48101,15 @@ var taskRecordSchema = external_exports.object({
   structuredResultSha256: hash2.optional(),
   artifactCount: count.optional(),
   agentPolicy: resolvedAgentPolicySchema.optional(),
-  agentPolicyReceipt: external_exports.object({ sha256: hash2, decisionCount: count, deniedCount: count }).strict().optional(),
+  agentPolicyReceipt: external_exports.object({ sha256: hash2, decisionCount: count, deniedCount: count, deniedReadCount: count.optional() }).strict().optional(),
+  deniedReads: external_exports.object({
+    total: count,
+    items: external_exports.array(external_exports.object({
+      toolName: external_exports.string().max(128),
+      path: external_exports.string().max(1e3).optional(),
+      reason: external_exports.string().max(500)
+    }).strict()).max(50)
+  }).strict().optional(),
   processCleanup: external_exports.object({ verified: external_exports.boolean(), spawnedAt: timestamp, checkedAt: timestamp, remaining: count }).strict().optional(),
   craft: external_exports.object({ revision: external_exports.string(), manifestSha256: hash2, permanent: external_exports.array(external_exports.string()), catalog: external_exports.array(external_exports.string()) }).strict().optional(),
   craftLoad: external_exports.object({
@@ -48511,7 +48572,15 @@ var snapshotSchema = external_exports.object({
     execution: executionIdentitySchema.optional(),
     roleDefinition: roleDefinitionSchema.optional(),
     providedSkills: stagedSkillsSchema.optional(),
-    agentPolicyReceipt: external_exports.object({ sha256: external_exports.string().regex(/^[a-f0-9]{64}$/), decisionCount: external_exports.number().int().nonnegative(), deniedCount: external_exports.number().int().nonnegative() }).strict().optional(),
+    agentPolicyReceipt: external_exports.object({ sha256: external_exports.string().regex(/^[a-f0-9]{64}$/), decisionCount: external_exports.number().int().nonnegative(), deniedCount: external_exports.number().int().nonnegative(), deniedReadCount: external_exports.number().int().nonnegative().optional() }).strict().optional(),
+    deniedReads: external_exports.object({
+      total: external_exports.number().int().nonnegative(),
+      items: external_exports.array(external_exports.object({
+        toolName: external_exports.string().max(128),
+        path: external_exports.string().max(1e3).optional(),
+        reason: external_exports.string().max(500)
+      }).strict()).max(50)
+    }).strict().optional(),
     peerRequests: external_exports.array(external_exports.lazy(() => peerMessageInputSchema)).max(20).optional(),
     peerRequestsTruncated: external_exports.boolean().optional(),
     group: external_exports.lazy(() => groupAssignmentSchema).optional(),
@@ -58186,7 +58255,7 @@ var TaskManager = class {
         this.finish(task2, this.terminalStateFromResult(task2, execResult), nonCompleteError.code, nonCompleteError.message);
         return;
       }
-      await this.verifyAndRecordExecutionPolicy(task2, policyReceiptOffset, "No new guarded finish was observed for this conversation");
+      const deniedReads = await this.verifyPolicyAndReadDenials(task2, execResult, policyReceiptOffset, "No new guarded finish was observed for this conversation");
       if (record2.mode !== "read-only")
         await this.normalizeEditedFiles(task2, styles, boms);
       const structuredOutput = record2.result?.structured_output ?? execResult.structuredOutput;
@@ -58196,6 +58265,10 @@ var TaskManager = class {
       }
       if (!task2.options.nativeTest && record2.artifactPaths !== void 0) {
         record2.artifacts = await collectArtifacts(task2.project, record2.artifactPaths, this.config);
+      }
+      if (deniedReads) {
+        record2.deniedReads = deniedReads;
+        this.events.append(record2.taskId, "task.denied-reads", deniedReads);
       }
       this.finish(task2, "completed");
     } catch (error62) {
@@ -58365,7 +58438,15 @@ var TaskManager = class {
       const failure3 = this.resultFailure(task2, execResult);
       throw new BridgeError(failure3.code, failure3.message);
     }
-    await this.verifyAndRecordExecutionPolicy(task2, receiptOffset, "Repair did not produce a new guarded finish");
+    const deniedReads = await this.verifyPolicyAndReadDenials(task2, execResult, receiptOffset, "Repair did not produce a new guarded finish");
+    if (deniedReads) {
+      const previous = task2.record.deniedReads;
+      task2.record.deniedReads = {
+        total: (previous?.total ?? 0) + deniedReads.total,
+        items: [...previous?.items ?? [], ...deniedReads.items].slice(0, MAX_DENIED_READS)
+      };
+      this.events.append(task2.record.taskId, "task.denied-reads", deniedReads);
+    }
     await this.normalizeEditedFiles(task2, styles, boms);
   }
   async executeWindowsNativeTest(task2) {
@@ -58741,6 +58822,27 @@ var TaskManager = class {
       });
     });
   }
+  async verifyPolicyAndReadDenials(task2, execResult, receiptOffset, unverifiedMessage) {
+    await this.verifyAndRecordExecutionPolicy(task2, receiptOffset, unverifiedMessage);
+    const deniedReads = execResult.deniedReads;
+    const receiptDeniedReads = task2.record.agentPolicyReceipt?.deniedReadCount ?? 0;
+    const reportedTotal = deniedReads?.total ?? 0;
+    if (!task2.project?.executionPolicy) {
+      if (reportedTotal > 0) {
+        throw new BridgeError("AGY_PROCESS_FAILED", deniedReads?.items[0]?.reason || "Read tool call denied by pre-tool hook");
+      }
+      return void 0;
+    }
+    if (reportedTotal > receiptDeniedReads) {
+      throw new BridgeError("AGY_PROCESS_FAILED", `CLI reported ${reportedTotal} denied read call${reportedTotal === 1 ? "" : "s"} but the execution policy receipt recorded ${receiptDeniedReads}`);
+    }
+    if (receiptDeniedReads === 0)
+      return void 0;
+    return {
+      total: receiptDeniedReads,
+      items: deniedReads?.items ?? []
+    };
+  }
   async verifyAndRecordExecutionPolicy(task2, receiptOffset, unverifiedMessage) {
     if (!task2.project?.executionPolicy)
       return;
@@ -58753,10 +58855,12 @@ var TaskManager = class {
     record2.agentPolicyReceipt = {
       sha256: receipt.sha256,
       decisionCount: receipt.decisionCount,
-      deniedCount: receipt.deniedCount
+      deniedCount: receipt.deniedCount,
+      ...receipt.deniedReadCount > 0 ? { deniedReadCount: receipt.deniedReadCount } : {}
     };
-    if (receipt.deniedCount > 0) {
-      throw new BridgeError("AGY_PROCESS_FAILED", `Execution policy pre-tool hook denied ${receipt.deniedCount} tool call${receipt.deniedCount === 1 ? "" : "s"}`);
+    const nonReadDeniedCount = receipt.deniedCount - receipt.deniedReadCount;
+    if (nonReadDeniedCount > 0) {
+      throw new BridgeError("AGY_PROCESS_FAILED", `Execution policy pre-tool hook denied ${nonReadDeniedCount} tool call${nonReadDeniedCount === 1 ? "" : "s"}`);
     }
     if (!receipt.guardedFinish) {
       throw new BridgeError("AGENT_POLICY_UNVERIFIED", unverifiedMessage);

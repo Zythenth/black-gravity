@@ -1184,6 +1184,7 @@ export async function readExecutionPolicyReceipt(
   guardedFinish: boolean;
   decisionCount: number;
   deniedCount: number;
+  deniedReadCount: number;
 }> {
   const parsedStaged = stagedExecutionPolicySchema.safeParse(staged);
   if (!parsedStaged.success) {
@@ -1239,6 +1240,7 @@ export async function readExecutionPolicyReceipt(
       guardedFinish: false,
       decisionCount: 0,
       deniedCount: 0,
+      deniedReadCount: 0,
     };
   }
 
@@ -1271,6 +1273,7 @@ export async function readExecutionPolicyReceipt(
       guardedFinish: false,
       decisionCount: 0,
       deniedCount: 0,
+      deniedReadCount: 0,
     };
   }
 
@@ -1282,6 +1285,7 @@ export async function readExecutionPolicyReceipt(
   const lines = windowText.split('\n').slice(0, -1);
   let decisionCount = 0;
   let deniedCount = 0;
+  let deniedReadCount = 0;
   let guardedFinish = false;
 
   for (const line of lines) {
@@ -1294,6 +1298,9 @@ export async function readExecutionPolicyReceipt(
     decisionCount++;
     if (parsed.decision === 'deny') {
       deniedCount++;
+      if (parsed.toolName === 'read_file' || parsed.toolName === 'view_file') {
+        deniedReadCount++;
+      }
     }
     if (parsed.toolName === 'finish' && parsed.decision === 'allow') {
       guardedFinish = true;
@@ -1307,6 +1314,7 @@ export async function readExecutionPolicyReceipt(
     guardedFinish,
     decisionCount,
     deniedCount,
+    deniedReadCount,
   };
 }
 

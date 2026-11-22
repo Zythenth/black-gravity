@@ -1744,3 +1744,437 @@ test('ControlledCliAdapter skips real agy probe with nonexistent AGY_PATH while 
     env.cleanup();
   }
 });
+
+test('AgyExecutionAdapter tolerates pre-tool hook read denials on SUCCESS while keeping write, non-zero exit, higher-priority, and uncorroborated failures', async () => {
+  const env = createWorkspace();
+  let tasks: TaskManager | undefined;
+  try {
+    const config = loadConfig({ BRIDGE_STATE_DIRECTORY: env.stateDir, AGY_PATH: process.execPath });
+    const cli = new CliAdapter(config, [env.scenarioScript]);
+    await cli.discover();
+    const adapter = new AgyExecutionAdapter(cli, config);
+
+    // 1. read_file denied by pre-tool hook for a missing file + SUCCESS + exit 0 -> completed with deniedReads
+    const missingReadPath = path.join(env.repoDir, 'src', 'agy-client.ts');
+    const readFileRes = await adapter.execute(makeRequest({
+      taskId: 'read-file-hook-deny',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-read-1' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 13,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'read_file',
+              tool_info: {
+                name: 'read_file',
+                parameters: { Path: missingReadPath },
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target file must exist and be a regular file' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-read-1', response: 'recovered after missing read' } },
+        ],
+      }),
+    }));
+    assert.equal(readFileRes.status, 'completed', JSON.stringify(readFileRes));
+    assert.equal(readFileRes.deniedReads?.total, 1);
+    assert.equal(readFileRes.deniedReads?.items.length, 1);
+    assert.equal(readFileRes.deniedReads?.items[0]?.toolName, 'read_file');
+    assert.equal(readFileRes.deniedReads?.items[0]?.path, missingReadPath);
+    assert.match(readFileRes.deniedReads?.items[0]?.reason ?? '', /pre-tool hook/i);
+
+    // 2. view_file denied by pre-tool hook for a path outside the copy + SUCCESS + exit 0 -> completed with deniedReads
+    const outsideViewPath = path.join(env.root, 'outside.txt');
+    const viewFileRes = await adapter.execute(makeRequest({
+      taskId: 'view-file-hook-deny',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-view-1' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 4,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'view_file',
+              tool_info: {
+                name: 'view_file',
+                parameters: { AbsolutePath: outsideViewPath },
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target path is outside the copy' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-view-1', response: 'recovered after outside view' } },
+        ],
+      }),
+    }));
+    assert.equal(viewFileRes.status, 'completed', JSON.stringify(viewFileRes));
+    assert.equal(viewFileRes.deniedReads?.total, 1);
+    assert.equal(viewFileRes.deniedReads?.items[0]?.toolName, 'view_file');
+    assert.equal(viewFileRes.deniedReads?.items[0]?.path, outsideViewPath);
+    assert.match(viewFileRes.deniedReads?.items[0]?.reason ?? '', /pre-tool hook/i);
+
+    // 3. write_to_file denied by pre-tool hook + SUCCESS + exit 0 -> still failed AGY_PROCESS_FAILED
+    const writeDenyRes = await adapter.execute(makeRequest({
+      taskId: 'write-hook-deny',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-write-1' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 1,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'write_to_file',
+              tool_info: {
+                name: 'write_to_file',
+                parameters: { TargetFile: path.join(env.repoDir, '.git', 'config') },
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Path contains invalid characters or accesses .git' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-write-1', response: 'claimed done' } },
+        ],
+      }),
+    }));
+    assert.equal(writeDenyRes.status, 'failed');
+    if (writeDenyRes.status === 'failed') {
+      assert.equal(writeDenyRes.error.code, 'AGY_PROCESS_FAILED');
+      assert.match(writeDenyRes.error.message, /pre-tool hook/i);
+    }
+
+    // 4. read denial + non-zero exit -> still failed
+    const nonZeroExitRes = await adapter.execute(makeRequest({
+      taskId: 'read-deny-nonzero-exit',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 1,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-exit-1' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 0,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'read_file',
+              tool_info: {
+                parameters: { Path: missingReadPath },
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target file must exist and be a regular file' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-exit-1', response: 'exited nonzero' } },
+        ],
+      }),
+    }));
+    assert.equal(nonZeroExitRes.status, 'failed');
+    if (nonZeroExitRes.status === 'failed') {
+      assert.equal(nonZeroExitRes.error.code, 'AGY_PROCESS_FAILED');
+    }
+
+    // 5. read denial + MCP denial -> still failed with higher-priority code
+    const mcpWithReadDenyRes = await adapter.execute(makeRequest({
+      taskId: 'read-deny-plus-mcp',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-mcp-1' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 0,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'read_file',
+              tool_info: {
+                parameters: { Path: missingReadPath },
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target file must exist and be a regular file' },
+              },
+            },
+          },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 1,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'call_mcp_tool',
+              tool_info: {
+                error: { type: 'PermissionError', message: 'permission check failed for mcp tool context7' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-mcp-1', response: 'claimed done' } },
+        ],
+      }),
+    }));
+    assert.equal(mcpWithReadDenyRes.status, 'failed');
+    if (mcpWithReadDenyRes.status === 'failed') {
+      assert.equal(mcpWithReadDenyRes.error.code, 'AGY_MCP_PERMISSION_REQUIRED');
+    }
+
+    // 6. Bounded list: >50 read denials keep 50 items and exact total count
+    const manyReadDenials = Array.from({ length: 52 }, (_, stepIndex) => ({
+      event: 'step_update',
+      step_update: {
+        step_index: stepIndex,
+        step_type: 'tool',
+        state: 'ERROR',
+        tool_name: 'read_file',
+        tool_info: {
+          parameters: { Path: path.join(env.repoDir, `missing-${stepIndex}.ts`) },
+          error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target file must exist and be a regular file' },
+        },
+      },
+    }));
+    const boundedRes = await adapter.execute(makeRequest({
+      taskId: 'read-deny-bounded',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-bounded' },
+          ...manyReadDenials,
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-bounded', response: 'done' } },
+        ],
+      }),
+    }));
+    assert.equal(boundedRes.status, 'completed');
+    assert.equal(boundedRes.deniedReads?.total, 52);
+    assert.equal(boundedRes.deniedReads?.items.length, 50);
+
+    // 7. TaskManager without staged execution policy still fails on deniedReads
+    tasks = new TaskManager(cli, config, adapter);
+    const unguardedTask = await tasks.run({
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-unguarded-read-deny' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 0,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'read_file',
+              tool_info: {
+                parameters: { Path: missingReadPath },
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target file must exist and be a regular file' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-unguarded-read-deny', response: 'ok' } },
+        ],
+      }),
+    });
+    const settledUnguarded = await settleTask(tasks, unguardedTask.taskId);
+    assert.equal(settledUnguarded.status, 'failed');
+    assert.equal(settledUnguarded.error?.code, 'AGY_PROCESS_FAILED');
+    assert.match(settledUnguarded.error?.message ?? '', /Target file must exist and be a regular file/i);
+
+    // 8. read_file step with pre-tool hook denial message AND tool_info.denied_actions -> failed (no deniedReads)
+    const readWithToolInfoDeniedActions = await adapter.execute(makeRequest({
+      taskId: 'read-deny-with-tool-info-denied-actions',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-read-denied-actions-1' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 0,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'read_file',
+              tool_info: {
+                parameters: { Path: missingReadPath },
+                denied_actions: [{ action: 'write_file', reason: 'denied by pre-tool hook' }],
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target file must exist and be a regular file' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-read-denied-actions-1', response: 'claimed done' } },
+        ],
+      }),
+    }));
+    assert.equal(readWithToolInfoDeniedActions.status, 'failed');
+    assert.equal(readWithToolInfoDeniedActions.deniedReads, undefined);
+    if (readWithToolInfoDeniedActions.status === 'failed') {
+      assert.equal(readWithToolInfoDeniedActions.error.code, 'AGY_PROCESS_FAILED');
+    }
+
+    // 9. read_file step with step.denied_actions unsandboxed while tool_info.denied_actions holds a read entry -> failed with AGY_SANDBOX_BYPASS_DENIED
+    const readWithStepUnsandboxed = await adapter.execute(makeRequest({
+      taskId: 'read-deny-with-step-unsandboxed',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-read-denied-actions-2' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 0,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'read_file',
+              denied_actions: [{ action: 'unsandboxed' }],
+              tool_info: {
+                parameters: { Path: missingReadPath },
+                denied_actions: [{ action: 'read_file', reason: 'denied by pre-tool hook' }],
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target file must exist and be a regular file' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-read-denied-actions-2', response: 'claimed done' } },
+        ],
+      }),
+    }));
+    assert.equal(readWithStepUnsandboxed.status, 'failed');
+    assert.equal(readWithStepUnsandboxed.deniedReads, undefined);
+    if (readWithStepUnsandboxed.status === 'failed') {
+      assert.equal(readWithStepUnsandboxed.error.code, 'AGY_SANDBOX_BYPASS_DENIED');
+    }
+
+    // 10. read_file step with state DENIED, pre-tool hook error message, AND higher-priority sandbox denial in tool_info.output -> failed (no deniedReads)
+    const readDeniedStateWithOutput = await adapter.execute(makeRequest({
+      taskId: 'read-deny-state-denied-with-output',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-read-denied-state-1' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 0,
+              step_type: 'tool',
+              state: 'DENIED',
+              tool_name: 'read_file',
+              tool_info: {
+                parameters: { Path: missingReadPath },
+                output: 'permission check failed for unsandboxed',
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target file must exist and be a regular file' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-read-denied-state-1', response: 'claimed done' } },
+        ],
+      }),
+    }));
+    assert.equal(readDeniedStateWithOutput.status, 'failed');
+    assert.equal(readDeniedStateWithOutput.deniedReads, undefined);
+
+    // 11. read_file step with state DENIED and only the pre-tool hook error message -> failed with AGY_PROCESS_FAILED (non-ERROR states keep failing)
+    const readDeniedStateHookOnly = await adapter.execute(makeRequest({
+      taskId: 'read-deny-state-denied-hook-only',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-read-denied-state-2' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 0,
+              step_type: 'tool',
+              state: 'DENIED',
+              tool_name: 'read_file',
+              tool_info: {
+                parameters: { Path: missingReadPath },
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: Target file must exist and be a regular file' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-read-denied-state-2', response: 'claimed done' } },
+        ],
+      }),
+    }));
+    assert.equal(readDeniedStateHookOnly.status, 'failed');
+    assert.equal(readDeniedStateHookOnly.deniedReads, undefined);
+    if (readDeniedStateHookOnly.status === 'failed') {
+      assert.equal(readDeniedStateHookOnly.error.code, 'AGY_PROCESS_FAILED');
+    }
+
+    // 12. read_file step with both a pre-tool hook denial and another denial in the same diagnostic text -> failed with AGY_PROCESS_FAILED (no deniedReads)
+    const mixedDenialRes = await adapter.execute(makeRequest({
+      taskId: 'read-deny-mixed-diagnostic',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-read-mixed-1' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 13,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'read_file',
+              tool_info: {
+                name: 'read_file',
+                parameters: { Path: missingReadPath },
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: missing file\nrun_command: tool execution denied by user' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-read-mixed-1', response: 'claimed done' } },
+        ],
+      }),
+    }));
+    assert.equal(mixedDenialRes.status, 'failed');
+    assert.equal(mixedDenialRes.deniedReads, undefined);
+    if (mixedDenialRes.status === 'failed') {
+      assert.equal(mixedDenialRes.error.code, 'AGY_PROCESS_FAILED');
+    }
+
+    // 13. read_file step with a pre-tool hook denial followed by another denial on the same line -> failed with AGY_PROCESS_FAILED (no deniedReads)
+    const sameLineDenialRes = await adapter.execute(makeRequest({
+      taskId: 'read-deny-same-line-diagnostic',
+      workingDirectory: env.repoDir,
+      prompt: encodeScenarioPrompt({
+        exitCode: 0,
+        stdoutLines: [
+          { event: 'init', conversation_id: 'c-read-same-line-1' },
+          {
+            event: 'step_update',
+            step_update: {
+              step_index: 13,
+              step_type: 'tool',
+              state: 'ERROR',
+              tool_name: 'read_file',
+              tool_info: {
+                name: 'read_file',
+                parameters: { Path: missingReadPath },
+                error: { type: 'TOOL_ERROR', message: 'tool call denied by pre-tool hook: missing file; run_command: tool execution denied by user' },
+              },
+            },
+          },
+          { event: 'result', result: { status: 'SUCCESS', conversation_id: 'c-read-same-line-1', response: 'claimed done' } },
+        ],
+      }),
+    }));
+    assert.equal(sameLineDenialRes.status, 'failed');
+    assert.equal(sameLineDenialRes.deniedReads, undefined);
+    if (sameLineDenialRes.status === 'failed') {
+      assert.equal(sameLineDenialRes.error.code, 'AGY_PROCESS_FAILED');
+    }
+  } finally {
+    await tasks?.shutdown();
+    env.cleanup();
+  }
+});

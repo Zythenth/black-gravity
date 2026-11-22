@@ -79,6 +79,7 @@ export type CompactTask = Pick<TaskRecord, 'taskId' | 'workingDirectory' | 'stat
   memory?: TaskRecord['memory'];
   agentPolicy?: TaskRecord['agentPolicy'];
   agentPolicyReceipt?: TaskRecord['agentPolicyReceipt'];
+  deniedReads?: TaskRecord['deniedReads'];
 };
 
 export function compactTask(task: TaskRecord): CompactTask {
@@ -89,6 +90,7 @@ export function compactTask(task: TaskRecord): CompactTask {
     ...(task.group ? { group: structuredClone(task.group) } : {}),
     ...(task.memory !== undefined ? { memory: structuredClone(task.memory) } : {}),
     ...(task.agentPolicy ? { agentPolicy: task.agentPolicy, agentPolicyReceipt: task.agentPolicyReceipt } : {}),
+    ...(task.deniedReads ? { deniedReads: task.deniedReads } : {}),
     ...(task.providedSkills?.length ? { providedSkillSummaries: task.providedSkills.map(skill => ({ name: skill.name, sha256: skill.sha256, fileCount: skill.files.length })) } : {}),
     ...(task.continuationTaskId ? { continuationTaskId: task.continuationTaskId } : {}),
     ...(task.structuredResult ? { structuredResultSha256: task.structuredResult.sha256 } : {}),

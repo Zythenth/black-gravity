@@ -100,7 +100,15 @@ export const taskRecordSchema = z.object({
   structuredResultSha256: hash.optional(),
   artifactCount: count.optional(),
   agentPolicy: resolvedAgentPolicySchema.optional(),
-  agentPolicyReceipt: z.object({ sha256: hash, decisionCount: count, deniedCount: count }).strict().optional(),
+  agentPolicyReceipt: z.object({ sha256: hash, decisionCount: count, deniedCount: count, deniedReadCount: count.optional() }).strict().optional(),
+  deniedReads: z.object({
+    total: count,
+    items: z.array(z.object({
+      toolName: z.string().max(128),
+      path: z.string().max(1000).optional(),
+      reason: z.string().max(500),
+    }).strict()).max(50),
+  }).strict().optional(),
   processCleanup: z.object({ verified: z.boolean(), spawnedAt: timestamp, checkedAt: timestamp, remaining: count }).strict().optional(),
   craft: z.object({ revision: z.string(), manifestSha256: hash, permanent: z.array(z.string()), catalog: z.array(z.string()) }).strict().optional(),
   craftLoad: z.object({

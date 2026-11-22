@@ -23,14 +23,17 @@ import {
   terminateSubprocess,
   type RedactionState,
 } from './subprocess.js';
-import { BridgeError, type RunOptions, type TaskRecord } from './types.js';
+import { BridgeError, type DeniedRead, type DeniedReads, type RunOptions, type TaskRecord } from './types.js';
 import { normalizeUsage, type UsageCounters } from './usage.js';
+
+export type { DeniedRead, DeniedReads } from './types.js';
 
 const RESPONSE_HOLD_BACK_CHARS = 8192;
 const MAX_BUFFERED_RESPONSE_STEPS = 16;
 const MAX_RESPONSE_STEPS = 1000;
 const MAX_HELD_RESPONSE_LINES = 100;
 const STDERR_BUFFER_LIMIT = 10000;
+export const MAX_DENIED_READS = 50;
 
 interface PendingResponse {
   text: string;
@@ -47,6 +50,7 @@ export type AgyExecutionResult = ExecutionResult & {
   readonly processCleanup?: TaskRecord['processCleanup'];
   readonly parseErrors?: number;
   readonly spawnedPid?: number;
+  readonly deniedReads?: DeniedReads;
 };
 
 export interface AgyExecutionHooks {
@@ -174,6 +178,33 @@ export class ResponseRedactor {
 const MCP_PERMISSION_RE = /no output produced[^\r\n]{0,200}["']mcp["'][^\r\n]{0,200}permission[^\r\n]{0,200}headless|(?:permission check failed|tool call denied|denied tool|action denied|cannot request approval)[^\r\n]{0,200}\bmcp\b|\bmcp\b[^\r\n]{0,200}(?:permission denied|permission check failed|requires? approval|not authorized)/iu;
 const SOFT_DENIAL_RE = /permission check failed|tool(?:\s+call|\s+execution)?\s+(?:was\s+)?denied|(?:soft\s+)?tool\s+denial|(?:action|command|operation)\s+(?:was\s+)?denied\s+(?:by\s+(?:the\s+)?(?:pre-?tool\s+hook|execution\s+policy|hook|policy|sandbox|security|user|headless|agy|\bmcp\b|permission\s+(?:check|policy))|in\s+(?:headless|non-?interactive)\s+mode)|(?:headless|non-?interactive|agy|pre-?tool\s+hook|execution\s+policy|sandbox|\bmcp\b)[^\r\n]{0,200}(?:confirmation|approval|permission)\s+(?:required|denied|rejected)|(?:confirmation|approval|permission)\s+(?:required|denied|rejected)[^\r\n]{0,200}(?:headless|non-?interactive|pre-?tool\s+hook|execution\s+policy|sandbox|agy|\bmcp\b)|headless\s+mode\s+cannot\s+(?:prompt|request)\s+(?:for\s+)?(?:permission|approval|confirmation)|user\s+denied\s+(?:permission|the\s+tool|tool\s+execution)|denied\s+by\s+(?:the\s+)?(?:pre-?tool\s+hook|execution\s+policy|hook|policy|sandbox|security|user|headless|agy|\bmcp\b|permission\s+(?:check|policy))|(?:not\s+allowed|blocked)\s+by\s+(?:the\s+)?(?:bridge\s+)?(?:pre-?tool\s+hook|execution\s+policy|hook|policy|sandbox|security|headless|agy|\bmcp\b)|failed to prompt user for /i;
 const SOFT_TOOL_STATES = new Set(['DENIED', 'BLOCKED', 'REJECTED', 'CANCELED', 'CANCELLED']);
+const HOOK_READ_DENIAL_RE = /^(?:tool (?:call|execution) )?denied by (?:the )?pre-?tool hook: ([^\r\n\u0085\u2028\u2029]*)$/i;
+
+function isSoleHookDenial(text: string): boolean {
+  const match = HOOK_READ_DENIAL_RE.exec(text.trim());
+  return match !== null && classifyCliTextError(match[1] ?? '', 'tool-error') === undefined;
+}
+
+function toDeniedRead(
+  toolName: unknown,
+  denial: BridgeError | undefined,
+  onlyPreToolHookDenials: boolean,
+  params: Record<string, unknown> | undefined,
+): DeniedRead | undefined {
+  if (!denial || !onlyPreToolHookDenials || (toolName !== 'read_file' && toolName !== 'view_file')) {
+    return undefined;
+  }
+  const rawPath = typeof params?.Path === 'string'
+    ? params.Path
+    : typeof params?.AbsolutePath === 'string'
+      ? params.AbsolutePath
+      : undefined;
+  return {
+    toolName,
+    ...(rawPath !== undefined ? { path: redactDiagnostic(rawPath).slice(0, 1000) } : {}),
+    reason: redactDiagnostic(denial.message).slice(0, 500),
+  };
+}
 
 function errorPriority(code: string): number {
   switch (code) {
@@ -409,6 +440,8 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
     let lastUsage: unknown;
     let resultFrame: Record<string, unknown> | undefined;
     let observedDenial: BridgeError | undefined;
+    let deniedReadTotal = 0;
+    const deniedReadItems: DeniedRead[] = [];
     const redactor = new ResponseRedactor();
 
     const recordHookFailure = (error: unknown) => {
@@ -494,6 +527,12 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
           type = result.type;
           eventData = result.eventData;
           recordDenial(result.denial);
+          if (result.deniedRead) {
+            deniedReadTotal += 1;
+            if (deniedReadItems.length < MAX_DENIED_READS) {
+              deniedReadItems.push(result.deniedRead);
+            }
+          }
         } else if (step.step_type === 'agent_response' && typeof step.text_delta === 'string') {
           type = 'response.chunk';
         }
@@ -777,18 +816,22 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
     }
 
     const finalResponse = typeof resultFrame.response === 'string' ? resultFrame.response : '';
+    const deniedReads: DeniedReads | undefined = deniedReadTotal > 0
+      ? { total: deniedReadTotal, items: deniedReadItems }
+      : undefined;
     return {
       ...common,
       status: 'completed',
       response: finalResponse,
       structuredOutput: resultFrame.structured_output,
+      ...(deniedReads ? { deniedReads } : {}),
     };
   }
 
   private handleToolStep(
     step: Record<string, unknown>,
     hooks: AgyExecutionHooks | undefined,
-  ): { type: string; eventData: Record<string, unknown>; denial?: BridgeError } {
+  ): { type: string; eventData: Record<string, unknown>; denial?: BridgeError; deniedRead?: DeniedRead } {
     const type = step.state === 'DONE' ? 'tool.completed' : step.state === 'ERROR' ? 'tool.failed' : 'tool.started';
     const toolInfo = step.tool_info && typeof step.tool_info === 'object' ? step.tool_info as Record<string, unknown> : undefined;
     const toolError = toolInfo?.error && typeof toolInfo.error === 'object' ? toolInfo.error as Record<string, unknown> : undefined;
@@ -797,26 +840,44 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
     const editSearch = hooks?.resolveEditMismatch?.(step.tool_name, step.state, rawErrorMsg, params);
 
     let denial: BridgeError | undefined;
+    let onlyPreToolHookDenials = true;
+    const addDenial = (candidate: BridgeError | undefined, source: string | undefined) => {
+      if (!candidate) return;
+      if (source === undefined || errorPriority(candidate.code) !== 1 || candidate.code !== 'AGY_PROCESS_FAILED' || !isSoleHookDenial(source)) {
+        onlyPreToolHookDenials = false;
+      }
+      denial = pickHigherPriority(denial, candidate);
+    };
+    const toolDeniedActions = toolInfo?.denied_actions;
+    const stepDeniedActions = step.denied_actions;
+    const hasToolDeniedActions = Array.isArray(toolDeniedActions) && toolDeniedActions.length > 0;
+    const hasStepDeniedActions = Array.isArray(stepDeniedActions) && stepDeniedActions.length > 0;
+    if (hasToolDeniedActions || hasStepDeniedActions) {
+      onlyPreToolHookDenials = false;
+    }
     const stepDenied = classifyDeniedActions(toolInfo?.denied_actions) ?? classifyDeniedActions(step.denied_actions);
-    if (stepDenied) denial = pickHigherPriority(denial, stepDenied);
+    addDenial(stepDenied, undefined);
+    if (hasToolDeniedActions) {
+      addDenial(classifyDeniedActions(step.denied_actions), undefined);
+    }
 
     const stateUpper = typeof step.state === 'string' ? step.state.toUpperCase() : '';
     if (step.denied === true || step.permission_denied === true || toolInfo?.denied === true || toolInfo?.permission_denied === true || SOFT_TOOL_STATES.has(stateUpper)) {
       const reason = rawErrorMsg ?? (typeof toolInfo?.output === 'string' ? toolInfo.output : undefined);
-      denial = pickHigherPriority(
-        denial,
+      addDenial(
         classifyCliTextError(reason ?? '', 'tool-error') ?? new BridgeError('AGY_PROCESS_FAILED', redactDiagnostic(reason || `Tool step ${String(step.tool_name ?? '')} ended with state ${stateUpper || 'DENIED'}`)),
+        reason,
       );
     }
 
     if (step.state === 'ERROR') {
-      if (rawErrorMsg) denial = pickHigherPriority(denial, classifyCliTextError(rawErrorMsg, 'tool-error'));
-      if (typeof toolInfo?.output === 'string') denial = pickHigherPriority(denial, classifyCliTextError(toolInfo.output, 'tool-error'));
+      if (rawErrorMsg) addDenial(classifyCliTextError(rawErrorMsg, 'tool-error'), rawErrorMsg);
+      if (typeof toolInfo?.output === 'string') addDenial(classifyCliTextError(toolInfo.output, 'tool-error'), toolInfo.output);
       if (!denial && typeof toolError?.type === 'string' && /(?:hook|permission|policy|deni|reject|block)/i.test(toolError.type)) {
-        denial = new BridgeError(
+        addDenial(new BridgeError(
           'AGY_PROCESS_FAILED',
           redactDiagnostic(rawErrorMsg || `Tool step ${String(step.tool_name ?? '')} denied (${toolError.type})`).slice(0, 2000),
-        );
+        ), rawErrorMsg);
       }
       const failure = {
         ...(typeof toolError?.type === 'string' && toolError.type.length <= 64 ? { type: toolError.type } : {}),
@@ -837,13 +898,14 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
           truncated: true,
         };
       }
-      return { type, eventData, denial };
+      const deniedRead = toDeniedRead(step.tool_name, denial, onlyPreToolHookDenials, params);
+      return deniedRead ? { type, eventData, deniedRead } : { type, eventData, denial };
     }
 
     if (step.state === 'DONE' && step.tool_name === 'run_command' && typeof toolInfo?.output === 'string') {
       const trimmedOutput = toolInfo.output.trim();
       const cmdDenial = classifyCliTextError(trimmedOutput, 'run-command-output');
-      if (cmdDenial) denial = pickHigherPriority(denial, cmdDenial);
+      addDenial(cmdDenial, undefined);
     }
 
     return { type, eventData: step, denial };

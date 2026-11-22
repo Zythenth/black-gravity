@@ -30,6 +30,17 @@ export interface BridgeEvent {
   raw?: unknown;
 }
 
+export interface DeniedRead {
+  toolName: string;
+  path?: string;
+  reason: string;
+}
+
+export interface DeniedReads {
+  total: number;
+  items: DeniedRead[];
+}
+
 export interface TaskRecord {
   peerRequests?: PeerMessageInput[];
   peerRequestsTruncated?: boolean;
@@ -83,7 +94,8 @@ export interface TaskRecord {
   structuredResult?: { value: unknown; sha256: string };
   artifacts?: ArtifactReference[];
   agentPolicy?: ResolvedAgentPolicy;
-  agentPolicyReceipt?: { sha256: string; decisionCount: number; deniedCount: number };
+  agentPolicyReceipt?: { sha256: string; decisionCount: number; deniedCount: number; deniedReadCount?: number };
+  deniedReads?: DeniedReads;
   processCleanup?: { verified: boolean; spawnedAt: string; checkedAt: string; remaining: number };
   craft?: { revision: string; manifestSha256: string; permanent: string[]; catalog: string[] };
   craftLoad?: {
