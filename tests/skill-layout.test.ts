@@ -82,3 +82,19 @@ test('a link that leaves the skill folder is reported', async () => {
 test('a reference missing from the core is reported', async () => {
   assert.deepEqual(await inspectFixture('no links\n', validReference), ['references/a.md: not linked from SKILL.md']);
 });
+
+test('the shipped skill starts tasks through black_gravity_dispatch and reports missing MCP tools', async () => {
+  const core = (await readFile(path.join(shippedSkill, 'SKILL.md'), 'utf8')).replace(/\r\n/g, '\n');
+  const copyAndExecution = (
+    await readFile(path.join(shippedSkill, 'references', 'copy-and-execution.md'), 'utf8')
+  ).replace(/\r\n/g, '\n');
+
+  assert.ok(core.includes('Start a new task with `black_gravity_dispatch`'));
+  assert.ok(
+    core.includes('never start tasks through the shell, a separately started bridge server or an ad hoc MCP client'),
+  );
+  assert.match(copyAndExecution, /^## MCP tools unavailable or a build not yet loaded$/m);
+  assert.ok(copyAndExecution.includes('black_gravity_tasks'));
+  assert.ok(copyAndExecution.includes('reconnect the MCP server in the host or open a new session'));
+  assert.ok(copyAndExecution.includes('it never starts, resumes or integrates a task'));
+});
