@@ -207,6 +207,16 @@ export const toolCases = [
   { name: 'black_gravity_discard', args: c => ({ taskId: c.task }) },
   { name: 'black_gravity_cleanup', args: () => ({}) },
   { name: 'black_gravity_usage', args: () => ({}) },
+  {
+    name: 'black_gravity_dispatch',
+    args: c => ({ provider: 'agy', prompt: 'dispatch:contract', workingDirectory: c.source, mode: 'read-only' }),
+    check: async (result, c) => {
+      assert.equal(result.executor?.provider, 'agy', `[${c.scenario}] black_gravity_dispatch: executor provider mismatch`);
+      assert.equal(result.task?.prompt, undefined, `[${c.scenario}] black_gravity_dispatch: response task must omit prompt`);
+      const task = await settle(c.client, result.task.taskId);
+      assert.equal(task.status, 'completed', `[${c.scenario}] black_gravity_dispatch: ${JSON.stringify(task.error)}`);
+    },
+  },
 ];
 
 export async function checkToolContracts(bin, root) {

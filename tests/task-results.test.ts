@@ -220,7 +220,7 @@ describe('Task results and artifacts runtime', () => {
 
     const toolList = await client.listTools();
     const names = toolList.tools.map(t => t.name);
-    assert.equal(names.length, 52);
+    assert.equal(names.length, 53);
     assert.ok(names.includes('black_gravity_read_structured_result'));
     assert.ok(names.includes('black_gravity_artifacts'));
     assert.ok(names.includes('black_gravity_read_artifact'));

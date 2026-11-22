@@ -41,16 +41,16 @@ function assertRefusal(args: readonly string[], messageMatch?: string | RegExp):
 
 const expectedCounts: Record<PermissionPreset, Record<ToolProfile, [number, number]>> = {
   connector: {
-    full: [25, 27],
-    query: [25, 13],
-    review: [25, 16],
-    implementation: [25, 27],
+    full: [25, 28],
+    query: [25, 14],
+    review: [25, 17],
+    implementation: [25, 28],
   },
   delegation: {
-    full: [45, 7],
-    query: [36, 2],
-    review: [39, 2],
-    implementation: [45, 7],
+    full: [46, 7],
+    query: [37, 2],
+    review: [40, 2],
+    implementation: [46, 7],
   },
 };
 

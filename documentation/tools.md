@@ -6,10 +6,10 @@ Set `BRIDGE_TOOL_PROFILE` in the server environment and restart the MCP connecti
 
 | Value | Tools | Catalog and execution |
 | --- | --- | --- |
-| `full` (default) | 52 | All tools, preserving the existing configuration. |
-| `query` | 38 | Queries, models, sessions, handoff, comparison and sandbox policy inspection. Read-only tasks. |
-| `review` | 41 | Queries plus preview, patch reads and verification. Read-only tasks. |
-| `implementation` | 52 | Full flow, including tests, authorized integration and discard. |
+| `full` (default) | 53 | All tools, preserving the existing configuration. |
+| `query` | 39 | Queries, models, sessions, handoff, comparison and sandbox policy inspection. Read-only tasks. |
+| `review` | 42 | Queries plus preview, patch reads and verification. Read-only tasks. |
+| `implementation` | 53 | Full flow, including tests, authorized integration and discard. |
 
 `black_gravity_health.toolProfile` reports the profile. Tools outside it are unregistered and direct calls are refused. `query` and `review` refuse `mode: "write"` and default to read-only when the mode is omitted. Sandboxing and integration approval still apply. Unknown profile values prevent startup.
 
@@ -32,6 +32,7 @@ Every tool publishes an `outputSchema` describing fields and types in its struct
 | `black_gravity_set_sandbox_policy` | Replaces the global policy after checking its previous hash, with a human MCP form in `ask` mode. |
 | `black_gravity_send_message` | Queues caller text with an idempotent receipt and official session continuation. |
 | `black_gravity_run` | Starts a task and returns its `taskId`. |
+| `black_gravity_dispatch` | Starts a task through the provider-neutral entry with an explicit `provider` from the registered executors and the same fields as `black_gravity_run`; strict input rejected before dispatch, compact response with the executor identity. |
 | `black_gravity_list_project_files` | Lists files eligible for copying. |
 | `black_gravity_preview` | Shows added, modified and deleted files, line totals, per-file statistics, patch, hash and recorded tests. |
 | `black_gravity_record_test` | Records client-reported command, output and exit code against the hash. |

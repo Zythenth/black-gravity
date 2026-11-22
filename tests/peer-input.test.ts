@@ -249,7 +249,7 @@ import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { createMcpServer } from '../src/mcp-server.js';
 import { successOutputSchemas } from '../src/output-schemas.js';
 test('receipt MCP contract is available in all four profiles with no peer body or model start', async () => {
-  for (const [profile, count] of [['full',52],['query',38],['review',41],['implementation',52]] as const) {
+  for (const [profile, count] of [['full',53],['query',39],['review',42],['implementation',53]] as const) {
     await fixture(async ({ source, tasks, adapter, config }) => {
       config.toolProfile = profile;
       const group = await tasks.groups.create(randomUUID(), peerDefinition(source));

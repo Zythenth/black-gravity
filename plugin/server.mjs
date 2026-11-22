@@ -29989,6 +29989,7 @@ var queryTools = /* @__PURE__ */ new Set([
   "black_gravity_usage",
   "black_gravity_list_project_files",
   "black_gravity_run",
+  "black_gravity_dispatch",
   "black_gravity_resume",
   "black_gravity_status",
   "black_gravity_tasks",
@@ -48300,6 +48301,7 @@ var successOutputSchemas = {
   }).strict(),
   black_gravity_list_project_files: external_exports.object({ files: external_exports.array(external_exports.string()) }).strict(),
   black_gravity_run: startedTask,
+  black_gravity_dispatch: external_exports.object({ task: taskRecordSchema, executor: external_exports.object({ provider: external_exports.string(), adapterId: external_exports.string(), adapterVersion: external_exports.string() }).strict(), waitCommand: waitCommandSchema.optional() }).strict(),
   black_gravity_resume: startedTask,
   black_gravity_handoff: startedTask,
   black_gravity_context: external_exports.object({
@@ -48476,6 +48478,7 @@ var TOOL_ANNOTATIONS = {
   black_gravity_group_cancel: { title: "Cancel a dependency group", readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_wait_many: { title: "Wait for several tasks", readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_run: { title: "Run Antigravity task", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  black_gravity_dispatch: { title: "Dispatch task to a selected executor", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   black_gravity_resume: { title: "Resume Antigravity conversation", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   black_gravity_context: { title: "Inspect role handoff context", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   black_gravity_handoff: { title: "Transfer work to another role", readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
@@ -49981,14 +49984,35 @@ function createMcpServer(adapter, tasks, options = {}) {
     outputSchema: structuredResultInputSchema.optional(),
     artifactPaths: artifactPathsSchema.optional()
   };
+  const startTask = async (args) => {
+    const task2 = await tasks.run(args);
+    return { task: task2, ...waitCommand([task2.taskId]) };
+  };
   if (toolEnabled(tasks.toolProfile, "black_gravity_run"))
     server.registerTool("black_gravity_run", {
       outputSchema: outputSchemas.black_gravity_run,
       description: "Copy non-ignored project files to a temporary directory and run agy --sandbox there. includePaths narrows copied files or folders. Returns a taskId; source is unchanged.",
       inputSchema: runSchema
     }, async (args) => safe(async () => {
-      const task2 = await tasks.run(args);
-      return { task: clientTask(task2), ...waitCommand([task2.taskId]) };
+      const { task: task2, ...wait } = await startTask(args);
+      return { task: clientTask(task2), ...wait };
+    })());
+  if (toolEnabled(tasks.toolProfile, "black_gravity_dispatch"))
+    server.registerTool("black_gravity_dispatch", {
+      outputSchema: outputSchemas.black_gravity_dispatch,
+      description: "Start a task through the provider-neutral entry: select an executor from the registered providers and pass the same task fields as black_gravity_run. The input is strict and rejected before dispatch when invalid; the response is compact and large content stays behind the result and patch readers.",
+      inputSchema: external_exports.object({ provider: external_exports.enum([tasks.executorIdentity.provider]), ...runSchema }).strict()
+    }, async ({ provider, ...args }) => safe(async () => {
+      const identity = tasks.executorIdentity;
+      if (provider !== identity.provider) {
+        throw new BridgeError("INVALID_PROVIDER", `Unknown provider: ${provider}`);
+      }
+      const { task: task2, ...wait } = await startTask(args);
+      return {
+        task: compactTask(task2),
+        executor: { provider: identity.provider, adapterId: identity.id, adapterVersion: identity.version },
+        ...wait
+      };
     })());
   if (toolEnabled(tasks.toolProfile, "black_gravity_resume"))
     server.registerTool("black_gravity_resume", {
@@ -56258,6 +56282,10 @@ var TaskManager = class {
     this.nativeRecoveryError = void 0;
   }
   executor;
+  get executorIdentity() {
+    const { id: id2, provider, version: version2 } = this.executor.identity;
+    return Object.freeze({ id: id2, provider, version: version2 });
+  }
   linuxBwrapStatus;
   constructor(adapter, config2, executor, runtimeOptions) {
     this.adapter = adapter;

@@ -242,6 +242,7 @@ export const successOutputSchemas = {
   }).strict(),
   black_gravity_list_project_files: z.object({ files: z.array(z.string()) }).strict(),
   black_gravity_run: startedTask,
+  black_gravity_dispatch: z.object({ task: taskRecordSchema, executor: z.object({ provider: z.string(), adapterId: z.string(), adapterVersion: z.string() }).strict(), waitCommand: waitCommandSchema.optional() }).strict(),
   black_gravity_resume: startedTask,
   black_gravity_handoff: startedTask,
   black_gravity_context: z.object({ taskId: id, treeSha256: hash, role: roleSchema, report: report.nullable(), handoff: handoffSchema.nullable(),

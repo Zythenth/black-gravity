@@ -8,7 +8,7 @@ import { providedSkillsSchema } from './skills.js';
 import { CliAdapter } from './cli-adapter.js';
 import { AGY_ADAPTER_VERSION } from './agy-execution-adapter.js';
 import { TaskManager } from './task-manager.js';
-import { BridgeError } from './types.js';
+import { BridgeError, type RunOptions } from './types.js';
 import { criteriaSchema, reviewSchema } from './verification.js';
 import { testCommandSchema } from './native-tests.js';
 import { outputSchemas } from './output-schemas.js';
@@ -353,13 +353,34 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
     outputSchema: structuredResultInputSchema.optional(),
     artifactPaths: artifactPathsSchema.optional(),
   };
+  const startTask = async (args: RunOptions) => {
+    const task = await tasks.run(args);
+    return { task, ...waitCommand([task.taskId]) };
+  };
   if (toolEnabled(tasks.toolProfile, 'black_gravity_run')) server.registerTool('black_gravity_run', {
     outputSchema: outputSchemas.black_gravity_run,
     description: 'Copy non-ignored project files to a temporary directory and run agy --sandbox there. includePaths narrows copied files or folders. Returns a taskId; source is unchanged.',
     inputSchema: runSchema,
   }, async args => safe(async () => {
-    const task = await tasks.run(args);
-    return { task: clientTask(task), ...waitCommand([task.taskId]) };
+    const { task, ...wait } = await startTask(args);
+    return { task: clientTask(task), ...wait };
+  })());
+
+  if (toolEnabled(tasks.toolProfile, 'black_gravity_dispatch')) server.registerTool('black_gravity_dispatch', {
+    outputSchema: outputSchemas.black_gravity_dispatch,
+    description: 'Start a task through the provider-neutral entry: select an executor from the registered providers and pass the same task fields as black_gravity_run. The input is strict and rejected before dispatch when invalid; the response is compact and large content stays behind the result and patch readers.',
+    inputSchema: z.object({ provider: z.enum([tasks.executorIdentity.provider]), ...runSchema }).strict(),
+  }, async ({ provider, ...args }) => safe(async () => {
+    const identity = tasks.executorIdentity;
+    if (provider !== identity.provider) {
+      throw new BridgeError('INVALID_PROVIDER', `Unknown provider: ${provider}`);
+    }
+    const { task, ...wait } = await startTask(args);
+    return {
+      task: compactTask(task),
+      executor: { provider: identity.provider, adapterId: identity.id, adapterVersion: identity.version },
+      ...wait,
+    };
   })());
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_resume')) server.registerTool('black_gravity_resume', {

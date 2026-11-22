@@ -17,7 +17,7 @@ import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { appendMessage, deliveryModeSchema, extractAgentMessages, readMessages, resultReference, type DeliveryMode } from './messages.js';
 import { CliAdapter, taskPrompt } from './cli-adapter.js';
 import { AgyExecutionAdapter, MAX_DENIED_READS, type AgyExecutionHooks, type AgyExecutionResult } from './agy-execution-adapter.js';
-import type { ExecutionAdapter, ExecutionIdentity, ExecutionRequest, ExecutionResult } from './execution-contract.js';
+import type { ExecutionAdapter, ExecutionAdapterIdentity, ExecutionIdentity, ExecutionRequest, ExecutionResult } from './execution-contract.js';
 import { terminateSubprocess, redactDiagnostic, redactionContextDigest, containsCredential } from './subprocess.js';
 import { reconcileOwnedProcesses } from './process-tree.js';
 import { sanitizePayload } from './payload-safety.js';
@@ -146,6 +146,10 @@ export class TaskManager {
   }
 
   private readonly executor: ExecutionAdapter;
+  get executorIdentity(): ExecutionAdapterIdentity {
+    const { id, provider, version } = this.executor.identity;
+    return Object.freeze({ id, provider, version });
+  }
   private readonly linuxBwrapStatus?: BubblewrapDetection;
 
   constructor(

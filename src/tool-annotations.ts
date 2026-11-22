@@ -43,6 +43,7 @@ export const TOOL_ANNOTATIONS: Readonly<Record<string, ToolAnnotationRow>> = {
   black_gravity_group_cancel: { title: 'Cancel a dependency group', readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_wait_many: { title: 'Wait for several tasks', readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   black_gravity_run: { title: 'Run Antigravity task', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
+  black_gravity_dispatch: { title: 'Dispatch task to a selected executor', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   black_gravity_resume: { title: 'Resume Antigravity conversation', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   black_gravity_context: { title: 'Inspect role handoff context', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
   black_gravity_handoff: { title: 'Transfer work to another role', readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
