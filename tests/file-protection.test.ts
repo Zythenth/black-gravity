@@ -2384,12 +2384,38 @@ test('regression: conflicting execution policy path in source rejects before fir
   try {
     await mkdir(path.join(dir, '.agents'), { recursive: true });
     const conflictMarker = 'BRIDGE_SYNTHETIC_CONFLICTING_HOOKS_CONTENT';
-    await writeFile(path.join(dir, '.agents', 'hooks.json'), `{"conflict":"${conflictMarker}"}\n`);
+    const sourceHooksPath = path.join(dir, '.agents', 'hooks.json');
+    await writeFile(sourceHooksPath, `{"conflict":"${conflictMarker}"}\n`);
+    const sourceHooksBytes = await readFile(sourceHooksPath);
 
     const { resolveAgentPolicy } = await import('../src/agent-policy.js');
     const { randomUUID } = await import('node:crypto');
     const executionId = randomUUID();
     const policy = resolveAgentPolicy({ allowedTools: ['finish', 'view_file'] }, ['finish', 'view_file'], [], 'read-only', executionId);
+
+    const copy = await createProjectCopy(
+      dir,
+      undefined,
+      undefined,
+      DEFAULT_PROJECT_LIMITS,
+      [],
+      { policy, catalog: [], stateDirectory: stateDir, executionId }
+    );
+    try {
+      const copyHooksPath = path.join(copy.copyDirectory, '.agents', 'hooks.json');
+      assert.equal(existsSync(copyHooksPath), true, 'Bridge execution policy must stage .agents/hooks.json in copy');
+      const copyHooksBytes = await readFile(copyHooksPath);
+      assert.equal(copyHooksBytes.toString('utf8').includes(conflictMarker), false, 'Copy .agents/hooks.json must not contain source conflict marker');
+      const hooksEntry = copy.executionPolicy?.files.find(entry => entry.path === '.agents/hooks.json');
+      assert.ok(hooksEntry, 'executionPolicy.files must include .agents/hooks.json');
+      assert.equal(createHash('sha256').update(copyHooksBytes).digest('hex'), hooksEntry.sha256, 'Copy .agents/hooks.json must match bridge-generated digest');
+      assert.deepEqual(await readFile(sourceHooksPath), sourceHooksBytes, 'Source .agents/hooks.json must remain byte-identical');
+    } finally {
+      await discardProjectCopy(copy);
+    }
+
+    const nodeShadowPath = path.join(dir, 'node');
+    await writeFile(nodeShadowPath, 'inert synthetic runtime shadow\n');
 
     const originalSpawn = childProcess.spawn;
     let gitAddCalled = false;
@@ -2410,11 +2436,11 @@ test('regression: conflicting execution policy path in source rejects before fir
           p => { capturedProject = p; },
           DEFAULT_PROJECT_LIMITS,
           [],
-          { policy, catalog: [], stateDirectory: stateDir, executionId }
+          { policy, catalog: [], stateDirectory: stateDir, executionId: randomUUID() }
         ),
         { code: 'CONFLICTING_EXECUTION_POLICY' }
       );
-      assert.equal(gitAddCalled, false, 'Conflicting helper content must be rejected before first Git add');
+      assert.equal(gitAddCalled, false, 'Runtime shadow file must be rejected before first Git add');
       assert.ok(capturedProject, 'onCreated should capture project before stageProjectExecutionPolicy');
       assert.equal(existsSync(capturedProject.copyDirectory), false, 'Failed createProjectCopy must clean up copyDirectory');
       assert.equal(existsSync(capturedProject.gitDirectory), false, 'Failed createProjectCopy must clean up gitDirectory');
@@ -2422,6 +2448,7 @@ test('regression: conflicting execution policy path in source rejects before fir
       t.mock.restoreAll();
       syncBuiltinESMExports();
     }
+    await rm(nodeShadowPath, { force: true });
 
     // Persisted copy whose HEAD is missing/unborn fails closed with GIT_OPERATION_FAILED
     await rm(path.join(dir, '.agents'), { recursive: true, force: true });

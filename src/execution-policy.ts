@@ -481,22 +481,26 @@ async function hookMain() {
               (args.ArtifactMetadata === undefined || isPlainObject(args.ArtifactMetadata)))));
       const rawTarget = hasUnambiguousTarget && modernEnvelopeValid ? args[expectedTargetKey] : undefined;
       let pathValid = typeof rawTarget === 'string' && rawTarget.length > 0 && rawTarget.length <= 4000;
+      let pathDenyReason = 'Invalid or non-absolute target file path';
       if (pathValid) {
-        if (!path.isAbsolute(rawTarget)) {
+        if (!isWindows && rawTarget.includes('\\')) {
+          pathValid = false;
+          pathDenyReason = 'Target path cannot contain backslashes on non-Windows platforms';
+        } else if (!path.isAbsolute(rawTarget)) {
           pathValid = false;
         } else if (isWindows) {
           if (!/^[A-Za-z]:[\\/]/.test(rawTarget) || /^(?:\\\\|\/\/|\\\\\?\\)/.test(rawTarget) || rawTarget.slice(2).includes(':')) {
             pathValid = false;
           }
         }
-        if (/[\x00-\x1f]/.test(rawTarget) || rawTarget.split(/[\\/]+/).some((part: string) => part === '.' || part === '..')) {
+        if (pathValid && (/[\x00-\x1f]/.test(rawTarget) || rawTarget.split(/[\\/]+/).some((part: string) => part === '.' || part === '..'))) {
           pathValid = false;
         }
       }
 
       if (!pathValid) {
         decision = 'deny';
-        reason = 'Invalid or non-absolute target file path';
+        reason = pathDenyReason;
       } else {
         const resolvedTarget = path.resolve(rawTarget);
         const insideOriginal = isInside(manifest.originalCopyRoot, resolvedTarget);

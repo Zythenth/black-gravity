@@ -27,6 +27,7 @@ import { convertCrlfToLf, listCopyFiles, normalizeEditedLineEndings, planLineEnd
 import { assertForbiddenDirectoriesUsable, assertSecretExclusionsUsable, assertAgyPathUsable, assertWindowsNodeCacheDirectoryUsable, assertAntiAiCraftDirectoryUsable, type Config, type ApprovalMode, type ConfigurationIssue, type ConfigurationIssueReason, type TestExecutor } from './config.js';
 import { EventStore } from './event-store.js';
 import { assertManagedCopyPresent, assertTextIsUtf8, createProjectCopy, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, forkProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, clearLineEndingConversions, type ChangePreview, type ProjectCopy } from './isolation.js';
+import { assertNoAgentConfigInCopy, ensureAgentGuard } from './agent-config.js';
 import { BridgeError, type DeniedReads, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt, type TestEvidence } from './types.js';
 import { validatePrompt, validateRuntimeCacheSeparation, validateWorkingDirectory, validateStateSeparation } from './validation.js';
 import { copyIdentity, copyLockName, processAlive, StateStore, StateStoreLinkError, stateDirectoryProblem, type QuarantineReason, type QuarantinedSnapshot } from './state-store.js';
@@ -2154,6 +2155,10 @@ export class TaskManager {
   ): Promise<{ result: ExecutionResult; styles?: Map<string, LineEndingStyle>; boms?: Set<string> }> {
     const record = task.record;
     const project = task.project!;
+    const mode = record.mode ?? 'write';
+    await verifyManagedCopy(project);
+    await ensureAgentGuard(project, mode);
+    await assertNoAgentConfigInCopy(project, mode);
     let styles: Map<string, LineEndingStyle> | undefined;
     let boms: Set<string> | undefined;
     if (config.prepareLf) {

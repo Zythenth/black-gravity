@@ -3,6 +3,7 @@ import { appendFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 import { BridgeError } from './types.js';
+import { AGENT_GUARD_PATHS } from './agent-config.js';
 import type { ProjectCopy } from './isolation.js';
 import type { SandboxSelection } from './sandbox-policy.js';
 
@@ -32,7 +33,7 @@ export const receiptSchema = z.object({
 export type NativeTestReceipt = z.infer<typeof receiptSchema>;
 
 // The loader is a parameter because bundlers rewrite free require calls.
-async function nativeRunner(load: NodeJS.Require, settings: TestCommand & { nonce: string; copyDirectory: string; file: string; timeoutSeconds: number; maxCopyFiles: number; maxCopyBytes: number }) {
+async function nativeRunner(load: NodeJS.Require, settings: TestCommand & { nonce: string; copyDirectory: string; file: string; excludedPaths: string[]; timeoutSeconds: number; maxCopyFiles: number; maxCopyBytes: number }) {
   const fs = load('node:fs') as typeof import('node:fs');
   const crypto = load('node:crypto') as typeof import('node:crypto');
   const paths = load('node:path') as typeof import('node:path');
@@ -42,12 +43,18 @@ async function nativeRunner(load: NodeJS.Require, settings: TestCommand & { nonc
   let output = '';
   try {
     if (paths.relative(fs.realpathSync.native(settings.copyDirectory), fs.realpathSync.native(process.cwd())) !== '') throw new Error('Test working directory differs from the copy');
+    if (!Array.isArray(settings.excludedPaths)) throw new Error('Unsafe excluded test path');
+    for (const p of settings.excludedPaths) {
+      if (typeof p !== 'string' || paths.isAbsolute(p) || p.includes('\\') || /[\r\n\0]/.test(p) || /^[A-Za-z]:/.test(p) || p.split('/').some(part => !part || part === '.' || part === '..')) {
+        throw new Error('Unsafe excluded test path');
+      }
+    }
     gitDirectory = fs.mkdtempSync(paths.join(process.cwd(), '.black-gravity-test-snapshot-'));
     processes.execFileSync('git', ['-c', 'init.templateDir=', 'init', '--bare', '--quiet', gitDirectory]);
     fs.mkdirSync(paths.join(gitDirectory, 'info'), { recursive: true });
-    fs.appendFileSync(paths.join(gitDirectory, 'info', 'exclude'), '\n/' + settings.file + '\n/' + paths.basename(gitDirectory) + '/\n');
+    fs.appendFileSync(paths.join(gitDirectory, 'info', 'exclude'), '\n/' + settings.file + '\n/' + paths.basename(gitDirectory) + '/\n' + settings.excludedPaths.map(p => '/' + p + '\n').join(''));
     async function fingerprint() {
-      const list = processes.execFileSync('git', ['--git-dir=' + gitDirectory, '--work-tree=' + process.cwd(), 'ls-files', '--others', '--exclude-standard', '-z'], { maxBuffer: 10_000_000 }).toString('utf8').split('\0').filter(Boolean).sort();
+      const list = processes.execFileSync('git', ['--git-dir=' + gitDirectory, '--work-tree=' + process.cwd(), 'ls-files', '--others', '--exclude-standard', '-z'], { maxBuffer: 10_000_000 }).toString('utf8').split('\0').filter(Boolean).filter(p => !settings.excludedPaths.includes(p)).sort();
       if (list.length > settings.maxCopyFiles) throw new Error('Test snapshot file limit exceeded');
       const tree = crypto.createHash('sha256');
       let bytes = 0;
@@ -105,7 +112,8 @@ export async function prepareNativeTest(project: ProjectCopy, request: NativeTes
   const nonce = randomUUID();
   const file = '.black-gravity-test-' + nonce + '.cjs';
   const absolute = path.join(project.copyDirectory, file);
-  const script = '(' + nativeRunner.toString() + ')(require, ' + JSON.stringify({ executable: request.executable, args: request.args, nonce, file, copyDirectory: project.copyDirectory, ...settings }) + ');';
+  const excludedPaths = project.executionPolicy ? [] : [...AGENT_GUARD_PATHS];
+  const script = '(' + nativeRunner.toString() + ')(require, ' + JSON.stringify({ executable: request.executable, args: request.args, nonce, file, copyDirectory: project.copyDirectory, ...settings, excludedPaths }) + ');';
   const hash = createHash('sha256').update(script).digest('hex');
   const exclude = path.join(project.gitDirectory, 'info', 'exclude');
   await mkdir(path.dirname(exclude), { recursive: true });

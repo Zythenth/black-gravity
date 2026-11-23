@@ -23,8 +23,16 @@ import {
 } from './secret-preflight.js';
 import { normalizeSecretExceptionsPolicy } from './hardening-policy.js';
 import { hasOwnedPrefix } from './state-migration.js';
+import {
+  AGENT_GUARD_PATHS,
+  assertNoProtectedPatchPaths,
+  buildAgentGuardFiles,
+  isAgentConfigPath,
+  isProtectedPatchPath,
+} from './agent-config.js';
 
 export type { BlockedPath } from './secret-preflight.js';
+export { assertNoProtectedPatchPaths, isAgentConfigPath, isProtectedPatchPath };
 
 export interface ExecutionPolicyRequest { policy: ResolvedAgentPolicy; catalog: McpCatalogEntry[]; stateDirectory: string; executionId: string; readOnlyRoots?: readonly string[] }
 
@@ -175,6 +183,8 @@ function managedAuxiliarySet(project: ProjectCopy): Set<string> {
   );
   if (project.executionPolicy) {
     for (const file of EXECUTION_POLICY_PATHS) paths.add(file);
+  } else {
+    for (const file of AGENT_GUARD_PATHS) paths.add(file);
   }
   return paths;
 }
@@ -338,6 +348,7 @@ export async function enumerateGitCandidates(sourceDirectory: string): Promise<s
     ['check-ignore', '--no-index', '--stdin', '-z'], Buffer.from(candidates.join('\0') + '\0'), [0, 1])));
   return candidates.filter(file => {
     if (ignored.has(file)) return false;
+    if (isAgentConfigPath(file)) return false;
     const parts = file.split('/');
     if (parts.some(p => p === '.git')) return false;
     if (process.platform === 'win32' && parts.some(p => p.toLowerCase() === '.git' || /^git~\d+$/i.test(p))) return false;
@@ -454,12 +465,17 @@ export async function copyVerifiedFile(
 
 export async function createProjectCopy(sourceDirectory: string, includePaths?: string[], onCreated?: (project: ProjectCopy) => void, limits: ProjectLimits = DEFAULT_PROJECT_LIMITS, skills: readonly ProvidedSkill[] = [], execution?: ExecutionPolicyRequest): Promise<ProjectCopy> {
   const unignored = await enumerateGitCandidates(sourceDirectory);
-  if (!unignored.length) throw new BridgeError('ISOLATION_EMPTY', 'No eligible project files to copy');
 
   let candidatesToScan: string[];
   if (includePaths !== undefined) {
     if (!includePaths.length) throw new BridgeError('INVALID_INCLUDE_PATH', 'includePaths cannot be empty');
     const wanted = includePaths.map(validRelative);
+    for (const item of wanted) {
+      if (isAgentConfigPath(item)) {
+        throw new BridgeError('INVALID_INCLUDE_PATH', 'Agent configuration from the repository is never copied: ' + item);
+      }
+    }
+    if (!unignored.length) throw new BridgeError('ISOLATION_EMPTY', 'No eligible project files to copy');
     for (const item of wanted) {
       if (!unignored.some(file => file === item || file.startsWith(item + '/'))) {
         throw new BridgeError('INVALID_INCLUDE_PATH', 'No eligible file matches: ' + item);
@@ -467,6 +483,7 @@ export async function createProjectCopy(sourceDirectory: string, includePaths?: 
     }
     candidatesToScan = unignored.filter(file => wanted.some(item => file === item || file.startsWith(item + '/')));
   } else {
+    if (!unignored.length) throw new BridgeError('ISOLATION_EMPTY', 'No eligible project files to copy');
     candidatesToScan = unignored;
   }
 
@@ -944,6 +961,8 @@ export async function previewProjectCopy(project: ProjectCopy, limits: ProjectLi
       if (status === 'D' && !checked.baselinePaths.has(relative)) throw new BridgeError('CONTEXT_CHANGED', 'Unverified baseline deletion: ' + relative);
       files.push({ status, path: relative });
     }
+    // Refused with AGENT_CONFIG_IN_PATCH here, so integrateProjectCopy (which previews first) never touches .agents or .git in the original.
+    assertNoProtectedPatchPaths(files);
     const stats = new Map(splitNull(await snapshotGit(['diff', '--cached', '--no-ext-diff', '--no-textconv', '--numstat', '--no-renames', '-z', checked.baselineCommit, ...diffPathspec])).map(line => {
       const [added, removed, ...relative] = line.split('\t');
       return [relative.join('\t'), { insertions: added === '-' ? null : Number(added), deletions: removed === '-' ? null : Number(removed), binary: added === '-' }];
@@ -989,12 +1008,24 @@ export async function previewProjectCopy(project: ProjectCopy, limits: ProjectLi
 export async function verifyReadOnlyCopy(project: ProjectCopy, baseline: ReadonlyMap<string, string> = project.baseline): Promise<void> {
   await verifyManagedCopy(project);
   const expected = new Map([...baseline, ...(project.providedSkills ?? []).flatMap(skill => skill.files.map(file => [file.path, file.sha256] as [string, string])), ...(project.executionPolicy?.files ?? []).map(file => [file.path, file.sha256] as [string, string])]);
+  const guardExpected = project.executionPolicy
+    ? undefined
+    : new Map(buildAgentGuardFiles(project.copyDirectory, await realpath(project.copyDirectory), 'read-only').map(file => [
+        file.path as string,
+        createHash('sha256').update(file.content, 'utf8').digest('hex'),
+      ]));
   const seen = new Set<string>();
+  const seenGuard = new Set<string>();
   async function visit(directory: string, prefix = ''): Promise<void> {
     for (const entry of await readdir(directory, { withFileTypes: true })) {
       const relative = prefix + entry.name;
       if (entry.isDirectory()) await visit(path.join(directory, entry.name), relative + '/');
-      else {
+      else if (guardExpected?.has(relative)) {
+        seenGuard.add(relative);
+        if (!entry.isFile() || guardExpected.get(relative) !== await sha256File(path.join(directory, entry.name))) {
+          throw new BridgeError('READ_ONLY_VIOLATION', 'Read-only task changed the copy: ' + relative);
+        }
+      } else {
         seen.add(relative);
         if (!entry.isFile() || expected.get(relative) !== await sha256File(path.join(directory, entry.name))) {
           throw new BridgeError('READ_ONLY_VIOLATION', 'Read-only task changed the copy: ' + relative);
@@ -1003,6 +1034,11 @@ export async function verifyReadOnlyCopy(project: ProjectCopy, baseline: Readonl
     }
   }
   await visit(project.copyDirectory);
+  if (guardExpected && seenGuard.size !== guardExpected.size) {
+    for (const relative of guardExpected.keys()) if (!seenGuard.has(relative)) {
+      throw new BridgeError('READ_ONLY_VIOLATION', 'Read-only task deleted: ' + relative);
+    }
+  }
   for (const relative of expected.keys()) if (!seen.has(relative)) {
     throw new BridgeError('READ_ONLY_VIOLATION', 'Read-only task deleted: ' + relative);
   }
