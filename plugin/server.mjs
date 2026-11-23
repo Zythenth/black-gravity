@@ -60226,8 +60226,11 @@ if (command[0] === "wait") {
   let reportMaintenance2 = function(problem) {
     if (problem !== void 0)
       process.stderr.write(problem + "\n");
+  }, closeServer2 = function() {
+    clearInterval(cleanupTimer);
+    return serverClose ??= server.close();
   };
-  reportMaintenance = reportMaintenance2;
+  reportMaintenance = reportMaintenance2, closeServer = closeServer2;
   const loaded = loadConfig();
   const config2 = await migrateDefaultStateSettling(loaded, process.env, async (legacy) => {
     if (process.platform !== "win32" || loaded.testExecutor !== "windows-lpac")
@@ -60250,13 +60253,14 @@ if (command[0] === "wait") {
   }, 6e4);
   cleanupTimer.unref();
   let closing = false;
+  let serverClose;
   async function shutdown() {
     if (closing)
       return;
     closing = true;
     clearInterval(cleanupTimer);
     await tasks.shutdown();
-    await server.close();
+    await closeServer2();
   }
   process.on("SIGINT", () => {
     void shutdown();
@@ -60264,5 +60268,9 @@ if (command[0] === "wait") {
   process.on("SIGTERM", () => {
     void shutdown();
   });
+  process.on("SIGHUP", () => {
+    void closeServer2();
+  });
 }
 var reportMaintenance;
+var closeServer;

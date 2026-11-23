@@ -64,13 +64,19 @@ if (command[0] === 'wait') {
   cleanupTimer.unref();
 
   let closing = false;
+  let serverClose: Promise<void> | undefined;
+  function closeServer(): Promise<void> {
+    clearInterval(cleanupTimer);
+    return serverClose ??= server.close();
+  }
   async function shutdown() {
     if (closing) return;
     closing = true;
     clearInterval(cleanupTimer);
     await tasks.shutdown();
-    await server.close();
+    await closeServer();
   }
   process.on('SIGINT', () => { void shutdown(); });
   process.on('SIGTERM', () => { void shutdown(); });
+  process.on('SIGHUP', () => { void closeServer(); });
 }
