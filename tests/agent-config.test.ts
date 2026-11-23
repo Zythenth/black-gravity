@@ -1090,3 +1090,34 @@ test('T16: verifyReadOnlyCopy rejects with READ_ONLY_VIOLATION when both guard f
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 });
+
+test('T-OC: OpenCode configuration paths are protected patch paths while copy selection is unchanged', () => {
+  for (const protectedPath of [
+    'opencode.json',
+    'opencode.jsonc',
+    'sub/OpenCode.JSON',
+    '.opencode/plugins/x.js',
+    'a/.OPENCODE/agents/b.md',
+  ]) {
+    assert.equal(isProtectedPatchPath(protectedPath), true, `Expected protected path: ${protectedPath}`);
+  }
+  assert.equal(isProtectedPatchPath('OPENCO~1.JSO', 'win32'), true);
+  assert.equal(isProtectedPatchPath('OPENCO~1/x', 'win32'), true);
+
+  for (const safePath of [
+    'src/opencode-execution-adapter.ts',
+    'notes/opencode.md',
+    'opencode.json.bak',
+    'my.opencode/x',
+  ]) {
+    assert.equal(isProtectedPatchPath(safePath), false, `Expected non-protected path: ${safePath}`);
+  }
+
+  assert.equal(isAgentConfigPath('opencode.json'), false);
+  assert.equal(isAgentConfigPath('.opencode/x'), false);
+
+  assert.throws(
+    () => assertNoProtectedPatchPaths(['opencode.json']),
+    { code: 'AGENT_CONFIG_IN_PATCH' },
+  );
+});

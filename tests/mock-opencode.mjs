@@ -388,5 +388,137 @@ if (scenario === 'leak-escaped') {
   process.exit(0);
 }
 
+if (scenario === 'write-inside') {
+  writeFileSync(path.join(process.cwd(), 'created-by-opencode.txt'), 'opencode write fixture\n', 'utf8');
+  send({
+    type: 'tool_use',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      partID: 'prt_tool_1',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'tool',
+      id: 'call_1',
+      tool: 'write',
+      state: { status: 'completed', input: { path: 'created-by-opencode.txt' }, output: 'written', title: 'created-by-opencode.txt' },
+    },
+  });
+  send({
+    type: 'text',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      id: 'prt_text_1',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'text',
+      text: 'Created created-by-opencode.txt.',
+      time: { start: Date.now(), end: Date.now() },
+    },
+  });
+  emitStepFinish();
+  process.exit(0);
+}
+
+if (scenario === 'write-outside') {
+  writeFileSync(path.join(process.cwd(), 'partial.txt'), 'partial\n', 'utf8');
+  send({
+    type: 'tool_use',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      partID: 'prt_tool_1',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'tool',
+      id: 'call_1',
+      tool: 'write',
+      state: { status: 'completed', input: { path: 'partial.txt' }, output: 'written', title: 'partial.txt' },
+    },
+  });
+  send({
+    type: 'tool_use',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      partID: 'prt_tool_2',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'tool',
+      id: 'call_2',
+      tool: 'write',
+      state: { status: 'error', input: { path: '../outside-target.txt' }, error: 'Permission denied: external_directory' },
+    },
+  });
+  send({
+    type: 'tool_use',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      partID: 'prt_tool_3',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'tool',
+      id: 'call_3',
+      tool: 'shell',
+      state: {
+        status: 'error',
+        input: { command: 'touch ../outside-shell.txt' },
+        error: 'No tool named "shell" is currently available. Please use a tool from the available tool list.',
+      },
+    },
+  });
+  emitStepFinish();
+  process.exit(0);
+}
+
+if (scenario === 'write-config') {
+  writeFileSync(path.join(process.cwd(), 'opencode.json'), '{"plugins":["./evil.js"]}', 'utf8');
+  mkdirSync(path.join(process.cwd(), 'nested'), { recursive: true });
+  writeFileSync(path.join(process.cwd(), 'nested', 'opencode.jsonc'), '{}', 'utf8');
+  mkdirSync(path.join(process.cwd(), '.opencode', 'agents'), { recursive: true });
+  writeFileSync(path.join(process.cwd(), '.opencode', 'agents', 'evil.md'), 'planted', 'utf8');
+
+  const files = ['opencode.json', 'nested/opencode.jsonc', '.opencode/agents/evil.md'];
+  files.forEach((filePath, idx) => {
+    send({
+      type: 'tool_use',
+      timestamp: Date.now(),
+      sessionID,
+      part: {
+        partID: `prt_tool_${idx + 1}`,
+        sessionID,
+        messageID: 'msg_1',
+        type: 'tool',
+        id: `call_${idx + 1}`,
+        tool: 'write',
+        state: { status: 'completed', input: { path: filePath }, output: 'written', title: filePath },
+      },
+    });
+  });
+  emitStepFinish();
+  process.exit(0);
+}
+
+if (scenario === 'worktree-remove') {
+  send({
+    type: 'tool_use',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      partID: 'prt_tool_1',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'tool',
+      id: 'call_1',
+      tool: 'opencode_worktree_remove',
+      state: { status: 'completed', input: { directory: '/tmp/somewhere' }, output: 'removed', title: '/tmp/somewhere' },
+    },
+  });
+  emitStepFinish();
+  process.exit(0);
+}
+
 process.stderr.write(`Unknown mock scenario: ${scenario}\n`);
 process.exit(2);

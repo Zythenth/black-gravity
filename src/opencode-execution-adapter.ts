@@ -1,9 +1,11 @@
 /**
- * Read-only OpenCode CLI execution adapter (library-only; write mode, session lifecycle, and cancellation are later work).
+ * OpenCode CLI execution adapter (library-only; session lifecycle and cancellation are later work).
  * Runs `opencode` with `--standalone` so each invocation uses an isolated server and honors adapter environment variables.
+ * Write mode permits only file tools inside the isolated copy without an OS sandbox; shell commands, access outside
+ * the copy, and web tools are denied by OpenCode configuration, and tests run through the bridge test executor.
  * Never passes `--auto`, so any permission resolving to "ask" is auto-rejected in non-interactive runs and classified as
- * `EXECUTION_INCOMPLETE`. Inherited `OPENCODE_*` variables are stripped and project/Claude configs are neutralized via the
- * `OPENCODE_*` environment variables constructed below.
+ * `EXECUTION_INCOMPLETE`. Inherited `OPENCODE_*` variables are stripped, project/Claude configs are neutralized via the
+ * `OPENCODE_*` environment variables constructed below, and formatters and language servers are disabled in both modes.
  */
 import { spawn } from 'node:child_process';
 import { realpathSync } from 'node:fs';
@@ -23,9 +25,11 @@ import { LineParser } from './stream-parser.js';
 import { decodeJsonEscapes, redactDiagnostic, type RedactionState } from './subprocess.js';
 import { BridgeError } from './types.js';
 
-export const OPENCODE_ADAPTER_VERSION = '1';
+export const OPENCODE_ADAPTER_VERSION = '2';
 export const OPENCODE_READ_AGENT = 'black-gravity-read';
 export const OPENCODE_READ_TOOLS = ['read', 'glob', 'grep'] as const;
+export const OPENCODE_WRITE_AGENT = 'black-gravity-write';
+export const OPENCODE_WRITE_TOOLS = ['read', 'glob', 'grep', 'edit', 'write'] as const;
 
 const MAX_LINE_CHARS = 2_000_000;
 const MAX_RESPONSE_CHARS = 1_048_576;
@@ -39,6 +43,7 @@ const MODEL_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._:/
 const LISTED_MODEL_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*\/\S+$/;
 const VERSION_PATTERN = /^opencode v?(\S+)\s*$/m;
 const READ_TOOLS_SET: ReadonlySet<string> = new Set(OPENCODE_READ_TOOLS);
+const WRITE_TOOLS_SET: ReadonlySet<string> = new Set(OPENCODE_WRITE_TOOLS);
 
 export interface OpenCodePermissionRule {
   action: string;
@@ -53,23 +58,57 @@ export interface OpenCodeAdapterOptions {
   env?: NodeJS.ProcessEnv;
 }
 
-export function openCodeReadOnlyPermissions(): OpenCodePermissionRule[] {
+export function openCodeSecretReadRules(): OpenCodePermissionRule[] {
+  return [
+    { action: 'read', resource: '*.env', effect: 'deny' },
+    { action: 'read', resource: '*.env.*', effect: 'deny' },
+    { action: 'read', resource: '*.env.example', effect: 'allow' },
+    { action: 'read', resource: '*.env.sample', effect: 'allow' },
+    { action: 'read', resource: '*.env.template', effect: 'allow' },
+    { action: 'read', resource: '*.env.dist', effect: 'allow' },
+  ];
+}
+
+function buildOpenCodePermissions(writeRules: readonly OpenCodePermissionRule[] = []): OpenCodePermissionRule[] {
   return [
     { action: '*', resource: '*', effect: 'deny' },
     { action: 'read', resource: '*', effect: 'allow' },
     { action: 'glob', resource: '*', effect: 'allow' },
     { action: 'grep', resource: '*', effect: 'allow' },
+    ...writeRules,
+    { action: 'external_directory', resource: '*', effect: 'deny' },
+    ...openCodeSecretReadRules(),
   ];
 }
 
-export function openCodeConfigContent(): string {
+export function openCodeReadOnlyPermissions(): OpenCodePermissionRule[] {
+  return buildOpenCodePermissions();
+}
+
+export function openCodeWritePermissions(): OpenCodePermissionRule[] {
+  return buildOpenCodePermissions([
+    { action: 'edit', resource: '*', effect: 'allow' },
+    { action: 'edit', resource: '/*', effect: 'deny' },
+    { action: 'edit', resource: '?:*', effect: 'deny' },
+  ]);
+}
+
+export function openCodeConfigContent(mode: 'read-only' | 'write' = 'read-only'): string {
+  const isWrite = mode === 'write';
+  const permissions = isWrite ? openCodeWritePermissions() : openCodeReadOnlyPermissions();
+  const agent = isWrite ? OPENCODE_WRITE_AGENT : OPENCODE_READ_AGENT;
+  const description = isWrite
+    ? 'Black Gravity write executor confined to the isolated copy'
+    : 'Black Gravity read-only executor';
   return JSON.stringify({
-    permissions: openCodeReadOnlyPermissions(),
+    formatter: false,
+    lsp: false,
+    permissions,
     agents: {
-      [OPENCODE_READ_AGENT]: {
-        description: 'Black Gravity read-only executor',
+      [agent]: {
+        description,
         mode: 'primary',
-        permissions: openCodeReadOnlyPermissions(),
+        permissions,
       },
     },
   });
@@ -79,6 +118,7 @@ export function openCodeEnvironment(
   allowedEnvVars: readonly string[],
   source: NodeJS.ProcessEnv = process.env,
   platform: NodeJS.Platform = process.platform,
+  mode: 'read-only' | 'write' = 'read-only',
 ): NodeJS.ProcessEnv {
   const env = cliEnvironment(allowedEnvVars, source, platform);
   const isWindows = platform === 'win32';
@@ -91,7 +131,7 @@ export function openCodeEnvironment(
   env.OPENCODE_CONFIG_PROJECT_DISABLE = '1';
   env.OPENCODE_DISABLE_CLAUDE_CODE = '1';
   env.OPENCODE_DISABLE_AUTOUPDATE = '1';
-  env.OPENCODE_CONFIG_CONTENT = openCodeConfigContent();
+  env.OPENCODE_CONFIG_CONTENT = openCodeConfigContent(mode);
   return env;
 }
 
@@ -307,7 +347,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
 
   readonly capabilities: ExecutionCapabilities = Object.freeze({
     read: 'supported',
-    write: 'unsupported',
+    write: 'supported',
     sandbox: 'unsupported',
     network: 'unknown',
     skills: 'unsupported',
@@ -354,13 +394,22 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       throw new BridgeError('INVALID_MODEL', `Invalid OpenCode model identifier: ${redactDiagnostic(model).slice(0, 200)}`);
     }
 
+    const isWrite = request.mode === 'write';
+    const agent = isWrite ? OPENCODE_WRITE_AGENT : OPENCODE_READ_AGENT;
+    const allowedTools = isWrite ? WRITE_TOOLS_SET : READ_TOOLS_SET;
+
     const prefixArgs = this.options.prefixArgs ? [...this.options.prefixArgs] : [];
     const args = [
       ...prefixArgs,
-      'run', '--standalone', '--format', 'json', '--archived', '--agent', OPENCODE_READ_AGENT,
+      'run', '--standalone', '--format', 'json', '--archived', '--agent', agent,
       ...(model ? ['--model', model] : []),
     ];
-    const env = openCodeEnvironment(this.options.allowedEnvVars ?? [], this.options.env ?? process.env);
+    const env = openCodeEnvironment(
+      this.options.allowedEnvVars ?? [],
+      this.options.env ?? process.env,
+      process.platform,
+      request.mode,
+    );
     applySanitizedChildPath(env, request.workingDirectory);
     env.PWD = request.workingDirectory;
     const childSecrets = childEnvironmentSecrets(env);
@@ -456,7 +505,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
                   status: redactChild(status, childSecrets).slice(0, MAX_RAW_TOOL_FIELD_CHARS),
                 });
               }
-              if (!READ_TOOLS_SET.has(tool) || status !== 'completed') {
+              if (!allowedTools.has(tool) || status !== 'completed') {
                 const rawDetail = typeof state?.error === 'string' && state.error.trim()
                   ? state.error.trim()
                   : status;

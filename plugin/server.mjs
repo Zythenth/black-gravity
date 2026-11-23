@@ -33824,26 +33824,34 @@ var NODE_SHADOW_NAMES = [
   "node.cmd",
   "node.bat"
 ];
-function matchesProtectedSegment(segment, platform, includeGit) {
+function matchesProtectedSegment(segment, platform, includePatchOnly, isLast) {
   const lower = segment.toLowerCase();
-  if (lower === ".agents" || includeGit && lower === ".git")
+  if (lower === ".agents")
     return true;
+  if (includePatchOnly) {
+    if (lower === ".git" || lower === ".opencode")
+      return true;
+    if (isLast && (lower === "opencode.json" || lower === "opencode.jsonc"))
+      return true;
+  }
   if (platform !== "win32")
     return false;
-  return /^agents~\d+$/i.test(segment) || includeGit && /^git~\d+$/i.test(segment);
+  return /^agents~\d+$/i.test(segment) || includePatchOnly && (/^git~\d+$/i.test(segment) || /^openco~\d+(\..*)?$/i.test(segment) || /^op[0-9a-f]{4}~\d+(\..*)?$/i.test(segment));
 }
 function isAgentConfigPath(relative2, platform = process.platform) {
-  return relative2.split(/[\\/]/).some((segment) => matchesProtectedSegment(segment, platform, false));
+  const segments = relative2.split(/[\\/]/);
+  return segments.some((segment, index) => matchesProtectedSegment(segment, platform, false, index === segments.length - 1));
 }
 function isProtectedPatchPath(relative2, platform = process.platform) {
-  return relative2.split(/[\\/]/).some((segment) => matchesProtectedSegment(segment, platform, true));
+  const segments = relative2.split(/[\\/]/);
+  return segments.some((segment, index) => matchesProtectedSegment(segment, platform, true, index === segments.length - 1));
 }
 function assertNoProtectedPatchPaths(files) {
   const offending = files.map((entry2) => typeof entry2 === "string" ? entry2 : entry2.path).filter((entry2) => isProtectedPatchPath(entry2));
   if (offending.length === 0)
     return;
   const listed = offending.slice(0, 20).join(", ") + (offending.length > 20 ? ` and ${offending.length - 20} more` : "");
-  throw new BridgeError("AGENT_CONFIG_IN_PATCH", `Changes to protected paths (.agents or .git) cannot be previewed or integrated: ${listed}.`);
+  throw new BridgeError("AGENT_CONFIG_IN_PATCH", `Changes to protected paths (.agents, .git or OpenCode configuration) cannot be previewed or integrated: ${listed}.`);
 }
 async function guardHookMain(originalCopyRoot, canonicalCopyRoot, mode) {
   const fsp3 = await import("node:fs/promises");
@@ -59083,8 +59091,8 @@ var TaskManager = class {
         task2.editReceipts = void 0;
       assertPermanentDelivery(task2.options.craft, task2.project.providedSkills);
       await verifyCraftSelection(task2.options.craft);
-      const isReadOnly = record2.mode === "read-only";
-      const { result: execResult, styles, boms } = await this.runAgyStep(task2, native ? { ...task2.options, prompt: native.prompt } : task2.options, { prepareLf: !isReadOnly, convertLf: !isReadOnly && !native });
+      const isAgyWrite = this.executor instanceof AgyExecutionAdapter && record2.mode !== "read-only";
+      const { result: execResult, styles, boms } = await this.runAgyStep(task2, native ? { ...task2.options, prompt: native.prompt } : task2.options, { prepareLf: isAgyWrite, convertLf: isAgyWrite && !native });
       if (task2.termination) {
         this.finish(task2, task2.termination);
         return;
@@ -59320,9 +59328,10 @@ var TaskManager = class {
       delivered: this.permanentDeliveredSkills(task2.project.providedSkills),
       initListing: "not-observed"
     };
+    const isAgy = this.executor instanceof AgyExecutionAdapter;
     const { result: execResult, styles, boms } = await this.runAgyStep(task2, options, {
-      prepareLf: true,
-      convertLf: true,
+      prepareLf: isAgy,
+      convertLf: isAgy,
       repair: true
     });
     if (task2.termination)
@@ -59477,6 +59486,8 @@ var TaskManager = class {
     let boms;
     if (config2.prepareLf) {
       ({ styles, boms } = await this.prepareLfCopy(task2, config2.convertLf));
+    } else if (mode !== "read-only") {
+      await assertTextIsUtf8(project, await editableCopyFiles(project, this.config));
     }
     const controller = new AbortController();
     task2.executionAbort = controller;

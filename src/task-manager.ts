@@ -1840,11 +1840,11 @@ export class TaskManager {
       } else task.editReceipts = undefined;
       assertPermanentDelivery(task.options.craft, task.project.providedSkills);
       await verifyCraftSelection(task.options.craft!);
-      const isReadOnly = record.mode === 'read-only';
+      const isAgyWrite = this.executor instanceof AgyExecutionAdapter && record.mode !== 'read-only';
       const { result: execResult, styles, boms } = await this.runAgyStep(
         task,
         native ? { ...task.options, prompt: native.prompt } : task.options,
-        { prepareLf: !isReadOnly, convertLf: !isReadOnly && !native },
+        { prepareLf: isAgyWrite, convertLf: isAgyWrite && !native },
       );
       if (task.termination) {
         this.finish(task, task.termination);
@@ -2032,9 +2032,10 @@ export class TaskManager {
       delivered: this.permanentDeliveredSkills(task.project.providedSkills),
       initListing: 'not-observed',
     };
+    const isAgy = this.executor instanceof AgyExecutionAdapter;
     const { result: execResult, styles, boms } = await this.runAgyStep(task, options, {
-      prepareLf: true,
-      convertLf: true,
+      prepareLf: isAgy,
+      convertLf: isAgy,
       repair: true,
     });
     if (task.termination) return;
@@ -2163,6 +2164,8 @@ export class TaskManager {
     let boms: Set<string> | undefined;
     if (config.prepareLf) {
       ({ styles, boms } = await this.prepareLfCopy(task, config.convertLf));
+    } else if (mode !== 'read-only') {
+      await assertTextIsUtf8(project, await editableCopyFiles(project, this.config));
     }
     const controller = new AbortController();
     task.executionAbort = controller;

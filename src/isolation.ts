@@ -961,7 +961,7 @@ export async function previewProjectCopy(project: ProjectCopy, limits: ProjectLi
       if (status === 'D' && !checked.baselinePaths.has(relative)) throw new BridgeError('CONTEXT_CHANGED', 'Unverified baseline deletion: ' + relative);
       files.push({ status, path: relative });
     }
-    // Refused with AGENT_CONFIG_IN_PATCH here, so integrateProjectCopy (which previews first) never touches .agents or .git in the original.
+    // Refused with AGENT_CONFIG_IN_PATCH here, so integrateProjectCopy (which previews first) never touches .agents, .git or OpenCode configuration in the original.
     assertNoProtectedPatchPaths(files);
     const stats = new Map(splitNull(await snapshotGit(['diff', '--cached', '--no-ext-diff', '--no-textconv', '--numstat', '--no-renames', '-z', checked.baselineCommit, ...diffPathspec])).map(line => {
       const [added, removed, ...relative] = line.split('\t');

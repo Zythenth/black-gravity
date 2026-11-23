@@ -31,19 +31,30 @@ export interface AgentGuardFile {
   content: string;
 }
 
-function matchesProtectedSegment(segment: string, platform: NodeJS.Platform, includeGit: boolean): boolean {
+function matchesProtectedSegment(
+  segment: string,
+  platform: NodeJS.Platform,
+  includePatchOnly: boolean,
+  isLast: boolean,
+): boolean {
   const lower = segment.toLowerCase();
-  if (lower === '.agents' || (includeGit && lower === '.git')) return true;
+  if (lower === '.agents') return true;
+  if (includePatchOnly) {
+    if (lower === '.git' || lower === '.opencode') return true;
+    if (isLast && (lower === 'opencode.json' || lower === 'opencode.jsonc')) return true;
+  }
   if (platform !== 'win32') return false;
-  return /^agents~\d+$/i.test(segment) || (includeGit && /^git~\d+$/i.test(segment));
+  return /^agents~\d+$/i.test(segment) || (includePatchOnly && (/^git~\d+$/i.test(segment) || /^openco~\d+(\..*)?$/i.test(segment) || /^op[0-9a-f]{4}~\d+(\..*)?$/i.test(segment)));
 }
 
 export function isAgentConfigPath(relative: string, platform: NodeJS.Platform = process.platform): boolean {
-  return relative.split(/[\\/]/).some(segment => matchesProtectedSegment(segment, platform, false));
+  const segments = relative.split(/[\\/]/);
+  return segments.some((segment, index) => matchesProtectedSegment(segment, platform, false, index === segments.length - 1));
 }
 
 export function isProtectedPatchPath(relative: string, platform: NodeJS.Platform = process.platform): boolean {
-  return relative.split(/[\\/]/).some(segment => matchesProtectedSegment(segment, platform, true));
+  const segments = relative.split(/[\\/]/);
+  return segments.some((segment, index) => matchesProtectedSegment(segment, platform, true, index === segments.length - 1));
 }
 
 export function assertNoProtectedPatchPaths(files: ReadonlyArray<string | { path: string }>): void {
@@ -54,7 +65,7 @@ export function assertNoProtectedPatchPaths(files: ReadonlyArray<string | { path
   const listed = offending.slice(0, 20).join(', ') + (offending.length > 20 ? ` and ${offending.length - 20} more` : '');
   throw new BridgeError(
     'AGENT_CONFIG_IN_PATCH',
-    `Changes to protected paths (.agents or .git) cannot be previewed or integrated: ${listed}.`,
+    `Changes to protected paths (.agents, .git or OpenCode configuration) cannot be previewed or integrated: ${listed}.`,
   );
 }
 
