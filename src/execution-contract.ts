@@ -5,7 +5,7 @@ import type { BridgeMessage } from './messages.js';
 export type CapabilitySupport = 'supported' | 'unsupported' | 'unknown';
 export type ExecutionCapability =
   | 'read' | 'write' | 'sandbox' | 'network' | 'skills' | 'resources'
-  | 'structuredOutput' | 'cancel' | 'resume' | 'observableUsage';
+  | 'structuredOutput' | 'cancel' | 'resume' | 'observableUsage' | 'modelList';
 export type ExecutionCapabilities = Readonly<Partial<Record<ExecutionCapability, CapabilitySupport>>>;
 
 export function isCapabilitySupported(capabilities: ExecutionCapabilities, key: ExecutionCapability): boolean {
@@ -63,10 +63,16 @@ export type ExecutionResult = ExecutionResultFields & (
   | { readonly status: 'failed' | 'cancelled' | 'timeout'; readonly error: NonNullable<TaskRecord['error']> }
 );
 
+export interface ExecutionModel {
+  readonly id: string;
+}
+
 export interface ExecutionAdapter {
   readonly identity: ExecutionAdapterIdentity;
   readonly capabilities: ExecutionCapabilities;
   execute(request: ExecutionRequest): Promise<ExecutionResult>;
+  // Declares the model-listing capability for the new-model notice.
+  listModels?(): Promise<readonly ExecutionModel[]>;
 }
 
 // This checks advertised support only. It grants no permissions and does not validate provider output.

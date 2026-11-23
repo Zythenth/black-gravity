@@ -116,7 +116,7 @@ export function redactDiagnostic(value: string | undefined | null, state?: Redac
   return decodedRedacted === decoded ? redacted : decodedRedacted;
 }
 
-function decodeJsonEscapes(text: string): string {
+export function decodeJsonEscapes(text: string): string {
   return text.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) => String.fromCharCode(parseInt(hex, 16))).replace(/\\(["\\/])/g, '$1');
 }
 
