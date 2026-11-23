@@ -29,7 +29,7 @@ import { EventStore } from './event-store.js';
 import { assertManagedCopyPresent, assertTextIsUtf8, createProjectCopy, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, forkProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, clearLineEndingConversions, type ChangePreview, type ProjectCopy } from './isolation.js';
 import { BridgeError, type DeniedReads, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt, type TestEvidence } from './types.js';
 import { validatePrompt, validateRuntimeCacheSeparation, validateWorkingDirectory, validateStateSeparation } from './validation.js';
-import { processAlive, StateStore, StateStoreLinkError, stateDirectoryProblem } from './state-store.js';
+import { copyIdentity, copyLockName, processAlive, StateStore, StateStoreLinkError, stateDirectoryProblem, type QuarantineReason, type QuarantinedSnapshot } from './state-store.js';
 import { criteriaSchema, verifyCriteria, type ReviewEvidence } from './verification.js';
 import { prepareNativeTest, readNativeReceipt, readNativeSandboxError, testCommandSchema, type LocalNativeTestRequest, type LocalTestBackend, type NativeTestReceipt, type TestCommand } from './native-tests.js';
 import { textChunk } from './chunks.js';
@@ -63,6 +63,11 @@ function maintenanceErrorCode(error: unknown): string {
 
 interface InternalTask { publicResponses?: Map<number, string>; messageKeys?: Set<string>; responseChars?: number; messageBufferLimited?: boolean; messageLimitReported?: boolean; record: TaskRecord; options: RunOptions; ownerPid: number; owned?: boolean; project?: ProjectCopy; releaseProject?: () => void; completion?: Promise<void>; child?: ChildProcessWithoutNullStreams; nativeAbort?: AbortController; executionAbort?: AbortController; timer?: NodeJS.Timeout; termination?: 'cancelled' | 'timeout'; editReceipts?: { offset: number; pending: Map<string, ReceiptEdit[]>; ambiguous: Set<string> }; nativeTest?: { nonce: string; commandLine: string; attempts: Array<{ receipt: NativeTestReceipt; output: string }>; steps: Set<number>; failure?: BridgeError } }
 const terminal = new Set(['completed', 'failed', 'cancelled', 'timeout']);
+const DISCARDABLE_QUARANTINE_REASONS = new Set<QuarantineReason>([
+  'copy-outside-temporary-directory',
+  'source-mismatch',
+  'execution-policy-mismatch',
+]);
 
 function restoredEvents(stored: readonly BridgeEvent[]): BridgeEvent[] {
   // Earlier versions kept raw deltas, so a credential split across chunks is only visible in the joined original text of its step.
@@ -103,6 +108,7 @@ export class TaskManager {
   private readonly claimingMessages = new Set<string>();
   private readonly busyProjects = new Set<ProjectCopy>();
   private stateStore?: StateStore;
+  private quarantined = new Map<string, QuarantinedSnapshot>();
   private degraded = false;
   private degradedIssue?: ConfigurationIssue;
   private maintenanceIssue?: MaintenanceIssue;
@@ -140,6 +146,7 @@ export class TaskManager {
     this.degradedIssue = fromConfig ? undefined : { variable: 'BRIDGE_STATE_DIRECTORY', reason };
     this.stateStore = undefined;
     this.tasks.clear();
+    this.quarantined.clear();
     this.events = new EventStore(this.config.eventBufferSize, taskId => this.persist(taskId));
     this.nativeRecovery = Promise.resolve();
     this.nativeRecoveryError = undefined;
@@ -233,12 +240,49 @@ export class TaskManager {
   }
 
   private projectLock(project: ProjectCopy): string {
-    return 'copy-' + createHash('sha256').update(project.copyDirectory).digest('hex');
+    return copyLockName(project.copyDirectory);
+  }
+
+  private assertNotQuarantined(taskId: string): void {
+    const entry = this.quarantined.get(taskId);
+    if (entry) {
+      throw new BridgeError(
+        'TASK_QUARANTINED',
+        `Task ${taskId} is quarantined: ${entry.reason}. Discard it with black_gravity_discard; its recorded paths are not used.`,
+      );
+    }
+  }
+
+  private requireTask(taskId: string, notFoundMessage = `Unknown task: ${taskId}`): InternalTask {
+    const task = this.tasks.get(taskId);
+    if (task) return task;
+    this.assertNotQuarantined(taskId);
+    throw new BridgeError('TASK_NOT_FOUND', notFoundMessage);
+  }
+
+  private hasQuarantinedCopySibling(project: Pick<ProjectCopy, 'copyDirectory' | 'gitDirectory'>): boolean {
+    const copyId = copyIdentity(project.copyDirectory);
+    const gitId = copyIdentity(project.gitDirectory);
+    for (const entry of this.quarantined.values()) {
+      for (const hint of entry.copyHints) {
+        const hintId = copyIdentity(hint);
+        if (hintId === copyId || hintId === gitId) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
 
   private refresh(): void {
     this.assertStateDirectoryUsable();
-    const stored = this.state.load();
+    const { tasks: stored, quarantined } = this.state.loadWithQuarantine();
+    const ownedIds = new Set([...this.tasks.values()].filter(task => task.owned).map(task => task.record.taskId));
+    this.quarantined = new Map(
+      quarantined
+        .filter(entry => !ownedIds.has(entry.taskId))
+        .map(entry => [entry.taskId, entry]),
+    );
     const projects = new Map([...this.tasks.values()].filter(task => task.project && (task.owned || this.busyProjects.has(task.project))).map(task => [task.project!.copyDirectory, task.project!]));
     const ids = new Set(stored.map(task => task.record.taskId));
     for (const [id, task] of this.tasks) if (!ids.has(id) && !task.owned && !this.busyProjects.has(task.project!)) {
@@ -547,6 +591,7 @@ export class TaskManager {
       }
       const resumeSource = resumeTaskId ? this.tasks.get(resumeTaskId) : undefined;
       if (resumeTaskId) {
+        if (!resumeSource) this.assertNotQuarantined(resumeTaskId);
         if (!resumeSource?.project || !resumeSource.record.sessionId || resumeSource.record.workingDirectory !== workingDirectory ||
           (resumeSource.record.status !== 'completed' && resumeSource.record.error?.code !== 'TEST_FAILED') || resumeSource.record.integratedAt) {
           throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
@@ -554,6 +599,7 @@ export class TaskManager {
         options.sessionId = resumeSource.record.sessionId;
       }
       const contextSource = options.contextTaskId ? this.tasks.get(options.contextTaskId) : undefined;
+      if (options.contextTaskId && !contextSource) this.assertNotQuarantined(options.contextTaskId);
       if (options.contextTaskId && (options.sessionId || !contextSource?.project || contextSource.record.status !== 'completed' ||
         contextSource.record.integratedAt || contextSource.record.workingDirectory !== workingDirectory)) {
         throw new BridgeError('INVALID_CONTEXT', 'Context requires a completed, retained, non-integrated task in the same project; use a new session');
@@ -576,6 +622,7 @@ export class TaskManager {
       const budgetGroup = options.groupAdmission ?? previous?.record.group;
       if (budgetGroup) this.checkGroupBudget(budgetGroup.groupId);
       if (previous?.project && this.busyProjects.has(previous.project)) throw new BridgeError('TASK_NOT_READY', 'The copy is being reviewed or removed');
+      if (previous?.project && this.hasQuarantinedCopySibling(previous.project)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
       if (previous && !previous.record.agentPolicy && this.config.enforceAgentPolicy) throw new BridgeError('AGENT_POLICY_CHANGED', 'This legacy session has no enforced policy; start a new task under the configured human ceiling');
       if (previous && (options.allowedTools !== undefined || options.mcpServers !== undefined)) throw new BridgeError('INVALID_AGENT_POLICY', 'Resume retains its original tool policy; use a new task to select different tools');
       if (previous && options.includePaths !== undefined) throw new BridgeError('INVALID_INCLUDE_PATH', 'A resumed task reuses its original file selection');
@@ -708,8 +755,10 @@ export class TaskManager {
       if (previous) {
         // Integration and discard do not hold the registry lock and may have ended during the awaits above; the copy lock now keeps them out.
         this.refresh();
+        if (resumeTaskId && !this.tasks.has(resumeTaskId)) this.assertNotQuarantined(resumeTaskId);
         previous = this.tasks.get(previous.record.taskId);
         if (!previous?.project || previous.record.integratedAt) throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+        if (this.hasQuarantinedCopySibling(previous.project)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
       }
       if (this.tasks.size >= this.config.maxRetainedTasks) {
         const oldestFinished = [...this.tasks.values()].find(task => terminal.has(task.record.status) && task !== contextSource && !this.hasPendingInbox(task.record) && !(options.sourceMessage && task === previous));
@@ -760,8 +809,7 @@ export class TaskManager {
   status(taskId: string): TaskRecord {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task = this.tasks.get(taskId);
-    if (!task) throw new BridgeError('TASK_NOT_FOUND', `Unknown task: ${taskId}`);
+    const task = this.requireTask(taskId);
     return { ...task.record, tokenUsage: taskTokenUsage(task.record) };
   }
 
@@ -769,6 +817,27 @@ export class TaskManager {
     this.assertStateDirectoryUsable();
     this.refresh();
     return [...this.tasks.values()].map(task => ({ ...task.record, tokenUsage: taskTokenUsage(task.record) }));
+  }
+
+  quarantinedTasks(): Array<{ taskId: string; reason: QuarantineReason }> {
+    this.assertStateDirectoryUsable();
+    this.refresh();
+    return this.lastQuarantinedTasks();
+  }
+
+  lastQuarantinedTasks(): Array<{ taskId: string; reason: QuarantineReason }> {
+    if (this.degraded) return [];
+    return [...this.quarantined.values()].map(({ taskId, reason }) => ({ taskId, reason }));
+  }
+
+  currentQuarantinedTasks(): Array<{ taskId: string; reason: QuarantineReason }> {
+    if (!this.isStateDirectoryUsable()) return this.lastQuarantinedTasks();
+    try {
+      this.refresh();
+    } catch {
+      return this.lastQuarantinedTasks();
+    }
+    return this.lastQuarantinedTasks();
   }
 
   usage(filters: { taskId?: string; sessionId?: string; model?: string } = {}) {
@@ -803,8 +872,7 @@ export class TaskManager {
   readStructuredResult(taskId: string, offset = 0, limit = 10000, expectedContentSha256?: string) {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task = this.tasks.get(taskId);
-    if (!task) throw new BridgeError('TASK_NOT_FOUND', `Unknown task: ${taskId}`);
+    const task = this.requireTask(taskId);
     if (task.record.status !== 'completed') {
       throw new BridgeError('TASK_NOT_READY', 'Structured result requires a completed task');
     }
@@ -820,8 +888,7 @@ export class TaskManager {
   listArtifacts(taskId: string) {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task = this.tasks.get(taskId);
-    if (!task) throw new BridgeError('TASK_NOT_FOUND', `Unknown task: ${taskId}`);
+    const task = this.requireTask(taskId);
     if (task.record.status !== 'completed') {
       throw new BridgeError('TASK_NOT_READY', 'Artifacts require a completed task');
     }
@@ -834,8 +901,7 @@ export class TaskManager {
   async readArtifact(taskId: string, artifactPath: string, expectedSha256: string, offset = 0, limit = 65536) {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task = this.tasks.get(taskId);
-    if (!task) throw new BridgeError('TASK_NOT_FOUND', `Unknown task: ${taskId}`);
+    const task = this.requireTask(taskId);
     if (task.record.status !== 'completed' || !task.project || task.record.discardedAt) {
       throw new BridgeError('TASK_NOT_READY', 'Reading artifacts requires a completed task with a retained copy');
     }
@@ -854,6 +920,7 @@ export class TaskManager {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task = this.tasks.get(taskId);
+    if (!task) this.assertNotQuarantined(taskId);
     if (!task?.project || !terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Wait for the task before reading its patch');
     return this.withProject(task.project, async () => {
       const selected = relative?.replaceAll('\\', '/');
@@ -877,6 +944,7 @@ export class TaskManager {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task = this.tasks.get(taskId);
+    if (!task) this.assertNotQuarantined(taskId);
     if (!task || !task.project || !terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Wait for an isolated task to finish');
     return this.withProject(task.project, async () => {
       const preview = await previewProjectCopy(task.project!, this.config);
@@ -893,6 +961,7 @@ export class TaskManager {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task = this.tasks.get(taskId);
+    if (!task) this.assertNotQuarantined(taskId);
     if (!task?.project || task.record.status !== 'completed' || task.record.integratedAt) throw new BridgeError('INVALID_CONTEXT', 'Context requires a completed, non-integrated task with a retained copy');
     return this.withProject(task.project, async () => ({
       taskId, treeSha256: await fingerprintProjectCopy(task.project!, this.config),
@@ -998,6 +1067,7 @@ export class TaskManager {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task = this.tasks.get(taskId);
+    if (!task) this.assertNotQuarantined(taskId);
     if (!task?.project || !terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Wait for the task before verification');
     return this.withProject(task.project, async () => {
       const preview = await previewProjectCopy(task.project!, this.config);
@@ -1129,6 +1199,7 @@ export class TaskManager {
     try {
       this.refresh();
       const current = this.tasks.get(sourceTaskId);
+      if (!current) this.assertNotQuarantined(sourceTaskId);
       const isCompleted = current?.record.status === 'completed';
       const isTestFailed = current?.record.status === 'failed' && current?.record.error?.code === 'TEST_FAILED';
       const isLocalExecutorFailure = current?.record.status === 'failed' && current?.record.error?.code !== 'TEST_FAILED' && current?.record.usageProvenance === 'local-executor';
@@ -1142,6 +1213,7 @@ export class TaskManager {
         throw new BridgeError('TASK_NOT_READY', 'Run tests from the latest retained task for this isolated copy');
       }
       if (this.busyProjects.has(current.project)) throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
+      if (this.hasQuarantinedCopySibling(current.project)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
       const currentPreview = await this.preview(sourceTaskId, false);
       if (currentPreview.sha256 !== nativeTest.expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Copy changed while tests were queued');
       if (this.queue.length >= this.config.maxQueuedTasks && this.active >= this.config.maxConcurrentTasks) throw new BridgeError('QUEUE_FULL', 'Task queue is full');
@@ -1185,6 +1257,7 @@ export class TaskManager {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task = this.tasks.get(taskId);
+    if (!task) this.assertNotQuarantined(taskId);
     if (!task?.project || !terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Wait for the task before recording tests');
     if (!command.trim() || command.length > 1000 || !Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255 || output.length > 4000) {
       throw new BridgeError('INVALID_TEST_EVIDENCE', 'Invalid command, exit code or output size');
@@ -1200,6 +1273,9 @@ export class TaskManager {
   }
 
   private async withProject<T>(project: ProjectCopy, operation: () => Promise<T>): Promise<T> {
+    if (this.hasQuarantinedCopySibling(project)) {
+      throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+    }
     if (this.busyProjects.has(project) || [...this.tasks.values()].some(task => task.project === project && !terminal.has(task.record.status))) {
       throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
     }
@@ -1213,7 +1289,33 @@ export class TaskManager {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task = this.tasks.get(taskId);
-    if (!task) throw new BridgeError('TASK_NOT_FOUND', `Unknown task: ${taskId}`);
+    if (!task) {
+      const quarantined = this.quarantined.get(taskId);
+      if (!quarantined) throw new BridgeError('TASK_NOT_FOUND', `Unknown task: ${taskId}`);
+      if (!DISCARDABLE_QUARANTINE_REASONS.has(quarantined.reason)) {
+        throw new BridgeError(
+          'TASK_QUARANTINED',
+          `Task ${taskId} is quarantined: ${quarantined.reason}. This snapshot cannot be repaired by the bridge and must be removed from the state directory by its owner.`,
+        );
+      }
+      if (!quarantined.fingerprint) {
+        throw new BridgeError('STATE_BUSY', 'Quarantined task snapshot has no recorded digest; retry');
+      }
+      const release = this.state.acquire('registry');
+      try {
+        this.state.discardQuarantinedProject(taskId, quarantined.fingerprint);
+        this.refresh();
+        const reloaded = this.tasks.get(taskId);
+        if (!reloaded) throw new BridgeError('TASK_NOT_FOUND', `Unknown task: ${taskId}`);
+        const hadPendingInbox = Boolean(reloaded.record.inbox?.length || reloaded.record.dispatching);
+        this.failPendingInbox(undefined, reloaded, 'cancelled', 'COPY_DISCARDED');
+        this.recoverInboxClaims(true);
+        if (hadPendingInbox) this.persist(taskId);
+        return { ...reloaded.record, tokenUsage: taskTokenUsage(reloaded.record) };
+      } finally {
+        release();
+      }
+    }
     if (!terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Cancel and wait for the task before discarding');
     if (task.project) {
       const project = task.project;
@@ -1237,7 +1339,7 @@ export class TaskManager {
     // discard() reloads the state, which replaces the copy objects of tasks this server does not run, so each copy is looked up again by directory.
     for (const copyDirectory of new Set([...this.tasks.values()].flatMap(task => task.project ? [task.project.copyDirectory] : []))) {
       const related = [...this.tasks.values()].filter(task => task.project?.copyDirectory === copyDirectory);
-      if (!related.length || related.some(task => this.busyProjects.has(task.project!) || !terminal.has(task.record.status))) continue;
+      if (!related.length || related.some(task => this.hasQuarantinedCopySibling(task.project!) || this.busyProjects.has(task.project!) || !terminal.has(task.record.status))) continue;
       const latest = Math.max(...related.map(task => Date.parse(task.record.completedAt || task.record.createdAt)));
       if (now - latest < this.config.copyRetentionHours * 3600000) continue;
       await this.discard(related[0]!.record.taskId);
@@ -1272,6 +1374,7 @@ export class TaskManager {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task = this.tasks.get(taskId);
+    if (!task) this.assertNotQuarantined(taskId);
     if (!task || !task.project || task.record.status !== 'completed') throw new BridgeError('TASK_NOT_READY', 'Only completed tasks can be integrated');
     if (task.record.integratedAt) throw new BridgeError('ALREADY_INTEGRATED', 'This task was already integrated');
     if (task.record.mode === 'read-only') throw new BridgeError('READ_ONLY_TASK', 'Read-only tasks cannot be integrated');
@@ -1351,8 +1454,7 @@ export class TaskManager {
     try {
       this.refresh();
       this.recoverInboxClaims(true);
-      const task = this.tasks.get(taskId);
-      if (!task) throw new BridgeError('TASK_NOT_FOUND', 'Unknown task: ' + taskId);
+      const task = this.requireTask(taskId);
       const existing = task.record.inbox?.find(item => item.messageId === messageId);
       if (existing && (existing.text !== text || JSON.stringify(existing.peerOrigin) !== JSON.stringify(peerOrigin))) throw new BridgeError('MESSAGE_ID_CONFLICT', 'This message ID already identifies different text or origin');
       if (peerOrigin && (!existing || existing.receipt.state === 'queued')) this.assertPeerInput(task.record, text, peerOrigin);
@@ -1539,8 +1641,7 @@ export class TaskManager {
     const release = this.state.acquire('registry');
     try {
       this.refresh();
-      const task = this.tasks.get(taskId);
-      if (!task) throw new BridgeError('TASK_NOT_FOUND', 'Unknown task: ' + taskId);
+      const task = this.requireTask(taskId);
       if (!task.owned && !terminal.has(task.record.status)) throw new BridgeError('TASK_OWNED_BY_OTHER_SERVER', 'Change delivery in the bridge that owns the running task');
       task.record.deliveryMode = deliveryMode;
       task.options.deliveryMode = deliveryMode;
@@ -1628,8 +1729,7 @@ export class TaskManager {
   async cancel(taskId: string): Promise<TaskRecord> {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task = this.tasks.get(taskId);
-    if (!task) throw new BridgeError('TASK_NOT_FOUND', `Unknown task: ${taskId}`);
+    const task = this.requireTask(taskId);
     if (terminal.has(task.record.status)) return this.status(taskId);
     if (!task.owned) throw new BridgeError('TASK_OWNED_BY_OTHER_SERVER', 'Cancel the task in the bridge process that started it');
     // A task already taken by pump() is still marked queued until it starts; it is cancelled through its termination flag instead.
@@ -2530,6 +2630,10 @@ export class TaskManager {
 
   // A copy whose processes may still run cannot be reused; another observation may confirm they ended.
   private async assertProcessesReconciled(record: TaskRecord): Promise<void> {
+    const existing = this.tasks.get(record.taskId);
+    if (existing?.project && this.hasQuarantinedCopySibling(existing.project)) {
+      throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+    }
     const cleanup = record.processCleanup;
     if (!cleanup) return;
     if (!cleanup.verified) {
@@ -2541,7 +2645,11 @@ export class TaskManager {
     // conversion record happens under the copy's lock, so ownership is checked again while holding it.
     const task = this.tasks.get(record.taskId);
     const project = task?.project;
-    if (!project || (await readLineEndingConversions(project))?.taskId !== record.taskId) return;
+    if (!project) return;
+    if (this.hasQuarantinedCopySibling(project)) {
+      throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+    }
+    if ((await readLineEndingConversions(project))?.taskId !== record.taskId) return;
     if (this.busyProjects.has(project) || [...this.tasks.values()].some(other => other.project === project && !terminal.has(other.record.status))) {
       throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
     }
@@ -2549,6 +2657,9 @@ export class TaskManager {
     let release: (() => void) | undefined;
     try {
       release = this.state.acquire(this.projectLock(project));
+      if (this.hasQuarantinedCopySibling(project)) {
+        throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+      }
       if ((await readLineEndingConversions(project))?.taskId === record.taskId) await this.restoreLineEndings(task!);
     } finally { release?.(); this.busyProjects.delete(project); }
   }

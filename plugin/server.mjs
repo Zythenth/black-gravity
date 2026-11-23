@@ -47449,74 +47449,11 @@ var EMPTY_COMPLETION_RESULT = {
   }
 };
 
-// dist/src/handoff.js
-var decisionsSchema = external_exports.array(external_exports.string().min(1).max(2e3)).max(20);
-var handoffSchema = external_exports.object({
-  sourceTaskId: external_exports.string().uuid(),
-  sourceRole: roleSchema,
-  sourceModel: external_exports.string().nullable(),
-  treeSha256: external_exports.string().regex(/^[a-f0-9]{64}$/),
-  patchSha256: external_exports.string().regex(/^[a-f0-9]{64}$/),
-  decisions: external_exports.object({ source: external_exports.literal("client-reported"), items: decisionsSchema }).strict(),
-  files: external_exports.array(external_exports.string().min(1).max(1e3)).max(1e4),
-  acceptanceCriteria: external_exports.array(criterionSchema).max(100),
-  reports: external_exports.array(external_exports.object({
-    taskId: external_exports.string().uuid(),
-    role: external_exports.enum(["planner", "reviewer"]),
-    data: external_exports.union([plannerReportSchema, reviewerReportSchema])
-  }).strict()).max(8),
-  tests: external_exports.array(external_exports.object({
-    command: external_exports.string(),
-    exitCode: external_exports.number().int(),
-    source: external_exports.enum(["client-reported", "agy-tool", "windows-executor", "linux-executor"]),
-    sha256: external_exports.string(),
-    stale: external_exports.boolean()
-  }).strict()).max(20)
-}).strict();
-
-// dist/src/comparison.js
-var comparisonModelsSchema = external_exports.array(external_exports.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/)).min(2).max(4).refine((models) => new Set(models).size === models.length, "Choose distinct model IDs");
-var comparisonSchema = external_exports.object({
-  comparisonId: external_exports.string().uuid(),
-  sourceTaskId: external_exports.string().uuid(),
-  treeSha256: external_exports.string().regex(/^[a-f0-9]{64}$/),
-  models: comparisonModelsSchema,
-  startErrors: external_exports.array(external_exports.object({ model: external_exports.string(), code: external_exports.string(), message: external_exports.string() }).strict())
-}).strict();
-var comparisonFindingSchema = external_exports.object({
-  path: external_exports.string(),
-  line: external_exports.number().int().positive(),
-  quote: external_exports.string(),
-  agreement: external_exports.enum(["identical", "different", "not-reported-by-all"]),
-  opinions: external_exports.array(external_exports.object({ model: external_exports.string(), finding: reviewerReportSchema.shape.findings.element }).strict()),
-  notReportedBy: external_exports.array(external_exports.string())
-}).strict();
-function compareFindings(tasks, models) {
-  const groups = /* @__PURE__ */ new Map();
-  const valid = tasks.filter((task2) => task2.status === "completed" && task2.report?.role === "reviewer");
-  for (const task2 of valid) {
-    if (task2.report?.role !== "reviewer" || !task2.model)
-      continue;
-    for (const finding of task2.report.data.findings) {
-      const key = JSON.stringify([finding.path, finding.line, finding.quote]);
-      const group = groups.get(key) ?? [];
-      group.push({ model: task2.model, finding });
-      groups.set(key, group);
-    }
-  }
-  return [...groups.values()].map((opinions) => {
-    const { path: path29, line, quote } = opinions[0].finding;
-    const notReportedBy = models.filter((model) => !opinions.some((opinion) => opinion.model === model));
-    return {
-      path: path29,
-      line,
-      quote,
-      opinions,
-      notReportedBy,
-      agreement: notReportedBy.length ? "not-reported-by-all" : new Set(opinions.map((opinion) => JSON.stringify(opinion.finding))).size === 1 ? "identical" : "different"
-    };
-  });
-}
+// dist/src/state-store.js
+import { createHash as createHash19, randomUUID as randomUUID8 } from "node:crypto";
+import { closeSync as closeSync3, lstatSync as lstatSync4, mkdirSync as mkdirSync4, openSync as openSync3, readFileSync as readFileSync3, readdirSync as readdirSync3, realpathSync as realpathSync4, renameSync as renameSync3, rmSync as rmSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import path18 from "node:path";
+import os7 from "node:os";
 
 // dist/src/sandbox-policy.js
 import { createHash as createHash18 } from "node:crypto";
@@ -47785,6 +47722,909 @@ async function resolveSandboxSelection(policy, value, sourceDirectory, stateDire
     throw new BridgeError("SANDBOX_PERMISSION_DENIED", "Requested permissions exceed the globally authorized sandbox policy");
   }
   return { readPaths, writePaths, network, childProcesses, maxOutputChars };
+}
+
+// dist/src/state-store.js
+var uuid3 = /^[a-f0-9-]{36}$/;
+var canonicalUuidSchema = external_exports.string().uuid();
+var SANITIZED_CACHE_VERSION = 1;
+var maxSandboxPolicyFileBytes = 2 * 20 * 1e3 * 6 + 4096;
+var modelSelectionSchema = external_exports.object({ version: external_exports.literal(1), model: external_exports.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/).nullable() }).strict();
+var integrationApprovalRootSchema = external_exports.string().min(1).max(1e3).refine((root) => !root.includes("\0") && path18.isAbsolute(root) && path18.resolve(root) === root && root !== path18.parse(root).root && (process.platform !== "win32" || root === root.toLowerCase()));
+var integrationApprovalsSchema = external_exports.object({ version: external_exports.literal(1), roots: external_exports.array(integrationApprovalRootSchema).max(20) }).strict();
+var blockedMetadataSchema = external_exports.object({
+  path: external_exports.string(),
+  reason: external_exports.enum(["SECRET_FILE", "SECRET_CONTENT", "SECRET_EXCLUSION", "UNSAFE_PATH"])
+}).strict();
+var executionIdentitySchema = external_exports.object({
+  provider: external_exports.string().min(1).max(128),
+  adapterId: external_exports.string().min(1).max(128),
+  adapterVersion: external_exports.string().min(1).max(128),
+  requested: external_exports.object({
+    model: external_exports.string().min(1).max(256).nullable(),
+    effort: effortSchema.nullable()
+  }).strict(),
+  observed: external_exports.object({
+    model: external_exports.string().min(1).max(256).nullable(),
+    status: external_exports.enum(["observed", "not-observable"])
+  }).strict()
+}).strict();
+var snapshotSchema = external_exports.object({
+  version: external_exports.literal(1),
+  ownerPid: external_exports.number().int().positive(),
+  record: external_exports.object({
+    taskId: external_exports.string().uuid(),
+    workingDirectory: external_exports.string(),
+    prompt: external_exports.string(),
+    status: external_exports.enum(["queued", "starting", "running", "streaming", "completed", "failed", "cancelled", "timeout"]),
+    createdAt: external_exports.string().datetime(),
+    completedAt: external_exports.string().datetime().optional(),
+    pid: external_exports.number().int().positive().optional(),
+    mode: external_exports.enum(["write", "read-only"]).optional(),
+    integratedAt: external_exports.string().datetime().optional(),
+    discardedAt: external_exports.string().datetime().optional(),
+    usageIsResume: external_exports.boolean().optional(),
+    usageBaseline: usageCountersSchema.optional(),
+    lastObservedCliUsage: usageCountersSchema.optional(),
+    usageProvenance: external_exports.literal("local-executor").optional(),
+    deliveryMode: deliveryModeSchema.optional(),
+    messages: external_exports.array(persistedBridgeMessageSchema).max(100).optional(),
+    messageCursor: external_exports.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
+    effort: effortSchema.optional(),
+    execution: executionIdentitySchema.optional(),
+    roleDefinition: roleDefinitionSchema.optional(),
+    providedSkills: stagedSkillsSchema.optional(),
+    agentPolicyReceipt: external_exports.object({ sha256: external_exports.string().regex(/^[a-f0-9]{64}$/), decisionCount: external_exports.number().int().nonnegative(), deniedCount: external_exports.number().int().nonnegative(), deniedReadCount: external_exports.number().int().nonnegative().optional() }).strict().optional(),
+    deniedReads: external_exports.object({
+      total: external_exports.number().int().nonnegative(),
+      items: external_exports.array(external_exports.object({
+        toolName: external_exports.string().max(128),
+        path: external_exports.string().max(1e3).optional(),
+        reason: external_exports.string().max(500)
+      }).strict()).max(50)
+    }).strict().optional(),
+    peerRequests: external_exports.array(external_exports.lazy(() => peerMessageInputSchema)).max(20).optional(),
+    peerRequestsTruncated: external_exports.boolean().optional(),
+    group: external_exports.lazy(() => groupAssignmentSchema).optional(),
+    memory: external_exports.array(external_exports.lazy(() => memorySummarySchema)).max(8).optional(),
+    agentPolicy: resolvedAgentPolicySchema.optional(),
+    outputSchema: external_exports.record(external_exports.string(), external_exports.unknown()).optional(),
+    artifactPaths: external_exports.array(external_exports.string().min(1).max(1e3)).min(1).max(100).optional(),
+    structuredResult: external_exports.object({ value: external_exports.unknown(), sha256: external_exports.string().regex(/^[a-f0-9]{64}$/) }).strict().optional(),
+    artifacts: external_exports.array(external_exports.object({ path: external_exports.string().min(1).max(1e3), sha256: external_exports.string().regex(/^[a-f0-9]{64}$/), bytes: external_exports.number().int().nonnegative() }).strict()).max(100).optional(),
+    continuationTaskId: external_exports.string().uuid().optional(),
+    parentTaskId: external_exports.string().uuid().optional(),
+    sourceMessage: external_exports.object({ taskId: external_exports.string().uuid(), messageId: external_exports.string().uuid() }).strict().optional(),
+    dispatching: external_exports.object({ messageId: external_exports.string().uuid(), continuationTaskId: external_exports.string().uuid().optional(), ownerId: external_exports.string().uuid().optional() }).strict().optional(),
+    inbox: external_exports.array(external_exports.object({
+      peerOrigin: external_exports.lazy(() => peerOriginSchema).optional(),
+      messageId: external_exports.string().uuid(),
+      taskId: external_exports.string().uuid(),
+      text: external_exports.string().min(1).max(2e3),
+      receivedAt: external_exports.string().datetime(),
+      receipt: external_exports.object({
+        messageId: external_exports.string().uuid(),
+        taskId: external_exports.string().uuid(),
+        state: external_exports.enum(["queued", "sent", "failed", "cancelled"]),
+        continuationTaskId: external_exports.string().uuid().optional(),
+        error: external_exports.object({ code: external_exports.string(), message: external_exports.string() }).strict().optional()
+      }).strict()
+    }).strict()).max(20).optional()
+  }).passthrough(),
+  options: external_exports.object({
+    peerContext: external_exports.lazy(() => peerContextSchema).optional(),
+    peerOrigin: external_exports.lazy(() => peerOriginSchema).optional(),
+    group: external_exports.lazy(() => groupAssignmentSchema).optional(),
+    memory: external_exports.lazy(() => memorySelectionSchema).optional(),
+    memorySnapshots: external_exports.lazy(() => memorySnapshotsSchema).optional(),
+    allowedTools: nativeToolsSchema.optional(),
+    mcpServers: mcpSelectionSchema.optional(),
+    agentPolicy: resolvedAgentPolicySchema.optional(),
+    prompt: external_exports.string(),
+    workingDirectory: external_exports.string(),
+    effort: effortSchema.optional(),
+    roleDefinition: roleDefinitionSchema.optional(),
+    outputSchema: external_exports.record(external_exports.string(), external_exports.unknown()).optional(),
+    artifactPaths: external_exports.array(external_exports.string().min(1).max(1e3)).min(1).max(100).optional()
+  }).passthrough(),
+  project: external_exports.object({
+    executionPolicy: stagedExecutionPolicySchema.optional(),
+    executionStateDirectory: external_exports.string().optional(),
+    sourceDirectory: external_exports.string(),
+    copyDirectory: external_exports.string(),
+    gitDirectory: external_exports.string(),
+    baseline: external_exports.array(external_exports.tuple([external_exports.string(), external_exports.string().regex(/^[a-f0-9]{64}$/)])),
+    includedFiles: external_exports.array(external_exports.string()),
+    providedSkills: stagedSkillsSchema.optional(),
+    blockedFiles: external_exports.array(blockedMetadataSchema).optional(),
+    modelProofFailure: external_exports.string().max(2e3).optional()
+  }).optional(),
+  events: external_exports.array(external_exports.object({ taskId: external_exports.string().uuid(), sequence: external_exports.number().int().positive(), timestamp: external_exports.string(), type: external_exports.string(), data: external_exports.unknown(), raw: external_exports.unknown().optional(), rawIsData: external_exports.literal(true).optional(), rawEnvelope: external_exports.string().min(1).max(64).optional() }).refine((event) => [event.raw !== void 0, event.rawIsData !== void 0, event.rawEnvelope !== void 0].filter(Boolean).length <= 1 && event.rawEnvelope !== "event")),
+  cursor: external_exports.number().int().nonnegative(),
+  // Written by versions that redact before persisting; older state is sanitized when restored.
+  redacted: external_exports.literal(true).optional()
+});
+var QUARANTINE_REASONS = [
+  "unsafe-file",
+  "unreadable",
+  "invalid-snapshot",
+  "identity-mismatch",
+  "messages-mismatch",
+  "inbox-mismatch",
+  "group-mismatch",
+  "memory-mismatch",
+  "tool-policy-mismatch",
+  "copy-outside-temporary-directory",
+  "source-mismatch",
+  "execution-policy-mismatch"
+];
+var SnapshotRejection = class extends BridgeError {
+  reason;
+  fingerprint;
+  copyHints;
+  rawError;
+  constructor(reason, message, fingerprint, copyHints = [], rawError) {
+    super("INVALID_STATE", message);
+    this.reason = reason;
+    this.fingerprint = fingerprint;
+    this.copyHints = copyHints;
+    this.rawError = rawError;
+    this.name = "SnapshotRejection";
+  }
+};
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function extractCopyHints(raw) {
+  if (!isRecord(raw))
+    return [];
+  const project = isRecord(raw.project) ? raw.project : void 0;
+  const record2 = isRecord(raw.record) ? raw.record : void 0;
+  const candidates = [project?.copyDirectory, project?.gitDirectory, record2?.copyDirectory];
+  const hints = [];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.length >= 1 && candidate.length <= 4096 && !hints.includes(candidate)) {
+      hints.push(candidate);
+    }
+  }
+  return hints;
+}
+function copyIdentity(directory, platform = process.platform) {
+  if (platform === "win32") {
+    const backslash = directory.replaceAll("/", "\\");
+    const stripped = backslash.replace(/^(?:\\\\[?.]|\\\?\?)\\UNC\\/i, "\\\\").replace(/^(?:\\\\[?.]|\\\?\?)\\(?=[A-Za-z]:)/, "");
+    return path18.win32.resolve(stripped).toLowerCase();
+  }
+  return path18.posix.resolve(directory);
+}
+function copyLockName(copyDirectory, platform = process.platform) {
+  return "copy-" + createHash19("sha256").update(copyIdentity(copyDirectory, platform)).digest("hex");
+}
+function processAlive2(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error62) {
+    return error62.code !== "ESRCH";
+  }
+}
+function retryTransient(action) {
+  const delays = [10, 20, 40, 80, 160];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      action();
+      return;
+    } catch (error62) {
+      const code = error62.code;
+      if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(code ?? "") || attempt >= delays.length)
+        throw error62;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delays[attempt]);
+    }
+  }
+}
+function assertReplaceable(target) {
+  retryTransient(() => {
+    try {
+      closeSync3(openSync3(target, "r+"));
+    } catch (error62) {
+      if (error62.code !== "ENOENT")
+        throw error62;
+    }
+  });
+}
+function replaceStateFile2(temporary, target) {
+  retryTransient(() => renameSync3(temporary, target));
+}
+function removeCachedFile(file3) {
+  try {
+    if (lstatSync4(file3).isFile())
+      rmSync3(file3, { force: true });
+  } catch {
+  }
+}
+function compactEvent(event) {
+  if (event.raw === void 0)
+    return { ...event };
+  const { raw, ...rest } = event;
+  const serializedRaw = JSON.stringify(raw);
+  if (serializedRaw === JSON.stringify(event.data))
+    return { ...rest, rawIsData: true };
+  const name = raw && typeof raw === "object" && !Array.isArray(raw) && typeof raw.event === "string" ? raw.event : void 0;
+  if (name && name !== "event" && name.length <= 64 && serializedRaw === JSON.stringify({ event: name, [name]: event.data })) {
+    return { ...rest, rawEnvelope: name };
+  }
+  return { ...event };
+}
+function expandEvent(event) {
+  const { rawIsData, rawEnvelope, raw, ...rest } = event;
+  const rebuiltRaw = rawIsData ? structuredClone(event.data) : rawEnvelope !== void 0 ? { event: rawEnvelope, [rawEnvelope]: structuredClone(event.data) } : raw;
+  return rebuiltRaw === void 0 ? rest : { ...rest, raw: rebuiltRaw };
+}
+function stateDirectoryProblem(directory) {
+  const validation = validateStateDirectory(directory);
+  if (!validation.valid)
+    return validation.reason;
+  try {
+    const stat4 = lstatSync4(directory);
+    if (stat4.isSymbolicLink())
+      return "link";
+    if (!stat4.isDirectory())
+      return "not-directory";
+  } catch (error62) {
+    if (error62.code !== "ENOENT")
+      return "unusable";
+  }
+  return void 0;
+}
+var StateStoreLinkError = class extends BridgeError {
+  constructor(message = "State directory cannot be a link") {
+    super("INVALID_STATE_DIRECTORY", message);
+    this.name = "StateStoreLinkError";
+  }
+};
+var StateStore = class {
+  directory;
+  constructor(directory) {
+    this.directory = directory;
+    const problem = stateDirectoryProblem(directory);
+    if (problem) {
+      if (problem === "link")
+        throw new StateStoreLinkError();
+      const message = problem === "not-directory" ? "State directory must be a directory" : problem === "unusable" ? "State directory is unusable" : problem === "invalid-entry" ? "BRIDGE_STATE_DIRECTORY is invalid" : "BRIDGE_STATE_DIRECTORY must be absolute";
+      throw new BridgeError("INVALID_STATE_DIRECTORY", message);
+    }
+    mkdirSync4(directory, { recursive: true, mode: 448 });
+    const stat4 = lstatSync4(directory);
+    if (stat4.isSymbolicLink()) {
+      throw new StateStoreLinkError();
+    }
+    if (!stat4.isDirectory()) {
+      throw new BridgeError("INVALID_STATE_DIRECTORY", "State directory must be a directory");
+    }
+  }
+  probeWritable() {
+    readdirSync3(this.directory);
+    const probeFile = path18.join(this.directory, ".startup-probe-" + randomUUID8());
+    writeFileSync4(probeFile, "", { flag: "wx", mode: 384 });
+    rmSync3(probeFile);
+  }
+  file(taskId) {
+    if (!uuid3.test(taskId))
+      throw new BridgeError("INVALID_STATE", "Invalid persisted task ID");
+    return path18.join(this.directory, taskId + ".json");
+  }
+  readIntegrationRoots() {
+    const variable = "integration-approvals.json";
+    const file3 = path18.join(this.directory, "integration-approvals.json");
+    let stat4;
+    try {
+      stat4 = lstatSync4(file3);
+    } catch (error62) {
+      if (error62.code === "ENOENT")
+        return { roots: [], issues: [] };
+      return { roots: [], issues: [{ variable, reason: mapFsError(error62) }] };
+    }
+    if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.nlink !== 1 || stat4.size > 128 * 1024) {
+      return { roots: [], issues: [{ variable, reason: "unsafe-file" }] };
+    }
+    let content;
+    try {
+      content = readFileSync3(file3, "utf8");
+    } catch (error62) {
+      if (error62.code === "ENOENT")
+        return { roots: [], issues: [] };
+      return { roots: [], issues: [{ variable, reason: mapFsError(error62) }] };
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      return { roots: [], issues: [{ variable, reason: "invalid-json" }] };
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return { roots: [], issues: [{ variable, reason: "invalid-format" }] };
+    }
+    const obj = parsed;
+    const keys2 = Object.keys(obj);
+    if (keys2.length !== 2 || !Object.hasOwn(obj, "version") || !Object.hasOwn(obj, "roots") || obj.version !== 1 || !Array.isArray(obj.roots)) {
+      return { roots: [], issues: [{ variable, reason: "invalid-format" }] };
+    }
+    if (obj.roots.length > 20) {
+      return { roots: [], issues: [{ variable, reason: "too-many-entries" }] };
+    }
+    const roots = [];
+    const issues = [];
+    for (let i = 0; i < obj.roots.length; i++) {
+      const result = integrationApprovalRootSchema.safeParse(obj.roots[i]);
+      if (!result.success) {
+        issues.push({ variable, index: i, reason: "invalid-entry" });
+      } else {
+        roots.push(result.data);
+      }
+    }
+    return { roots, issues };
+  }
+  loadIntegrationRoots() {
+    const result = this.readIntegrationRoots();
+    if (result.issues.length > 0) {
+      throw new BridgeError("INVALID_STATE", "Invalid persisted integration approvals");
+    }
+    return result.roots;
+  }
+  rememberIntegrationRoot(directory) {
+    const canonical = preauthorizedIntegrationRoots(JSON.stringify([directory]))[0];
+    const release = this.acquire("integration-approvals");
+    const target = path18.join(this.directory, "integration-approvals.json");
+    const temporary = target + "." + randomUUID8() + ".tmp";
+    try {
+      const roots = this.loadIntegrationRoots();
+      if (roots.includes(canonical))
+        return;
+      const snapshot = integrationApprovalsSchema.parse({ version: 1, roots: [...roots, canonical] });
+      writeFileSync4(temporary, JSON.stringify(snapshot), { flag: "wx", mode: 384, flush: true });
+      replaceStateFile2(temporary, target);
+    } finally {
+      rmSync3(temporary, { force: true });
+      release();
+    }
+  }
+  loadModel() {
+    const file3 = path18.join(this.directory, "model-selection.json");
+    try {
+      const stat4 = lstatSync4(file3);
+      if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.size > 1024)
+        throw new Error("Unsafe model selection");
+      return modelSelectionSchema.parse(JSON.parse(readFileSync3(file3, "utf8")));
+    } catch (error62) {
+      if (error62.code === "ENOENT")
+        return void 0;
+      throw new BridgeError("INVALID_STATE", "Invalid persisted model selection");
+    }
+  }
+  loadSandboxPolicy() {
+    const file3 = path18.join(this.directory, "sandbox-policy.json");
+    try {
+      const stat4 = lstatSync4(file3);
+      if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.size > maxSandboxPolicyFileBytes)
+        throw new Error("Unsafe sandbox policy");
+      return parseSandboxPolicySnapshot(JSON.parse(readFileSync3(file3, "utf8")));
+    } catch (error62) {
+      if (error62.code === "ENOENT") {
+        const policy = sandboxPolicySchema.parse({});
+        return { version: 1, policy, sha256: sandboxPolicyDigest(policy) };
+      }
+      throw new BridgeError("INVALID_STATE", "Invalid persisted sandbox policy");
+    }
+  }
+  saveSandboxPolicy(snapshot) {
+    let validated;
+    try {
+      validated = parseSandboxPolicySnapshot(snapshot);
+    } catch {
+      throw new BridgeError("INVALID_STATE", "Invalid sandbox policy snapshot");
+    }
+    const target = path18.join(this.directory, "sandbox-policy.json");
+    const temporary = target + "." + randomUUID8() + ".tmp";
+    try {
+      this.loadSandboxPolicy();
+      writeFileSync4(temporary, JSON.stringify(validated), { flag: "wx", mode: 384, flush: true });
+      replaceStateFile2(temporary, target);
+    } finally {
+      rmSync3(temporary, { force: true });
+    }
+  }
+  saveModel(model) {
+    const selection = modelSelectionSchema.parse({ version: 1, model });
+    const release = this.acquire("model-selection");
+    const target = path18.join(this.directory, "model-selection.json");
+    const temporary = target + "." + randomUUID8() + ".tmp";
+    try {
+      this.loadModel();
+      writeFileSync4(temporary, JSON.stringify(selection), { flag: "wx", mode: 384, flush: true });
+      replaceStateFile2(temporary, target);
+    } finally {
+      rmSync3(temporary, { force: true });
+      release();
+    }
+  }
+  save(task2) {
+    this.writeSnapshot(this.file(task2.record.taskId), task2);
+  }
+  formatSnapshot(task2, preserveRedacted) {
+    const snapshot = { ...task2, version: 1, events: task2.events.map(compactEvent), project: task2.project && { ...task2.project, baseline: [...task2.project.baseline] } };
+    if (!preserveRedacted)
+      snapshot.redacted = true;
+    else if (task2.redacted !== true)
+      delete snapshot.redacted;
+    delete snapshot.fingerprint;
+    return JSON.stringify(snapshot);
+  }
+  serializeSnapshot(task2) {
+    return this.formatSnapshot(task2, false);
+  }
+  // Renames across files cannot be atomic, so a failed rename can leave a prefix of
+  // entries published, and callers must order entries so that the next startup can finish the rest.
+  saveBatch(entries2, onPublished) {
+    const targets = entries2.map((entry2) => {
+      const target = this.file(entry2.taskId);
+      assertReplaceable(target);
+      return target;
+    });
+    const temporaries = [];
+    try {
+      const staged = [];
+      for (let i = 0; i < entries2.length; i++) {
+        const target = targets[i];
+        const temporary = target + "." + randomUUID8() + ".tmp";
+        temporaries.push(temporary);
+        writeFileSync4(temporary, entries2[i].content, { flag: "wx", mode: 384, flush: true });
+        staged.push({ temporary, target, taskId: entries2[i].taskId });
+      }
+      for (const { temporary, target, taskId } of staged) {
+        replaceStateFile2(temporary, target);
+        onPublished(taskId);
+      }
+    } finally {
+      for (const temporary of temporaries) {
+        try {
+          rmSync3(temporary, { force: true });
+        } catch {
+        }
+      }
+    }
+  }
+  writeSnapshot(target, task2, preserveRedacted = false) {
+    const temporary = target + "." + randomUUID8() + ".tmp";
+    try {
+      writeFileSync4(temporary, this.formatSnapshot(task2, preserveRedacted), { flag: "wx", mode: 384, flush: true });
+      replaceStateFile2(temporary, target);
+    } finally {
+      rmSync3(temporary, { force: true });
+    }
+  }
+  loadSnapshotFile(file3, name, selfRealpath, migrationOrigin) {
+    let stat4;
+    try {
+      stat4 = lstatSync4(file3);
+    } catch (error62) {
+      if (error62.code === "ENOENT")
+        return void 0;
+      throw new SnapshotRejection("unreadable", "Unreadable persisted task: " + name, void 0, [], error62);
+    }
+    if (stat4.isSymbolicLink() || !stat4.isFile() || stat4.size > 7e7) {
+      throw new SnapshotRejection("unsafe-file", "Unsafe persisted task file");
+    }
+    let text;
+    try {
+      text = readFileSync3(file3, "utf8");
+    } catch (error62) {
+      if (error62.code === "ENOENT")
+        return void 0;
+      throw new SnapshotRejection("unreadable", "Invalid persisted task: " + name);
+    }
+    const fingerprint = createHash19("sha256").update(text).digest("hex");
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new SnapshotRejection("invalid-snapshot", "Invalid persisted task: " + name, fingerprint);
+    }
+    const copyHints = extractCopyHints(parsed);
+    let data;
+    try {
+      data = snapshotSchema.parse(parsed);
+    } catch {
+      throw new SnapshotRejection("invalid-snapshot", "Invalid persisted task: " + name, fingerprint, copyHints);
+    }
+    if (data.record.taskId + ".json" !== name || !path18.isAbsolute(data.record.workingDirectory) || data.options.workingDirectory !== data.record.workingDirectory || data.options.prompt !== data.record.prompt || data.events.some((event) => event.taskId !== data.record.taskId || event.sequence > data.cursor)) {
+      throw new SnapshotRejection("identity-mismatch", "Persisted task does not match its identity", fingerprint, copyHints);
+    }
+    const messages = data.record.messages ?? [];
+    if (messages.some((message, index) => message.taskId !== data.record.taskId || message.sequence > (data.record.messageCursor ?? 0) || index > 0 && messages[index - 1].sequence >= message.sequence)) {
+      throw new SnapshotRejection("messages-mismatch", "Persisted messages do not match task identity or cursor", fingerprint, copyHints);
+    }
+    const inbox = data.record.inbox ?? [];
+    if (new Set(inbox.map((item) => item.messageId.toLowerCase())).size !== inbox.length || inbox.some((item) => item.taskId !== data.record.taskId || item.receipt.taskId !== data.record.taskId || item.receipt.messageId !== item.messageId) || data.record.dispatching && !inbox.some((item) => item.messageId === data.record.dispatching.messageId && item.receipt.state === "queued")) {
+      throw new SnapshotRejection("inbox-mismatch", "Persisted inbox does not match task identity", fingerprint, copyHints);
+    }
+    if (JSON.stringify(data.record.group) !== JSON.stringify(data.options.group)) {
+      throw new SnapshotRejection("group-mismatch", "Persisted group assignment differs from task options", fingerprint, copyHints);
+    }
+    if ((data.record.peerRequests || data.options.peerContext || data.options.peerOrigin) && !data.record.group) {
+      throw new SnapshotRejection("group-mismatch", "Peer state requires group membership", fingerprint, copyHints);
+    }
+    if (data.options.peerContext && (data.options.peerContext.groupId.toLowerCase() !== data.record.group.groupId.toLowerCase() || data.options.peerContext.nodeKey !== data.record.group.nodeKey)) {
+      throw new SnapshotRejection("group-mismatch", "Peer context differs from task group", fingerprint, copyHints);
+    }
+    if (data.options.peerOrigin && (!data.record.sourceMessage || data.options.peerOrigin.groupId.toLowerCase() !== data.record.group.groupId.toLowerCase())) {
+      throw new SnapshotRejection("group-mismatch", "Peer input differs from its continuation", fingerprint, copyHints);
+    }
+    const snapshots = data.options.memorySnapshots;
+    if (snapshots?.some((entry2) => entry2.projectId !== computeProjectId(data.record.workingDirectory)) || JSON.stringify(data.record.memory) !== JSON.stringify(summarizeMemory(snapshots)) || JSON.stringify(data.options.memory) !== JSON.stringify(snapshots?.map(({ specialist, sha256 }) => ({ specialist, sha256 })))) {
+      throw new SnapshotRejection("memory-mismatch", "Persisted private memory differs from its project, hashes or metadata", fingerprint, copyHints);
+    }
+    if (data.record.agentPolicy?.sha256 !== data.options.agentPolicy?.sha256) {
+      throw new SnapshotRejection("tool-policy-mismatch", "Persisted task tool policies disagree", fingerprint, copyHints);
+    }
+    if (data.project) {
+      for (const [directory, kind2] of [[data.project.copyDirectory, "copy"], [data.project.gitDirectory, "baseline"]]) {
+        if (!path18.isAbsolute(directory) || path18.relative(os7.tmpdir(), path18.dirname(directory)) !== "" || !hasOwnedPrefix(path18.basename(directory), kind2)) {
+          throw new SnapshotRejection("copy-outside-temporary-directory", "Persisted copy is outside bridge temporary storage", fingerprint, copyHints);
+        }
+      }
+      if (data.project.sourceDirectory !== data.record.workingDirectory) {
+        throw new SnapshotRejection("source-mismatch", "Persisted source differs from task", fingerprint, copyHints);
+      }
+      if (Boolean(data.project.executionPolicy) !== Boolean(data.project.executionStateDirectory) || data.project.executionPolicy && data.project.executionPolicy.policy.sha256 !== data.record.agentPolicy?.sha256 || data.project.executionStateDirectory && !this.tryOwnsExecutionState(data.project.executionStateDirectory, selfRealpath, migrationOrigin)) {
+        throw new SnapshotRejection("execution-policy-mismatch", "Persisted execution policy differs from task or private storage", fingerprint, copyHints);
+      }
+    }
+    try {
+      return {
+        ...data,
+        events: data.events.map(expandEvent),
+        fingerprint,
+        record: data.record,
+        options: data.options,
+        project: data.project && { ...data.project, baseline: new Map(data.project.baseline) }
+      };
+    } catch {
+      throw new SnapshotRejection("invalid-snapshot", "Invalid persisted task: " + name, fingerprint, copyHints);
+    }
+  }
+  // With a source, only that file is read, validated as the snapshot the task file name would hold.
+  load(source) {
+    const names = source ? [source.name] : readdirSync3(this.directory).filter((name) => uuid3.test(name.slice(0, -5)) && name.endsWith(".json"));
+    const selfRealpath = realpathSync4.native(this.directory);
+    const migrationOrigin = readMigrationMarker(this.directory)?.source;
+    const tasks = [];
+    for (const name of names) {
+      const file3 = source?.file ?? path18.join(this.directory, name);
+      try {
+        const task2 = this.loadSnapshotFile(file3, name, selfRealpath, migrationOrigin);
+        if (task2)
+          tasks.push(task2);
+      } catch (error62) {
+        if (error62 instanceof SnapshotRejection) {
+          if (error62.rawError !== void 0)
+            throw error62.rawError;
+          throw new BridgeError("INVALID_STATE", error62.message);
+        }
+        throw error62;
+      }
+    }
+    return tasks.sort((a, b) => a.record.createdAt.localeCompare(b.record.createdAt));
+  }
+  loadWithQuarantine() {
+    const names = readdirSync3(this.directory).filter((name) => {
+      if (!name.endsWith(".json"))
+        return false;
+      const stem = name.slice(0, -5);
+      return stem === stem.toLowerCase() && canonicalUuidSchema.safeParse(stem).success;
+    });
+    const selfRealpath = realpathSync4.native(this.directory);
+    const migrationOrigin = readMigrationMarker(this.directory)?.source;
+    const tasks = [];
+    const quarantined = [];
+    for (const name of names) {
+      const file3 = path18.join(this.directory, name);
+      try {
+        const task2 = this.loadSnapshotFile(file3, name, selfRealpath, migrationOrigin);
+        if (task2)
+          tasks.push(task2);
+      } catch (error62) {
+        if (error62 instanceof SnapshotRejection) {
+          quarantined.push({
+            taskId: name.slice(0, -5),
+            reason: error62.reason,
+            ...error62.fingerprint !== void 0 ? { fingerprint: error62.fingerprint } : {},
+            copyHints: error62.copyHints
+          });
+        } else {
+          throw error62;
+        }
+      }
+    }
+    return {
+      tasks: tasks.sort((a, b) => a.record.createdAt.localeCompare(b.record.createdAt)),
+      quarantined: quarantined.sort((a, b) => a.taskId.localeCompare(b.taskId))
+    };
+  }
+  readQuarantinedForDiscard(file3, expectedFingerprint) {
+    let stat4;
+    try {
+      stat4 = lstatSync4(file3);
+    } catch (error62) {
+      if (error62.code === "ENOENT") {
+        throw new BridgeError("STATE_BUSY", "Quarantined task snapshot disappeared before discard");
+      }
+      throw error62;
+    }
+    if (stat4.isSymbolicLink() || !stat4.isFile() || stat4.size > 7e7) {
+      throw new BridgeError("STATE_BUSY", "Quarantined task snapshot changed before discard");
+    }
+    let text;
+    try {
+      text = readFileSync3(file3, "utf8");
+    } catch (error62) {
+      if (error62.code === "ENOENT") {
+        throw new BridgeError("STATE_BUSY", "Quarantined task snapshot disappeared before discard");
+      }
+      throw new BridgeError("STATE_BUSY", "Quarantined task snapshot could not be read for discard");
+    }
+    const fingerprint = createHash19("sha256").update(text).digest("hex");
+    if (fingerprint !== expectedFingerprint) {
+      throw new BridgeError("STATE_BUSY", "Quarantined task snapshot changed before discard");
+    }
+    let data;
+    try {
+      data = snapshotSchema.parse(JSON.parse(text));
+    } catch {
+      throw new BridgeError("STATE_BUSY", "Quarantined task snapshot changed before discard");
+    }
+    if (data.ownerPid !== process.pid && processAlive2(data.ownerPid)) {
+      throw new BridgeError("TASK_OWNED_BY_OTHER_SERVER", "Discard the task in the bridge process that owns it");
+    }
+    if (!["completed", "failed", "cancelled", "timeout"].includes(data.record.status)) {
+      throw new BridgeError("TASK_NOT_READY", "Cancel and wait for the task before discarding");
+    }
+    return data;
+  }
+  discardQuarantinedProject(taskId, expectedFingerprint) {
+    const file3 = this.file(taskId);
+    let data = this.readQuarantinedForDiscard(file3, expectedFingerprint);
+    const lockNames = [...new Set([data.project?.copyDirectory, data.record.copyDirectory].filter((value) => typeof value === "string" && value.length > 0).map((directory) => copyLockName(directory)))].sort();
+    const releases = [];
+    try {
+      for (const lockName of lockNames) {
+        releases.push(this.acquire(lockName));
+      }
+      if (releases.length > 0) {
+        data = this.readQuarantinedForDiscard(file3, expectedFingerprint);
+      }
+      const record2 = { ...data.record, discardedAt: (/* @__PURE__ */ new Date()).toISOString() };
+      const updated = {
+        record: record2,
+        options: data.options,
+        ownerPid: data.ownerPid,
+        events: data.events.map(expandEvent),
+        cursor: data.cursor,
+        ...data.redacted ? { redacted: true } : {}
+      };
+      this.writeSnapshot(file3, updated, true);
+      return updated;
+    } finally {
+      while (releases.length > 0)
+        releases.pop()();
+    }
+  }
+  // Sanitized copies of legacy snapshots are cached per source file version; the source file itself is left to its writers.
+  /** Tasks carried over by the migration keep their receipts in the root they were created in. */
+  ownsExecutionState(directory, selfRealpath, migrationOrigin) {
+    if (migrationOrigin && samePath(directory, migrationOrigin))
+      return true;
+    return path18.relative(realpathSync4.native(directory), selfRealpath) === "";
+  }
+  tryOwnsExecutionState(directory, selfRealpath, migrationOrigin) {
+    try {
+      return this.ownsExecutionState(directory, selfRealpath, migrationOrigin);
+    } catch {
+      return false;
+    }
+  }
+  sanitizedDirectory() {
+    const directory = path18.join(this.directory, "sanitized");
+    mkdirSync4(directory, { recursive: true, mode: 448 });
+    if (lstatSync4(directory).isSymbolicLink() || !lstatSync4(directory).isDirectory())
+      throw new BridgeError("INVALID_STATE", "Sanitized state cache must be a real directory");
+    return directory;
+  }
+  sanitizedFile(taskId, fingerprint) {
+    if (!uuid3.test(taskId) || !/^[a-f0-9]{64}$/.test(fingerprint))
+      throw new BridgeError("INVALID_STATE", "Invalid sanitized state key");
+    return path18.join(this.sanitizedDirectory(), taskId + "-" + fingerprint + ".v" + SANITIZED_CACHE_VERSION + ".json");
+  }
+  loadSanitized(taskId, fingerprint) {
+    let file3;
+    try {
+      file3 = this.sanitizedFile(taskId, fingerprint);
+      const [cached2] = this.load({ file: file3, name: taskId + ".json" });
+      return cached2?.redacted ? cached2 : void 0;
+    } catch {
+      if (file3)
+        removeCachedFile(file3);
+      return void 0;
+    }
+  }
+  saveSanitized(task2, fingerprint) {
+    const target = this.sanitizedFile(task2.record.taskId, fingerprint);
+    this.writeSnapshot(target, task2);
+    this.dropSanitized(task2.record.taskId, target);
+  }
+  dropSanitized(taskId, keep) {
+    const directory = this.sanitizedDirectory();
+    for (const name of readdirSync3(directory)) {
+      const file3 = path18.join(directory, name);
+      if (name.startsWith(taskId + "-") && !name.endsWith(".tmp") && file3 !== keep)
+        removeCachedFile(file3);
+    }
+  }
+  drop(taskId) {
+    rmSync3(this.file(taskId), { force: true });
+    try {
+      this.dropSanitized(taskId);
+    } catch {
+    }
+  }
+  acquire(name) {
+    if (!/^[a-zA-Z0-9-]+$/.test(name))
+      throw new BridgeError("INVALID_STATE", "Invalid lock name");
+    const file3 = path18.join(this.directory, name + ".lock"), token = randomUUID8();
+    const root = lstatSync4(this.directory, { bigint: true });
+    const busy = () => new BridgeError("STATE_BUSY", "Another operation owns this task or copy, or its lock cannot be verified");
+    const checkRoot = () => {
+      const current = lstatSync4(this.directory, { bigint: true });
+      if (current.isSymbolicLink() || !current.isDirectory() || current.dev !== root.dev || current.ino !== root.ino) {
+        throw new BridgeError("INVALID_STATE", "Private state storage identity changed");
+      }
+    };
+    const inspect = (target) => {
+      try {
+        const stat4 = lstatSync4(target, { bigint: true });
+        if (stat4.isSymbolicLink() || !stat4.isFile() || stat4.nlink !== 1n || stat4.size < 1n || stat4.size > 1024n)
+          throw busy();
+        const data = JSON.parse(readFileSync3(target, "utf8"));
+        if (!data || typeof data !== "object" || Array.isArray(data) || typeof data.pid !== "number" || !Number.isSafeInteger(data.pid) || data.pid < 1 || data.token !== void 0 && (typeof data.token !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(data.token)))
+          throw busy();
+        return { stat: stat4, pid: data.pid, token: data.token };
+      } catch {
+        throw busy();
+      }
+    };
+    const removeOwned2 = (target, owned) => {
+      checkRoot();
+      const current = inspect(target);
+      if (current.stat.dev !== owned.stat.dev || current.stat.ino !== owned.stat.ino || current.pid !== owned.pid || current.token !== owned.token)
+        throw busy();
+      rmSync3(target);
+    };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      checkRoot();
+      let created = false;
+      try {
+        writeFileSync4(file3, JSON.stringify({ pid: process.pid, token }), { flag: "wx", mode: 384, flush: true });
+        created = true;
+      } catch (error62) {
+        if (process.platform === "win32" && error62.code === "EPERM")
+          continue;
+        if (error62.code !== "EEXIST")
+          throw error62;
+      }
+      if (created) {
+        const owned = inspect(file3);
+        if (owned.pid !== process.pid || owned.token !== token)
+          throw busy();
+        let released = false;
+        return () => {
+          if (released)
+            return;
+          removeOwned2(file3, owned);
+          released = true;
+        };
+      }
+      const observed = inspect(file3);
+      if (processAlive2(observed.pid))
+        throw busy();
+      const gate = file3 + ".recovery", gateToken = randomUUID8();
+      try {
+        writeFileSync4(gate, JSON.stringify({ pid: process.pid, token: gateToken }), { flag: "wx", mode: 384, flush: true });
+      } catch {
+        throw busy();
+      }
+      const ownedGate = inspect(gate);
+      if (ownedGate.pid !== process.pid || ownedGate.token !== gateToken)
+        throw busy();
+      try {
+        checkRoot();
+        const current = inspect(file3);
+        if (current.stat.dev !== observed.stat.dev || current.stat.ino !== observed.stat.ino || current.pid !== observed.pid || current.token !== observed.token || processAlive2(current.pid))
+          throw busy();
+        rmSync3(file3);
+      } finally {
+        removeOwned2(gate, ownedGate);
+      }
+    }
+    throw busy();
+  }
+};
+
+// dist/src/handoff.js
+var decisionsSchema = external_exports.array(external_exports.string().min(1).max(2e3)).max(20);
+var handoffSchema = external_exports.object({
+  sourceTaskId: external_exports.string().uuid(),
+  sourceRole: roleSchema,
+  sourceModel: external_exports.string().nullable(),
+  treeSha256: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  patchSha256: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  decisions: external_exports.object({ source: external_exports.literal("client-reported"), items: decisionsSchema }).strict(),
+  files: external_exports.array(external_exports.string().min(1).max(1e3)).max(1e4),
+  acceptanceCriteria: external_exports.array(criterionSchema).max(100),
+  reports: external_exports.array(external_exports.object({
+    taskId: external_exports.string().uuid(),
+    role: external_exports.enum(["planner", "reviewer"]),
+    data: external_exports.union([plannerReportSchema, reviewerReportSchema])
+  }).strict()).max(8),
+  tests: external_exports.array(external_exports.object({
+    command: external_exports.string(),
+    exitCode: external_exports.number().int(),
+    source: external_exports.enum(["client-reported", "agy-tool", "windows-executor", "linux-executor"]),
+    sha256: external_exports.string(),
+    stale: external_exports.boolean()
+  }).strict()).max(20)
+}).strict();
+
+// dist/src/comparison.js
+var comparisonModelsSchema = external_exports.array(external_exports.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/)).min(2).max(4).refine((models) => new Set(models).size === models.length, "Choose distinct model IDs");
+var comparisonSchema = external_exports.object({
+  comparisonId: external_exports.string().uuid(),
+  sourceTaskId: external_exports.string().uuid(),
+  treeSha256: external_exports.string().regex(/^[a-f0-9]{64}$/),
+  models: comparisonModelsSchema,
+  startErrors: external_exports.array(external_exports.object({ model: external_exports.string(), code: external_exports.string(), message: external_exports.string() }).strict())
+}).strict();
+var comparisonFindingSchema = external_exports.object({
+  path: external_exports.string(),
+  line: external_exports.number().int().positive(),
+  quote: external_exports.string(),
+  agreement: external_exports.enum(["identical", "different", "not-reported-by-all"]),
+  opinions: external_exports.array(external_exports.object({ model: external_exports.string(), finding: reviewerReportSchema.shape.findings.element }).strict()),
+  notReportedBy: external_exports.array(external_exports.string())
+}).strict();
+function compareFindings(tasks, models) {
+  const groups = /* @__PURE__ */ new Map();
+  const valid = tasks.filter((task2) => task2.status === "completed" && task2.report?.role === "reviewer");
+  for (const task2 of valid) {
+    if (task2.report?.role !== "reviewer" || !task2.model)
+      continue;
+    for (const finding of task2.report.data.findings) {
+      const key = JSON.stringify([finding.path, finding.line, finding.quote]);
+      const group = groups.get(key) ?? [];
+      group.push({ model: task2.model, finding });
+      groups.set(key, group);
+    }
+  }
+  return [...groups.values()].map((opinions) => {
+    const { path: path29, line, quote } = opinions[0].finding;
+    const notReportedBy = models.filter((model) => !opinions.some((opinion) => opinion.model === model));
+    return {
+      path: path29,
+      line,
+      quote,
+      opinions,
+      notReportedBy,
+      agreement: notReportedBy.length ? "not-reported-by-all" : new Set(opinions.map((opinion) => JSON.stringify(opinion.finding))).size === 1 ? "identical" : "different"
+    };
+  });
 }
 
 // dist/src/wait-profiles.js
@@ -48212,6 +49052,10 @@ var modelResolutionSchema = external_exports.object({
   }).strict(),
   errorCode: external_exports.string().optional()
 }).strict();
+var quarantinedTaskSchema = external_exports.object({
+  taskId: id,
+  reason: external_exports.enum(QUARANTINE_REASONS)
+}).strict();
 var successOutputSchemas = {
   black_gravity_wait_many: external_exports.object({ ready: external_exports.boolean(), timedOut: external_exports.boolean(), hasMoreMessages: external_exports.boolean(), tasks: external_exports.array(jointWaitTaskSchema).max(32), waitCommand: waitCommandSchema.optional() }).strict(),
   black_gravity_workflow_result: external_exports.object({
@@ -48238,6 +49082,7 @@ var successOutputSchemas = {
     approvalMode: external_exports.enum(["auto", "ask"]).optional(),
     configurationIssues: external_exports.array(external_exports.object({ variable: external_exports.string(), index: count.optional(), reason: external_exports.enum(["invalid-json", "not-a-list", "too-many-entries", "not-a-string", "not-absolute", "not-found", "access-denied", "not-a-directory", "volume-root", "unresolvable", "not-an-object", "legacy-format", "invalid-format", "invalid-name", "forbidden-name", "invalid-pattern", "invalid-entry", "duplicate", "too-large", "unsafe-file", "link", "not-directory", "unusable", "opt-out-unsupported", "legacy-state-busy", "legacy-state-conflict", "legacy-state-migration-failed"]) }).strict()).optional(),
     maintenanceIssues: external_exports.array(external_exports.object({ operation: external_exports.literal("copy-cleanup"), code: external_exports.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/), since: external_exports.string(), failures: count }).strict()).optional(),
+    quarantinedTasks: external_exports.array(quarantinedTaskSchema).optional(),
     installed: external_exports.boolean(),
     path: external_exports.string(),
     version: external_exports.string().optional(),
@@ -48389,7 +49234,10 @@ var successOutputSchemas = {
   black_gravity_discard: task,
   black_gravity_cleanup: external_exports.object({ discardedTaskIds: external_exports.array(id) }).strict(),
   black_gravity_status: task,
-  black_gravity_tasks: external_exports.object({ tasks: external_exports.array(taskRecordSchema) }).strict(),
+  black_gravity_tasks: external_exports.object({
+    tasks: external_exports.array(taskRecordSchema),
+    quarantinedTasks: external_exports.array(quarantinedTaskSchema).optional()
+  }).strict(),
   black_gravity_events: external_exports.object({
     events: external_exports.array(external_exports.object({ taskId: id, sequence: external_exports.number().int().positive(), timestamp, type: external_exports.string(), data: external_exports.unknown(), raw: external_exports.unknown().optional() }).strict()),
     nextCursor: count,
@@ -48545,621 +49393,6 @@ function toolAnnotations(name) {
 import { lstatSync as lstatSync5, readFileSync as readFileSync4 } from "node:fs";
 import path19 from "node:path";
 import { setTimeout as setTimeout2 } from "node:timers/promises";
-
-// dist/src/state-store.js
-import { createHash as createHash19, randomUUID as randomUUID8 } from "node:crypto";
-import { closeSync as closeSync3, lstatSync as lstatSync4, mkdirSync as mkdirSync4, openSync as openSync3, readFileSync as readFileSync3, readdirSync as readdirSync3, realpathSync as realpathSync4, renameSync as renameSync3, rmSync as rmSync3, writeFileSync as writeFileSync4 } from "node:fs";
-import path18 from "node:path";
-import os7 from "node:os";
-var uuid3 = /^[a-f0-9-]{36}$/;
-var SANITIZED_CACHE_VERSION = 1;
-var maxSandboxPolicyFileBytes = 2 * 20 * 1e3 * 6 + 4096;
-var modelSelectionSchema = external_exports.object({ version: external_exports.literal(1), model: external_exports.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/).nullable() }).strict();
-var integrationApprovalRootSchema = external_exports.string().min(1).max(1e3).refine((root) => !root.includes("\0") && path18.isAbsolute(root) && path18.resolve(root) === root && root !== path18.parse(root).root && (process.platform !== "win32" || root === root.toLowerCase()));
-var integrationApprovalsSchema = external_exports.object({ version: external_exports.literal(1), roots: external_exports.array(integrationApprovalRootSchema).max(20) }).strict();
-var blockedMetadataSchema = external_exports.object({
-  path: external_exports.string(),
-  reason: external_exports.enum(["SECRET_FILE", "SECRET_CONTENT", "SECRET_EXCLUSION", "UNSAFE_PATH"])
-}).strict();
-var executionIdentitySchema = external_exports.object({
-  provider: external_exports.string().min(1).max(128),
-  adapterId: external_exports.string().min(1).max(128),
-  adapterVersion: external_exports.string().min(1).max(128),
-  requested: external_exports.object({
-    model: external_exports.string().min(1).max(256).nullable(),
-    effort: effortSchema.nullable()
-  }).strict(),
-  observed: external_exports.object({
-    model: external_exports.string().min(1).max(256).nullable(),
-    status: external_exports.enum(["observed", "not-observable"])
-  }).strict()
-}).strict();
-var snapshotSchema = external_exports.object({
-  version: external_exports.literal(1),
-  ownerPid: external_exports.number().int().positive(),
-  record: external_exports.object({
-    taskId: external_exports.string().uuid(),
-    workingDirectory: external_exports.string(),
-    prompt: external_exports.string(),
-    status: external_exports.enum(["queued", "starting", "running", "streaming", "completed", "failed", "cancelled", "timeout"]),
-    createdAt: external_exports.string().datetime(),
-    completedAt: external_exports.string().datetime().optional(),
-    pid: external_exports.number().int().positive().optional(),
-    mode: external_exports.enum(["write", "read-only"]).optional(),
-    integratedAt: external_exports.string().datetime().optional(),
-    discardedAt: external_exports.string().datetime().optional(),
-    usageIsResume: external_exports.boolean().optional(),
-    usageBaseline: usageCountersSchema.optional(),
-    lastObservedCliUsage: usageCountersSchema.optional(),
-    usageProvenance: external_exports.literal("local-executor").optional(),
-    deliveryMode: deliveryModeSchema.optional(),
-    messages: external_exports.array(persistedBridgeMessageSchema).max(100).optional(),
-    messageCursor: external_exports.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).optional(),
-    effort: effortSchema.optional(),
-    execution: executionIdentitySchema.optional(),
-    roleDefinition: roleDefinitionSchema.optional(),
-    providedSkills: stagedSkillsSchema.optional(),
-    agentPolicyReceipt: external_exports.object({ sha256: external_exports.string().regex(/^[a-f0-9]{64}$/), decisionCount: external_exports.number().int().nonnegative(), deniedCount: external_exports.number().int().nonnegative(), deniedReadCount: external_exports.number().int().nonnegative().optional() }).strict().optional(),
-    deniedReads: external_exports.object({
-      total: external_exports.number().int().nonnegative(),
-      items: external_exports.array(external_exports.object({
-        toolName: external_exports.string().max(128),
-        path: external_exports.string().max(1e3).optional(),
-        reason: external_exports.string().max(500)
-      }).strict()).max(50)
-    }).strict().optional(),
-    peerRequests: external_exports.array(external_exports.lazy(() => peerMessageInputSchema)).max(20).optional(),
-    peerRequestsTruncated: external_exports.boolean().optional(),
-    group: external_exports.lazy(() => groupAssignmentSchema).optional(),
-    memory: external_exports.array(external_exports.lazy(() => memorySummarySchema)).max(8).optional(),
-    agentPolicy: resolvedAgentPolicySchema.optional(),
-    outputSchema: external_exports.record(external_exports.string(), external_exports.unknown()).optional(),
-    artifactPaths: external_exports.array(external_exports.string().min(1).max(1e3)).min(1).max(100).optional(),
-    structuredResult: external_exports.object({ value: external_exports.unknown(), sha256: external_exports.string().regex(/^[a-f0-9]{64}$/) }).strict().optional(),
-    artifacts: external_exports.array(external_exports.object({ path: external_exports.string().min(1).max(1e3), sha256: external_exports.string().regex(/^[a-f0-9]{64}$/), bytes: external_exports.number().int().nonnegative() }).strict()).max(100).optional(),
-    continuationTaskId: external_exports.string().uuid().optional(),
-    parentTaskId: external_exports.string().uuid().optional(),
-    sourceMessage: external_exports.object({ taskId: external_exports.string().uuid(), messageId: external_exports.string().uuid() }).strict().optional(),
-    dispatching: external_exports.object({ messageId: external_exports.string().uuid(), continuationTaskId: external_exports.string().uuid().optional(), ownerId: external_exports.string().uuid().optional() }).strict().optional(),
-    inbox: external_exports.array(external_exports.object({
-      peerOrigin: external_exports.lazy(() => peerOriginSchema).optional(),
-      messageId: external_exports.string().uuid(),
-      taskId: external_exports.string().uuid(),
-      text: external_exports.string().min(1).max(2e3),
-      receivedAt: external_exports.string().datetime(),
-      receipt: external_exports.object({
-        messageId: external_exports.string().uuid(),
-        taskId: external_exports.string().uuid(),
-        state: external_exports.enum(["queued", "sent", "failed", "cancelled"]),
-        continuationTaskId: external_exports.string().uuid().optional(),
-        error: external_exports.object({ code: external_exports.string(), message: external_exports.string() }).strict().optional()
-      }).strict()
-    }).strict()).max(20).optional()
-  }).passthrough(),
-  options: external_exports.object({
-    peerContext: external_exports.lazy(() => peerContextSchema).optional(),
-    peerOrigin: external_exports.lazy(() => peerOriginSchema).optional(),
-    group: external_exports.lazy(() => groupAssignmentSchema).optional(),
-    memory: external_exports.lazy(() => memorySelectionSchema).optional(),
-    memorySnapshots: external_exports.lazy(() => memorySnapshotsSchema).optional(),
-    allowedTools: nativeToolsSchema.optional(),
-    mcpServers: mcpSelectionSchema.optional(),
-    agentPolicy: resolvedAgentPolicySchema.optional(),
-    prompt: external_exports.string(),
-    workingDirectory: external_exports.string(),
-    effort: effortSchema.optional(),
-    roleDefinition: roleDefinitionSchema.optional(),
-    outputSchema: external_exports.record(external_exports.string(), external_exports.unknown()).optional(),
-    artifactPaths: external_exports.array(external_exports.string().min(1).max(1e3)).min(1).max(100).optional()
-  }).passthrough(),
-  project: external_exports.object({
-    executionPolicy: stagedExecutionPolicySchema.optional(),
-    executionStateDirectory: external_exports.string().optional(),
-    sourceDirectory: external_exports.string(),
-    copyDirectory: external_exports.string(),
-    gitDirectory: external_exports.string(),
-    baseline: external_exports.array(external_exports.tuple([external_exports.string(), external_exports.string().regex(/^[a-f0-9]{64}$/)])),
-    includedFiles: external_exports.array(external_exports.string()),
-    providedSkills: stagedSkillsSchema.optional(),
-    blockedFiles: external_exports.array(blockedMetadataSchema).optional(),
-    modelProofFailure: external_exports.string().max(2e3).optional()
-  }).optional(),
-  events: external_exports.array(external_exports.object({ taskId: external_exports.string().uuid(), sequence: external_exports.number().int().positive(), timestamp: external_exports.string(), type: external_exports.string(), data: external_exports.unknown(), raw: external_exports.unknown().optional(), rawIsData: external_exports.literal(true).optional(), rawEnvelope: external_exports.string().min(1).max(64).optional() }).refine((event) => [event.raw !== void 0, event.rawIsData !== void 0, event.rawEnvelope !== void 0].filter(Boolean).length <= 1 && event.rawEnvelope !== "event")),
-  cursor: external_exports.number().int().nonnegative(),
-  // Written by versions that redact before persisting; older state is sanitized when restored.
-  redacted: external_exports.literal(true).optional()
-});
-function processAlive2(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error62) {
-    return error62.code !== "ESRCH";
-  }
-}
-function retryTransient(action) {
-  const delays = [10, 20, 40, 80, 160];
-  for (let attempt = 0; ; attempt++) {
-    try {
-      action();
-      return;
-    } catch (error62) {
-      const code = error62.code;
-      if (process.platform !== "win32" || !["EPERM", "EACCES", "EBUSY"].includes(code ?? "") || attempt >= delays.length)
-        throw error62;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delays[attempt]);
-    }
-  }
-}
-function assertReplaceable(target) {
-  retryTransient(() => {
-    try {
-      closeSync3(openSync3(target, "r+"));
-    } catch (error62) {
-      if (error62.code !== "ENOENT")
-        throw error62;
-    }
-  });
-}
-function replaceStateFile2(temporary, target) {
-  retryTransient(() => renameSync3(temporary, target));
-}
-function removeCachedFile(file3) {
-  try {
-    if (lstatSync4(file3).isFile())
-      rmSync3(file3, { force: true });
-  } catch {
-  }
-}
-function compactEvent(event) {
-  if (event.raw === void 0)
-    return { ...event };
-  const { raw, ...rest } = event;
-  const serializedRaw = JSON.stringify(raw);
-  if (serializedRaw === JSON.stringify(event.data))
-    return { ...rest, rawIsData: true };
-  const name = raw && typeof raw === "object" && !Array.isArray(raw) && typeof raw.event === "string" ? raw.event : void 0;
-  if (name && name !== "event" && name.length <= 64 && serializedRaw === JSON.stringify({ event: name, [name]: event.data })) {
-    return { ...rest, rawEnvelope: name };
-  }
-  return { ...event };
-}
-function expandEvent(event) {
-  const { rawIsData, rawEnvelope, raw, ...rest } = event;
-  const rebuiltRaw = rawIsData ? structuredClone(event.data) : rawEnvelope !== void 0 ? { event: rawEnvelope, [rawEnvelope]: structuredClone(event.data) } : raw;
-  return rebuiltRaw === void 0 ? rest : { ...rest, raw: rebuiltRaw };
-}
-function stateDirectoryProblem(directory) {
-  const validation = validateStateDirectory(directory);
-  if (!validation.valid)
-    return validation.reason;
-  try {
-    const stat4 = lstatSync4(directory);
-    if (stat4.isSymbolicLink())
-      return "link";
-    if (!stat4.isDirectory())
-      return "not-directory";
-  } catch (error62) {
-    if (error62.code !== "ENOENT")
-      return "unusable";
-  }
-  return void 0;
-}
-var StateStoreLinkError = class extends BridgeError {
-  constructor(message = "State directory cannot be a link") {
-    super("INVALID_STATE_DIRECTORY", message);
-    this.name = "StateStoreLinkError";
-  }
-};
-var StateStore = class {
-  directory;
-  constructor(directory) {
-    this.directory = directory;
-    const problem = stateDirectoryProblem(directory);
-    if (problem) {
-      if (problem === "link")
-        throw new StateStoreLinkError();
-      const message = problem === "not-directory" ? "State directory must be a directory" : problem === "unusable" ? "State directory is unusable" : problem === "invalid-entry" ? "BRIDGE_STATE_DIRECTORY is invalid" : "BRIDGE_STATE_DIRECTORY must be absolute";
-      throw new BridgeError("INVALID_STATE_DIRECTORY", message);
-    }
-    mkdirSync4(directory, { recursive: true, mode: 448 });
-    const stat4 = lstatSync4(directory);
-    if (stat4.isSymbolicLink()) {
-      throw new StateStoreLinkError();
-    }
-    if (!stat4.isDirectory()) {
-      throw new BridgeError("INVALID_STATE_DIRECTORY", "State directory must be a directory");
-    }
-  }
-  probeWritable() {
-    readdirSync3(this.directory);
-    const probeFile = path18.join(this.directory, ".startup-probe-" + randomUUID8());
-    writeFileSync4(probeFile, "", { flag: "wx", mode: 384 });
-    rmSync3(probeFile);
-  }
-  file(taskId) {
-    if (!uuid3.test(taskId))
-      throw new BridgeError("INVALID_STATE", "Invalid persisted task ID");
-    return path18.join(this.directory, taskId + ".json");
-  }
-  readIntegrationRoots() {
-    const variable = "integration-approvals.json";
-    const file3 = path18.join(this.directory, "integration-approvals.json");
-    let stat4;
-    try {
-      stat4 = lstatSync4(file3);
-    } catch (error62) {
-      if (error62.code === "ENOENT")
-        return { roots: [], issues: [] };
-      return { roots: [], issues: [{ variable, reason: mapFsError(error62) }] };
-    }
-    if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.nlink !== 1 || stat4.size > 128 * 1024) {
-      return { roots: [], issues: [{ variable, reason: "unsafe-file" }] };
-    }
-    let content;
-    try {
-      content = readFileSync3(file3, "utf8");
-    } catch (error62) {
-      if (error62.code === "ENOENT")
-        return { roots: [], issues: [] };
-      return { roots: [], issues: [{ variable, reason: mapFsError(error62) }] };
-    }
-    let parsed;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      return { roots: [], issues: [{ variable, reason: "invalid-json" }] };
-    }
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return { roots: [], issues: [{ variable, reason: "invalid-format" }] };
-    }
-    const obj = parsed;
-    const keys2 = Object.keys(obj);
-    if (keys2.length !== 2 || !Object.hasOwn(obj, "version") || !Object.hasOwn(obj, "roots") || obj.version !== 1 || !Array.isArray(obj.roots)) {
-      return { roots: [], issues: [{ variable, reason: "invalid-format" }] };
-    }
-    if (obj.roots.length > 20) {
-      return { roots: [], issues: [{ variable, reason: "too-many-entries" }] };
-    }
-    const roots = [];
-    const issues = [];
-    for (let i = 0; i < obj.roots.length; i++) {
-      const result = integrationApprovalRootSchema.safeParse(obj.roots[i]);
-      if (!result.success) {
-        issues.push({ variable, index: i, reason: "invalid-entry" });
-      } else {
-        roots.push(result.data);
-      }
-    }
-    return { roots, issues };
-  }
-  loadIntegrationRoots() {
-    const result = this.readIntegrationRoots();
-    if (result.issues.length > 0) {
-      throw new BridgeError("INVALID_STATE", "Invalid persisted integration approvals");
-    }
-    return result.roots;
-  }
-  rememberIntegrationRoot(directory) {
-    const canonical = preauthorizedIntegrationRoots(JSON.stringify([directory]))[0];
-    const release = this.acquire("integration-approvals");
-    const target = path18.join(this.directory, "integration-approvals.json");
-    const temporary = target + "." + randomUUID8() + ".tmp";
-    try {
-      const roots = this.loadIntegrationRoots();
-      if (roots.includes(canonical))
-        return;
-      const snapshot = integrationApprovalsSchema.parse({ version: 1, roots: [...roots, canonical] });
-      writeFileSync4(temporary, JSON.stringify(snapshot), { flag: "wx", mode: 384, flush: true });
-      replaceStateFile2(temporary, target);
-    } finally {
-      rmSync3(temporary, { force: true });
-      release();
-    }
-  }
-  loadModel() {
-    const file3 = path18.join(this.directory, "model-selection.json");
-    try {
-      const stat4 = lstatSync4(file3);
-      if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.size > 1024)
-        throw new Error("Unsafe model selection");
-      return modelSelectionSchema.parse(JSON.parse(readFileSync3(file3, "utf8")));
-    } catch (error62) {
-      if (error62.code === "ENOENT")
-        return void 0;
-      throw new BridgeError("INVALID_STATE", "Invalid persisted model selection");
-    }
-  }
-  loadSandboxPolicy() {
-    const file3 = path18.join(this.directory, "sandbox-policy.json");
-    try {
-      const stat4 = lstatSync4(file3);
-      if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.size > maxSandboxPolicyFileBytes)
-        throw new Error("Unsafe sandbox policy");
-      return parseSandboxPolicySnapshot(JSON.parse(readFileSync3(file3, "utf8")));
-    } catch (error62) {
-      if (error62.code === "ENOENT") {
-        const policy = sandboxPolicySchema.parse({});
-        return { version: 1, policy, sha256: sandboxPolicyDigest(policy) };
-      }
-      throw new BridgeError("INVALID_STATE", "Invalid persisted sandbox policy");
-    }
-  }
-  saveSandboxPolicy(snapshot) {
-    let validated;
-    try {
-      validated = parseSandboxPolicySnapshot(snapshot);
-    } catch {
-      throw new BridgeError("INVALID_STATE", "Invalid sandbox policy snapshot");
-    }
-    const target = path18.join(this.directory, "sandbox-policy.json");
-    const temporary = target + "." + randomUUID8() + ".tmp";
-    try {
-      this.loadSandboxPolicy();
-      writeFileSync4(temporary, JSON.stringify(validated), { flag: "wx", mode: 384, flush: true });
-      replaceStateFile2(temporary, target);
-    } finally {
-      rmSync3(temporary, { force: true });
-    }
-  }
-  saveModel(model) {
-    const selection = modelSelectionSchema.parse({ version: 1, model });
-    const release = this.acquire("model-selection");
-    const target = path18.join(this.directory, "model-selection.json");
-    const temporary = target + "." + randomUUID8() + ".tmp";
-    try {
-      this.loadModel();
-      writeFileSync4(temporary, JSON.stringify(selection), { flag: "wx", mode: 384, flush: true });
-      replaceStateFile2(temporary, target);
-    } finally {
-      rmSync3(temporary, { force: true });
-      release();
-    }
-  }
-  save(task2) {
-    this.writeSnapshot(this.file(task2.record.taskId), task2);
-  }
-  serializeSnapshot(task2) {
-    const snapshot = { ...task2, version: 1, redacted: true, events: task2.events.map(compactEvent), project: task2.project && { ...task2.project, baseline: [...task2.project.baseline] } };
-    delete snapshot.fingerprint;
-    return JSON.stringify(snapshot);
-  }
-  // Renames across files cannot be atomic, so a failed rename can leave a prefix of
-  // entries published, and callers must order entries so that the next startup can finish the rest.
-  saveBatch(entries2, onPublished) {
-    const targets = entries2.map((entry2) => {
-      const target = this.file(entry2.taskId);
-      assertReplaceable(target);
-      return target;
-    });
-    const temporaries = [];
-    try {
-      const staged = [];
-      for (let i = 0; i < entries2.length; i++) {
-        const target = targets[i];
-        const temporary = target + "." + randomUUID8() + ".tmp";
-        temporaries.push(temporary);
-        writeFileSync4(temporary, entries2[i].content, { flag: "wx", mode: 384, flush: true });
-        staged.push({ temporary, target, taskId: entries2[i].taskId });
-      }
-      for (const { temporary, target, taskId } of staged) {
-        replaceStateFile2(temporary, target);
-        onPublished(taskId);
-      }
-    } finally {
-      for (const temporary of temporaries) {
-        try {
-          rmSync3(temporary, { force: true });
-        } catch {
-        }
-      }
-    }
-  }
-  writeSnapshot(target, task2) {
-    const temporary = target + "." + randomUUID8() + ".tmp";
-    try {
-      writeFileSync4(temporary, this.serializeSnapshot(task2), { flag: "wx", mode: 384, flush: true });
-      replaceStateFile2(temporary, target);
-    } finally {
-      rmSync3(temporary, { force: true });
-    }
-  }
-  // With a source, only that file is read, validated as the snapshot the task file name would hold.
-  load(source) {
-    const names = source ? [source.name] : readdirSync3(this.directory).filter((name) => uuid3.test(name.slice(0, -5)) && name.endsWith(".json"));
-    return names.map((name) => {
-      const file3 = source?.file ?? path18.join(this.directory, name);
-      const stat4 = lstatSync4(file3);
-      if (stat4.isSymbolicLink() || !stat4.isFile() || stat4.size > 7e7)
-        throw new BridgeError("INVALID_STATE", "Unsafe persisted task file");
-      let data, fingerprint;
-      try {
-        const text = readFileSync3(file3, "utf8");
-        fingerprint = createHash19("sha256").update(text).digest("hex");
-        data = snapshotSchema.parse(JSON.parse(text));
-      } catch {
-        throw new BridgeError("INVALID_STATE", "Invalid persisted task: " + name);
-      }
-      if (data.record.taskId + ".json" !== name || !path18.isAbsolute(data.record.workingDirectory) || data.options.workingDirectory !== data.record.workingDirectory || data.options.prompt !== data.record.prompt || data.events.some((event) => event.taskId !== data.record.taskId || event.sequence > data.cursor)) {
-        throw new BridgeError("INVALID_STATE", "Persisted task does not match its identity");
-      }
-      const messages = data.record.messages ?? [];
-      if (messages.some((message, index) => message.taskId !== data.record.taskId || message.sequence > (data.record.messageCursor ?? 0) || index > 0 && messages[index - 1].sequence >= message.sequence))
-        throw new BridgeError("INVALID_STATE", "Persisted messages do not match task identity or cursor");
-      const inbox = data.record.inbox ?? [];
-      if (new Set(inbox.map((item) => item.messageId.toLowerCase())).size !== inbox.length || inbox.some((item) => item.taskId !== data.record.taskId || item.receipt.taskId !== data.record.taskId || item.receipt.messageId !== item.messageId) || data.record.dispatching && !inbox.some((item) => item.messageId === data.record.dispatching.messageId && item.receipt.state === "queued")) {
-        throw new BridgeError("INVALID_STATE", "Persisted inbox does not match task identity");
-      }
-      if (JSON.stringify(data.record.group) !== JSON.stringify(data.options.group))
-        throw new BridgeError("INVALID_STATE", "Persisted group assignment differs from task options");
-      if ((data.record.peerRequests || data.options.peerContext || data.options.peerOrigin) && !data.record.group)
-        throw new BridgeError("INVALID_STATE", "Peer state requires group membership");
-      if (data.options.peerContext && (data.options.peerContext.groupId.toLowerCase() !== data.record.group.groupId.toLowerCase() || data.options.peerContext.nodeKey !== data.record.group.nodeKey))
-        throw new BridgeError("INVALID_STATE", "Peer context differs from task group");
-      if (data.options.peerOrigin && (!data.record.sourceMessage || data.options.peerOrigin.groupId.toLowerCase() !== data.record.group.groupId.toLowerCase()))
-        throw new BridgeError("INVALID_STATE", "Peer input differs from its continuation");
-      const snapshots = data.options.memorySnapshots;
-      if (snapshots?.some((entry2) => entry2.projectId !== computeProjectId(data.record.workingDirectory)) || JSON.stringify(data.record.memory) !== JSON.stringify(summarizeMemory(snapshots)) || JSON.stringify(data.options.memory) !== JSON.stringify(snapshots?.map(({ specialist, sha256 }) => ({ specialist, sha256 })))) {
-        throw new BridgeError("INVALID_STATE", "Persisted private memory differs from its project, hashes or metadata");
-      }
-      if (data.record.agentPolicy?.sha256 !== data.options.agentPolicy?.sha256)
-        throw new BridgeError("INVALID_STATE", "Persisted task tool policies disagree");
-      if (data.project) {
-        if (Boolean(data.project.executionPolicy) !== Boolean(data.project.executionStateDirectory) || data.project.executionStateDirectory && !this.ownsExecutionState(data.project.executionStateDirectory) || data.project.executionPolicy && data.project.executionPolicy.policy.sha256 !== data.record.agentPolicy?.sha256)
-          throw new BridgeError("INVALID_STATE", "Persisted execution policy differs from task or private storage");
-        for (const [directory, kind2] of [[data.project.copyDirectory, "copy"], [data.project.gitDirectory, "baseline"]]) {
-          if (!path18.isAbsolute(directory) || path18.relative(os7.tmpdir(), path18.dirname(directory)) !== "" || !hasOwnedPrefix(path18.basename(directory), kind2)) {
-            throw new BridgeError("INVALID_STATE", "Persisted copy is outside bridge temporary storage");
-          }
-        }
-        if (data.project.sourceDirectory !== data.record.workingDirectory)
-          throw new BridgeError("INVALID_STATE", "Persisted source differs from task");
-      }
-      return {
-        ...data,
-        events: data.events.map(expandEvent),
-        fingerprint,
-        record: data.record,
-        options: data.options,
-        project: data.project && { ...data.project, baseline: new Map(data.project.baseline) }
-      };
-    }).sort((a, b) => a.record.createdAt.localeCompare(b.record.createdAt));
-  }
-  // Sanitized copies of legacy snapshots are cached per source file version; the source file itself is left to its writers.
-  /** Tasks carried over by the migration keep their receipts in the root they were created in. */
-  ownsExecutionState(directory) {
-    const origin = readMigrationMarker(this.directory)?.source;
-    if (origin && samePath(directory, origin))
-      return true;
-    return path18.relative(realpathSync4.native(directory), realpathSync4.native(this.directory)) === "";
-  }
-  sanitizedDirectory() {
-    const directory = path18.join(this.directory, "sanitized");
-    mkdirSync4(directory, { recursive: true, mode: 448 });
-    if (lstatSync4(directory).isSymbolicLink() || !lstatSync4(directory).isDirectory())
-      throw new BridgeError("INVALID_STATE", "Sanitized state cache must be a real directory");
-    return directory;
-  }
-  sanitizedFile(taskId, fingerprint) {
-    if (!uuid3.test(taskId) || !/^[a-f0-9]{64}$/.test(fingerprint))
-      throw new BridgeError("INVALID_STATE", "Invalid sanitized state key");
-    return path18.join(this.sanitizedDirectory(), taskId + "-" + fingerprint + ".v" + SANITIZED_CACHE_VERSION + ".json");
-  }
-  loadSanitized(taskId, fingerprint) {
-    let file3;
-    try {
-      file3 = this.sanitizedFile(taskId, fingerprint);
-      const [cached2] = this.load({ file: file3, name: taskId + ".json" });
-      return cached2?.redacted ? cached2 : void 0;
-    } catch {
-      if (file3)
-        removeCachedFile(file3);
-      return void 0;
-    }
-  }
-  saveSanitized(task2, fingerprint) {
-    const target = this.sanitizedFile(task2.record.taskId, fingerprint);
-    this.writeSnapshot(target, task2);
-    this.dropSanitized(task2.record.taskId, target);
-  }
-  dropSanitized(taskId, keep) {
-    const directory = this.sanitizedDirectory();
-    for (const name of readdirSync3(directory)) {
-      const file3 = path18.join(directory, name);
-      if (name.startsWith(taskId + "-") && !name.endsWith(".tmp") && file3 !== keep)
-        removeCachedFile(file3);
-    }
-  }
-  drop(taskId) {
-    rmSync3(this.file(taskId), { force: true });
-    try {
-      this.dropSanitized(taskId);
-    } catch {
-    }
-  }
-  acquire(name) {
-    if (!/^[a-zA-Z0-9-]+$/.test(name))
-      throw new BridgeError("INVALID_STATE", "Invalid lock name");
-    const file3 = path18.join(this.directory, name + ".lock"), token = randomUUID8();
-    const root = lstatSync4(this.directory, { bigint: true });
-    const busy = () => new BridgeError("STATE_BUSY", "Another operation owns this task or copy, or its lock cannot be verified");
-    const checkRoot = () => {
-      const current = lstatSync4(this.directory, { bigint: true });
-      if (current.isSymbolicLink() || !current.isDirectory() || current.dev !== root.dev || current.ino !== root.ino) {
-        throw new BridgeError("INVALID_STATE", "Private state storage identity changed");
-      }
-    };
-    const inspect = (target) => {
-      try {
-        const stat4 = lstatSync4(target, { bigint: true });
-        if (stat4.isSymbolicLink() || !stat4.isFile() || stat4.nlink !== 1n || stat4.size < 1n || stat4.size > 1024n)
-          throw busy();
-        const data = JSON.parse(readFileSync3(target, "utf8"));
-        if (!data || typeof data !== "object" || Array.isArray(data) || typeof data.pid !== "number" || !Number.isSafeInteger(data.pid) || data.pid < 1 || data.token !== void 0 && (typeof data.token !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(data.token)))
-          throw busy();
-        return { stat: stat4, pid: data.pid, token: data.token };
-      } catch {
-        throw busy();
-      }
-    };
-    const removeOwned2 = (target, owned) => {
-      checkRoot();
-      const current = inspect(target);
-      if (current.stat.dev !== owned.stat.dev || current.stat.ino !== owned.stat.ino || current.pid !== owned.pid || current.token !== owned.token)
-        throw busy();
-      rmSync3(target);
-    };
-    for (let attempt = 0; attempt < 3; attempt++) {
-      checkRoot();
-      let created = false;
-      try {
-        writeFileSync4(file3, JSON.stringify({ pid: process.pid, token }), { flag: "wx", mode: 384, flush: true });
-        created = true;
-      } catch (error62) {
-        if (process.platform === "win32" && error62.code === "EPERM")
-          continue;
-        if (error62.code !== "EEXIST")
-          throw error62;
-      }
-      if (created) {
-        const owned = inspect(file3);
-        if (owned.pid !== process.pid || owned.token !== token)
-          throw busy();
-        let released = false;
-        return () => {
-          if (released)
-            return;
-          removeOwned2(file3, owned);
-          released = true;
-        };
-      }
-      const observed = inspect(file3);
-      if (processAlive2(observed.pid))
-        throw busy();
-      const gate = file3 + ".recovery", gateToken = randomUUID8();
-      try {
-        writeFileSync4(gate, JSON.stringify({ pid: process.pid, token: gateToken }), { flag: "wx", mode: 384, flush: true });
-      } catch {
-        throw busy();
-      }
-      const ownedGate = inspect(gate);
-      if (ownedGate.pid !== process.pid || ownedGate.token !== gateToken)
-        throw busy();
-      try {
-        checkRoot();
-        const current = inspect(file3);
-        if (current.stat.dev !== observed.stat.dev || current.stat.ino !== observed.stat.ino || current.pid !== observed.pid || current.token !== observed.token || processAlive2(current.pid))
-          throw busy();
-        rmSync3(file3);
-      } finally {
-        removeOwned2(gate, ownedGate);
-      }
-    }
-    throw busy();
-  }
-};
-
-// dist/src/wait-command.js
 var WAIT_EXIT_CODES = {
   completed: 0,
   error: 1,
@@ -49781,6 +50014,7 @@ function createMcpServer(adapter, tasks, options = {}) {
         approvalMode: tasks.approvalMode,
         configurationIssues: tasks.configurationIssues,
         maintenanceIssues: tasks.maintenanceIssues,
+        ...tasks.isStateDirectoryUsable() ? { quarantinedTasks: tasks.currentQuarantinedTasks() } : {},
         windowsRuntime: await tasks.windowsRuntimeStatus(),
         testExecutor: tasks.testExecutorStatus(),
         antiAiCraft: await tasks.antiAiCraftStatus(),
@@ -50205,16 +50439,19 @@ Integration modifies the original. Confirm only after reviewing the patch and th
   if (toolEnabled(tasks.toolProfile, "black_gravity_tasks"))
     server.registerTool("black_gravity_tasks", {
       outputSchema: outputSchemas.black_gravity_tasks,
-      description: "Recover task IDs and metadata from local bridge state, including tasks from earlier server processes.",
+      description: "Recover task IDs and metadata from local bridge state, including tasks from earlier server processes and quarantined snapshots.",
       inputSchema: {}
-    }, safe(() => ({ tasks: tasks.list().map((task2) => {
-      const delivered = clientTask(task2);
-      if ("prompt" in delivered) {
-        const { prompt: _prompt, ...metadata } = delivered;
-        return metadata;
-      }
-      return delivered;
-    }) })));
+    }, safe(() => ({
+      tasks: tasks.list().map((task2) => {
+        const delivered = clientTask(task2);
+        if ("prompt" in delivered) {
+          const { prompt: _prompt, ...metadata } = delivered;
+          return metadata;
+        }
+        return delivered;
+      }),
+      quarantinedTasks: tasks.lastQuarantinedTasks()
+    })));
   if (toolEnabled(tasks.toolProfile, "black_gravity_events"))
     server.registerTool("black_gravity_events", {
       outputSchema: outputSchemas.black_gravity_events,
@@ -56221,6 +56458,11 @@ function maintenanceErrorCode(error62) {
   return typeof candidate === "string" && /^[A-Z][A-Z0-9_]{0,63}$/.test(candidate) ? candidate : "UNEXPECTED_ERROR";
 }
 var terminal3 = /* @__PURE__ */ new Set(["completed", "failed", "cancelled", "timeout"]);
+var DISCARDABLE_QUARANTINE_REASONS = /* @__PURE__ */ new Set([
+  "copy-outside-temporary-directory",
+  "source-mismatch",
+  "execution-policy-mismatch"
+]);
 function restoredEvents(stored) {
   const steps = /* @__PURE__ */ new Map();
   const cleared = /* @__PURE__ */ new Set();
@@ -56265,6 +56507,7 @@ var TaskManager = class {
   claimingMessages = /* @__PURE__ */ new Set();
   busyProjects = /* @__PURE__ */ new Set();
   stateStore;
+  quarantined = /* @__PURE__ */ new Map();
   degraded = false;
   degradedIssue;
   maintenanceIssue;
@@ -56301,6 +56544,7 @@ var TaskManager = class {
     this.degradedIssue = fromConfig ? void 0 : { variable: "BRIDGE_STATE_DIRECTORY", reason };
     this.stateStore = void 0;
     this.tasks.clear();
+    this.quarantined.clear();
     this.events = new EventStore(this.config.eventBufferSize, (taskId) => this.persist(taskId));
     this.nativeRecovery = Promise.resolve();
     this.nativeRecoveryError = void 0;
@@ -56385,11 +56629,39 @@ var TaskManager = class {
     }
   }
   projectLock(project) {
-    return "copy-" + createHash25("sha256").update(project.copyDirectory).digest("hex");
+    return copyLockName(project.copyDirectory);
+  }
+  assertNotQuarantined(taskId) {
+    const entry2 = this.quarantined.get(taskId);
+    if (entry2) {
+      throw new BridgeError("TASK_QUARANTINED", `Task ${taskId} is quarantined: ${entry2.reason}. Discard it with black_gravity_discard; its recorded paths are not used.`);
+    }
+  }
+  requireTask(taskId, notFoundMessage = `Unknown task: ${taskId}`) {
+    const task2 = this.tasks.get(taskId);
+    if (task2)
+      return task2;
+    this.assertNotQuarantined(taskId);
+    throw new BridgeError("TASK_NOT_FOUND", notFoundMessage);
+  }
+  hasQuarantinedCopySibling(project) {
+    const copyId = copyIdentity(project.copyDirectory);
+    const gitId = copyIdentity(project.gitDirectory);
+    for (const entry2 of this.quarantined.values()) {
+      for (const hint of entry2.copyHints) {
+        const hintId = copyIdentity(hint);
+        if (hintId === copyId || hintId === gitId) {
+          return true;
+        }
+      }
+    }
+    return false;
   }
   refresh() {
     this.assertStateDirectoryUsable();
-    const stored = this.state.load();
+    const { tasks: stored, quarantined } = this.state.loadWithQuarantine();
+    const ownedIds = new Set([...this.tasks.values()].filter((task2) => task2.owned).map((task2) => task2.record.taskId));
+    this.quarantined = new Map(quarantined.filter((entry2) => !ownedIds.has(entry2.taskId)).map((entry2) => [entry2.taskId, entry2]));
     const projects = new Map([...this.tasks.values()].filter((task2) => task2.project && (task2.owned || this.busyProjects.has(task2.project))).map((task2) => [task2.project.copyDirectory, task2.project]));
     const ids = new Set(stored.map((task2) => task2.record.taskId));
     for (const [id2, task2] of this.tasks)
@@ -56727,12 +56999,16 @@ var TaskManager = class {
       }
       const resumeSource = resumeTaskId ? this.tasks.get(resumeTaskId) : void 0;
       if (resumeTaskId) {
+        if (!resumeSource)
+          this.assertNotQuarantined(resumeTaskId);
         if (!resumeSource?.project || !resumeSource.record.sessionId || resumeSource.record.workingDirectory !== workingDirectory || resumeSource.record.status !== "completed" && resumeSource.record.error?.code !== "TEST_FAILED" || resumeSource.record.integratedAt) {
           throw new BridgeError("INVALID_SESSION", RESUME_REFUSED);
         }
         options.sessionId = resumeSource.record.sessionId;
       }
       const contextSource = options.contextTaskId ? this.tasks.get(options.contextTaskId) : void 0;
+      if (options.contextTaskId && !contextSource)
+        this.assertNotQuarantined(options.contextTaskId);
       if (options.contextTaskId && (options.sessionId || !contextSource?.project || contextSource.record.status !== "completed" || contextSource.record.integratedAt || contextSource.record.workingDirectory !== workingDirectory)) {
         throw new BridgeError("INVALID_CONTEXT", "Context requires a completed, retained, non-integrated task in the same project; use a new session");
       }
@@ -56757,6 +57033,8 @@ var TaskManager = class {
         this.checkGroupBudget(budgetGroup.groupId);
       if (previous?.project && this.busyProjects.has(previous.project))
         throw new BridgeError("TASK_NOT_READY", "The copy is being reviewed or removed");
+      if (previous?.project && this.hasQuarantinedCopySibling(previous.project))
+        throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
       if (previous && !previous.record.agentPolicy && this.config.enforceAgentPolicy)
         throw new BridgeError("AGENT_POLICY_CHANGED", "This legacy session has no enforced policy; start a new task under the configured human ceiling");
       if (previous && (options.allowedTools !== void 0 || options.mcpServers !== void 0))
@@ -56929,9 +57207,13 @@ var TaskManager = class {
       pendingProjectRelease = previous?.project || contextProject ? this.state.acquire(this.projectLock(previous?.project ?? contextProject)) : void 0;
       if (previous) {
         this.refresh();
+        if (resumeTaskId && !this.tasks.has(resumeTaskId))
+          this.assertNotQuarantined(resumeTaskId);
         previous = this.tasks.get(previous.record.taskId);
         if (!previous?.project || previous.record.integratedAt)
           throw new BridgeError("INVALID_SESSION", RESUME_REFUSED);
+        if (this.hasQuarantinedCopySibling(previous.project))
+          throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
       }
       if (this.tasks.size >= this.config.maxRetainedTasks) {
         const oldestFinished = [...this.tasks.values()].find((task2) => terminal3.has(task2.record.status) && task2 !== contextSource && !this.hasPendingInbox(task2.record) && !(options.sourceMessage && task2 === previous));
@@ -57018,15 +57300,33 @@ var TaskManager = class {
   status(taskId) {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task2 = this.tasks.get(taskId);
-    if (!task2)
-      throw new BridgeError("TASK_NOT_FOUND", `Unknown task: ${taskId}`);
+    const task2 = this.requireTask(taskId);
     return { ...task2.record, tokenUsage: taskTokenUsage(task2.record) };
   }
   list() {
     this.assertStateDirectoryUsable();
     this.refresh();
     return [...this.tasks.values()].map((task2) => ({ ...task2.record, tokenUsage: taskTokenUsage(task2.record) }));
+  }
+  quarantinedTasks() {
+    this.assertStateDirectoryUsable();
+    this.refresh();
+    return this.lastQuarantinedTasks();
+  }
+  lastQuarantinedTasks() {
+    if (this.degraded)
+      return [];
+    return [...this.quarantined.values()].map(({ taskId, reason }) => ({ taskId, reason }));
+  }
+  currentQuarantinedTasks() {
+    if (!this.isStateDirectoryUsable())
+      return this.lastQuarantinedTasks();
+    try {
+      this.refresh();
+    } catch {
+      return this.lastQuarantinedTasks();
+    }
+    return this.lastQuarantinedTasks();
   }
   usage(filters = {}) {
     this.assertStateDirectoryUsable();
@@ -57061,9 +57361,7 @@ var TaskManager = class {
   readStructuredResult(taskId, offset = 0, limit = 1e4, expectedContentSha256) {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task2 = this.tasks.get(taskId);
-    if (!task2)
-      throw new BridgeError("TASK_NOT_FOUND", `Unknown task: ${taskId}`);
+    const task2 = this.requireTask(taskId);
     if (task2.record.status !== "completed") {
       throw new BridgeError("TASK_NOT_READY", "Structured result requires a completed task");
     }
@@ -57078,9 +57376,7 @@ var TaskManager = class {
   listArtifacts(taskId) {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task2 = this.tasks.get(taskId);
-    if (!task2)
-      throw new BridgeError("TASK_NOT_FOUND", `Unknown task: ${taskId}`);
+    const task2 = this.requireTask(taskId);
     if (task2.record.status !== "completed") {
       throw new BridgeError("TASK_NOT_READY", "Artifacts require a completed task");
     }
@@ -57092,9 +57388,7 @@ var TaskManager = class {
   async readArtifact(taskId, artifactPath, expectedSha256, offset = 0, limit = 65536) {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task2 = this.tasks.get(taskId);
-    if (!task2)
-      throw new BridgeError("TASK_NOT_FOUND", `Unknown task: ${taskId}`);
+    const task2 = this.requireTask(taskId);
     if (task2.record.status !== "completed" || !task2.project || task2.record.discardedAt) {
       throw new BridgeError("TASK_NOT_READY", "Reading artifacts requires a completed task with a retained copy");
     }
@@ -57112,6 +57406,8 @@ var TaskManager = class {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task2 = this.tasks.get(taskId);
+    if (!task2)
+      this.assertNotQuarantined(taskId);
     if (!task2?.project || !terminal3.has(task2.record.status))
       throw new BridgeError("TASK_NOT_READY", "Wait for the task before reading its patch");
     return this.withProject(task2.project, async () => {
@@ -57135,6 +57431,8 @@ var TaskManager = class {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task2 = this.tasks.get(taskId);
+    if (!task2)
+      this.assertNotQuarantined(taskId);
     if (!task2 || !task2.project || !terminal3.has(task2.record.status))
       throw new BridgeError("TASK_NOT_READY", "Wait for an isolated task to finish");
     return this.withProject(task2.project, async () => {
@@ -57154,6 +57452,8 @@ var TaskManager = class {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task2 = this.tasks.get(taskId);
+    if (!task2)
+      this.assertNotQuarantined(taskId);
     if (!task2?.project || task2.record.status !== "completed" || task2.record.integratedAt)
       throw new BridgeError("INVALID_CONTEXT", "Context requires a completed, non-integrated task with a retained copy");
     return this.withProject(task2.project, async () => ({
@@ -57296,6 +57596,8 @@ var TaskManager = class {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task2 = this.tasks.get(taskId);
+    if (!task2)
+      this.assertNotQuarantined(taskId);
     if (!task2?.project || !terminal3.has(task2.record.status))
       throw new BridgeError("TASK_NOT_READY", "Wait for the task before verification");
     return this.withProject(task2.project, async () => {
@@ -57463,6 +57765,8 @@ var TaskManager = class {
     try {
       this.refresh();
       const current = this.tasks.get(sourceTaskId);
+      if (!current)
+        this.assertNotQuarantined(sourceTaskId);
       const isCompleted = current?.record.status === "completed";
       const isTestFailed = current?.record.status === "failed" && current?.record.error?.code === "TEST_FAILED";
       const isLocalExecutorFailure = current?.record.status === "failed" && current?.record.error?.code !== "TEST_FAILED" && current?.record.usageProvenance === "local-executor";
@@ -57475,6 +57779,8 @@ var TaskManager = class {
       }
       if (this.busyProjects.has(current.project))
         throw new BridgeError("TASK_NOT_READY", "Wait for all operations on this copy to finish");
+      if (this.hasQuarantinedCopySibling(current.project))
+        throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
       const currentPreview = await this.preview(sourceTaskId, false);
       if (currentPreview.sha256 !== nativeTest.expectedSha256)
         throw new BridgeError("REVIEW_CHANGED", "Copy changed while tests were queued");
@@ -57564,6 +57870,8 @@ var TaskManager = class {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task2 = this.tasks.get(taskId);
+    if (!task2)
+      this.assertNotQuarantined(taskId);
     if (!task2?.project || !terminal3.has(task2.record.status))
       throw new BridgeError("TASK_NOT_READY", "Wait for the task before recording tests");
     if (!command2.trim() || command2.length > 1e3 || !Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255 || output2.length > 4e3) {
@@ -57580,6 +57888,9 @@ var TaskManager = class {
     });
   }
   async withProject(project, operation) {
+    if (this.hasQuarantinedCopySibling(project)) {
+      throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
+    }
     if (this.busyProjects.has(project) || [...this.tasks.values()].some((task2) => task2.project === project && !terminal3.has(task2.record.status))) {
       throw new BridgeError("TASK_NOT_READY", "Wait for all operations on this copy to finish");
     }
@@ -57598,8 +57909,33 @@ var TaskManager = class {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task2 = this.tasks.get(taskId);
-    if (!task2)
-      throw new BridgeError("TASK_NOT_FOUND", `Unknown task: ${taskId}`);
+    if (!task2) {
+      const quarantined = this.quarantined.get(taskId);
+      if (!quarantined)
+        throw new BridgeError("TASK_NOT_FOUND", `Unknown task: ${taskId}`);
+      if (!DISCARDABLE_QUARANTINE_REASONS.has(quarantined.reason)) {
+        throw new BridgeError("TASK_QUARANTINED", `Task ${taskId} is quarantined: ${quarantined.reason}. This snapshot cannot be repaired by the bridge and must be removed from the state directory by its owner.`);
+      }
+      if (!quarantined.fingerprint) {
+        throw new BridgeError("STATE_BUSY", "Quarantined task snapshot has no recorded digest; retry");
+      }
+      const release = this.state.acquire("registry");
+      try {
+        this.state.discardQuarantinedProject(taskId, quarantined.fingerprint);
+        this.refresh();
+        const reloaded = this.tasks.get(taskId);
+        if (!reloaded)
+          throw new BridgeError("TASK_NOT_FOUND", `Unknown task: ${taskId}`);
+        const hadPendingInbox = Boolean(reloaded.record.inbox?.length || reloaded.record.dispatching);
+        this.failPendingInbox(void 0, reloaded, "cancelled", "COPY_DISCARDED");
+        this.recoverInboxClaims(true);
+        if (hadPendingInbox)
+          this.persist(taskId);
+        return { ...reloaded.record, tokenUsage: taskTokenUsage(reloaded.record) };
+      } finally {
+        release();
+      }
+    }
     if (!terminal3.has(task2.record.status))
       throw new BridgeError("TASK_NOT_READY", "Cancel and wait for the task before discarding");
     if (task2.project) {
@@ -57624,7 +57960,7 @@ var TaskManager = class {
     const discardedTaskIds = [];
     for (const copyDirectory of new Set([...this.tasks.values()].flatMap((task2) => task2.project ? [task2.project.copyDirectory] : []))) {
       const related = [...this.tasks.values()].filter((task2) => task2.project?.copyDirectory === copyDirectory);
-      if (!related.length || related.some((task2) => this.busyProjects.has(task2.project) || !terminal3.has(task2.record.status)))
+      if (!related.length || related.some((task2) => this.hasQuarantinedCopySibling(task2.project) || this.busyProjects.has(task2.project) || !terminal3.has(task2.record.status)))
         continue;
       const latest = Math.max(...related.map((task2) => Date.parse(task2.record.completedAt || task2.record.createdAt)));
       if (now - latest < this.config.copyRetentionHours * 36e5)
@@ -57659,6 +57995,8 @@ var TaskManager = class {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task2 = this.tasks.get(taskId);
+    if (!task2)
+      this.assertNotQuarantined(taskId);
     if (!task2 || !task2.project || task2.record.status !== "completed")
       throw new BridgeError("TASK_NOT_READY", "Only completed tasks can be integrated");
     if (task2.record.integratedAt)
@@ -57758,9 +58096,7 @@ var TaskManager = class {
     try {
       this.refresh();
       this.recoverInboxClaims(true);
-      const task2 = this.tasks.get(taskId);
-      if (!task2)
-        throw new BridgeError("TASK_NOT_FOUND", "Unknown task: " + taskId);
+      const task2 = this.requireTask(taskId);
       const existing = task2.record.inbox?.find((item2) => item2.messageId === messageId);
       if (existing && (existing.text !== text || JSON.stringify(existing.peerOrigin) !== JSON.stringify(peerOrigin)))
         throw new BridgeError("MESSAGE_ID_CONFLICT", "This message ID already identifies different text or origin");
@@ -57987,9 +58323,7 @@ var TaskManager = class {
     const release = this.state.acquire("registry");
     try {
       this.refresh();
-      const task2 = this.tasks.get(taskId);
-      if (!task2)
-        throw new BridgeError("TASK_NOT_FOUND", "Unknown task: " + taskId);
+      const task2 = this.requireTask(taskId);
       if (!task2.owned && !terminal3.has(task2.record.status))
         throw new BridgeError("TASK_OWNED_BY_OTHER_SERVER", "Change delivery in the bridge that owns the running task");
       task2.record.deliveryMode = deliveryMode;
@@ -58110,9 +58444,7 @@ var TaskManager = class {
   async cancel(taskId) {
     this.assertStateDirectoryUsable();
     this.refresh();
-    const task2 = this.tasks.get(taskId);
-    if (!task2)
-      throw new BridgeError("TASK_NOT_FOUND", `Unknown task: ${taskId}`);
+    const task2 = this.requireTask(taskId);
     if (terminal3.has(task2.record.status))
       return this.status(taskId);
     if (!task2.owned)
@@ -59091,6 +59423,10 @@ var TaskManager = class {
   }
   // A copy whose processes may still run cannot be reused; another observation may confirm they ended.
   async assertProcessesReconciled(record2) {
+    const existing = this.tasks.get(record2.taskId);
+    if (existing?.project && this.hasQuarantinedCopySibling(existing.project)) {
+      throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
+    }
     const cleanup = record2.processCleanup;
     if (!cleanup)
       return;
@@ -59102,7 +59438,12 @@ var TaskManager = class {
     }
     const task2 = this.tasks.get(record2.taskId);
     const project = task2?.project;
-    if (!project || (await readLineEndingConversions(project))?.taskId !== record2.taskId)
+    if (!project)
+      return;
+    if (this.hasQuarantinedCopySibling(project)) {
+      throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
+    }
+    if ((await readLineEndingConversions(project))?.taskId !== record2.taskId)
       return;
     if (this.busyProjects.has(project) || [...this.tasks.values()].some((other) => other.project === project && !terminal3.has(other.record.status))) {
       throw new BridgeError("TASK_NOT_READY", "Wait for all operations on this copy to finish");
@@ -59111,6 +59452,9 @@ var TaskManager = class {
     let release;
     try {
       release = this.state.acquire(this.projectLock(project));
+      if (this.hasQuarantinedCopySibling(project)) {
+        throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
+      }
       if ((await readLineEndingConversions(project))?.taskId === record2.taskId)
         await this.restoreLineEndings(task2);
     } finally {

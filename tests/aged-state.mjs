@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createHash, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { access, mkdir, readFile, realpath, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { CliAdapter } from '../dist/src/cli-adapter.js';
 import { loadConfig } from '../dist/src/config.js';
+import { copyLockName } from '../dist/src/state-store.js';
 import { TaskManager } from '../dist/src/task-manager.js';
 
 const clock = fileURLToPath(new URL('./clock-offset.mjs', import.meta.url));
@@ -119,7 +120,7 @@ export async function checkFailedCleanup(bin, root) {
     const expired = first.tasks[0];
     const retainedList = run(1, 0, 100 * 3600000).tasks.filter(task => task.taskId !== expired.taskId);
     assert.equal(retainedList.length, 1);
-    const lockFile = path.join(state, `copy-${createHash('sha256').update(expired.copyDirectory).digest('hex')}.lock`);
+    const lockFile = path.join(state, copyLockName(expired.copyDirectory) + '.lock');
     await writeFile(lockFile, JSON.stringify({ pid: process.pid, token: randomUUID() }), { flag: 'wx', mode: 0o600 });
     setLockFile(lockFile);
     return { expired, retained: retainedList[0], lockFile };

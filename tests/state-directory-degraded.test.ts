@@ -549,12 +549,14 @@ test('TaskManager enters degraded mode with unusable when StateStore constructio
   }
 });
 
-test('TaskManager enters degraded mode with unusable when refresh throws after StateStore construction succeeds', async () => {
+test('TaskManager enters degraded mode with unusable when refresh throws after StateStore construction succeeds', async t => {
   const tmpDir = mkdtempSync(path.join(os.tmpdir(), 'black-gravity-tm-corrupt-refresh-'));
   const stateDir = path.join(tmpDir, 'state');
   mkdirSync(stateDir);
-  const corruptedTaskId = randomUUID();
-  writeFileSync(path.join(stateDir, `${corruptedTaskId}.json`), '{ invalid json syntax');
+
+  t.mock.method(StateStore.prototype, 'loadWithQuarantine', () => {
+    throw new Error('disk failure during refresh load');
+  });
 
   try {
     const config = loadConfig({

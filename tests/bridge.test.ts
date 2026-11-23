@@ -1,6 +1,5 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -10,6 +9,7 @@ import { after, test } from 'node:test';
 import { CliAdapter } from '../src/cli-adapter.js';
 import { DEFAULT_PROJECT_LIMITS, loadConfig } from '../src/config.js';
 import { EventStore } from '../src/event-store.js';
+import { copyLockName } from '../src/state-store.js';
 import { LineParser } from '../src/stream-parser.js';
 import { TaskManager } from '../src/task-manager.js';
 import type { TaskRecord } from '../src/types.js';
@@ -759,7 +759,7 @@ test('startup maintenance keeps a failed cleanup for health, warns once and retr
     await adapter.discover();
     const completed = await until(tasks, (await tasks.run({ prompt: 'test', workingDirectory: dir })).taskId, done);
     const expiredAt = Date.parse(completed.completedAt!) + 168 * 3600000;
-    const lockFile = path.join(config.stateDirectory, 'copy-' + createHash('sha256').update(completed.copyDirectory!).digest('hex') + '.lock');
+    const lockFile = path.join(config.stateDirectory, copyLockName(completed.copyDirectory!) + '.lock');
     await writeFile(lockFile, JSON.stringify({ pid: process.pid }));
     const restarted = new TaskManager(adapter, config); managers.push(restarted);
     const firstWarn = await restarted.maintain(expiredAt);

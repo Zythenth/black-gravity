@@ -22,6 +22,7 @@ import { validateStateDirectory, type ConfigurationIssue } from './config.js';
 import { hasOwnedPrefix, readMigrationMarker, samePath } from './state-migration.js';
 
 const uuid = /^[a-f0-9-]{36}$/;
+const canonicalUuidSchema = z.string().uuid();
 const SANITIZED_CACHE_VERSION = 1;
 const maxSandboxPolicyFileBytes = 2 * 20 * 1000 * 6 + 4096;
 const modelSelectionSchema = z.object({ version: z.literal(1), model: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/).nullable() }).strict();
@@ -106,6 +107,76 @@ const snapshotSchema = z.object({
   // Written by versions that redact before persisting; older state is sanitized when restored.
   redacted: z.literal(true).optional(),
 });
+
+export const QUARANTINE_REASONS = [
+  'unsafe-file',
+  'unreadable',
+  'invalid-snapshot',
+  'identity-mismatch',
+  'messages-mismatch',
+  'inbox-mismatch',
+  'group-mismatch',
+  'memory-mismatch',
+  'tool-policy-mismatch',
+  'copy-outside-temporary-directory',
+  'source-mismatch',
+  'execution-policy-mismatch',
+] as const;
+
+export type QuarantineReason = (typeof QUARANTINE_REASONS)[number];
+
+export interface QuarantinedSnapshot {
+  taskId: string;
+  reason: QuarantineReason;
+  fingerprint?: string;
+  copyHints: string[];
+}
+
+class SnapshotRejection extends BridgeError {
+  constructor(
+    readonly reason: QuarantineReason,
+    message: string,
+    readonly fingerprint?: string,
+    readonly copyHints: string[] = [],
+    readonly rawError?: unknown,
+  ) {
+    super('INVALID_STATE', message);
+    this.name = 'SnapshotRejection';
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function extractCopyHints(raw: unknown): string[] {
+  if (!isRecord(raw)) return [];
+  const project = isRecord(raw.project) ? raw.project : undefined;
+  const record = isRecord(raw.record) ? raw.record : undefined;
+  const candidates = [project?.copyDirectory, project?.gitDirectory, record?.copyDirectory];
+  const hints: string[] = [];
+  for (const candidate of candidates) {
+    if (typeof candidate === 'string' && candidate.length >= 1 && candidate.length <= 4096 && !hints.includes(candidate)) {
+      hints.push(candidate);
+    }
+  }
+  return hints;
+}
+
+export function copyIdentity(directory: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform === 'win32') {
+    const backslash = directory.replaceAll('/', '\\');
+    const stripped = backslash
+      .replace(/^(?:\\\\[?.]|\\\?\?)\\UNC\\/i, '\\\\')
+      .replace(/^(?:\\\\[?.]|\\\?\?)\\(?=[A-Za-z]:)/, '');
+    return path.win32.resolve(stripped).toLowerCase();
+  }
+  return path.posix.resolve(directory);
+}
+
+export function copyLockName(copyDirectory: string, platform: NodeJS.Platform = process.platform): string {
+  return 'copy-' + createHash('sha256').update(copyIdentity(copyDirectory, platform)).digest('hex');
+}
 
 export interface StoredTask {
   record: TaskRecord;
@@ -369,10 +440,16 @@ export class StateStore {
     this.writeSnapshot(this.file(task.record.taskId), task);
   }
 
-  serializeSnapshot(task: StoredTask): string {
-    const snapshot: Record<string, unknown> = { ...task, version: 1, redacted: true, events: task.events.map(compactEvent), project: task.project && { ...task.project, baseline: [...task.project.baseline] } };
+  private formatSnapshot(task: StoredTask, preserveRedacted: boolean): string {
+    const snapshot: Record<string, unknown> = { ...task, version: 1, events: task.events.map(compactEvent), project: task.project && { ...task.project, baseline: [...task.project.baseline] } };
+    if (!preserveRedacted) snapshot.redacted = true;
+    else if (task.redacted !== true) delete snapshot.redacted;
     delete snapshot.fingerprint;
     return JSON.stringify(snapshot);
+  }
+
+  serializeSnapshot(task: StoredTask): string {
+    return this.formatSnapshot(task, false);
   }
 
   // Renames across files cannot be atomic, so a failed rename can leave a prefix of
@@ -405,70 +482,254 @@ export class StateStore {
     }
   }
 
-  private writeSnapshot(target: string, task: StoredTask): void {
+  private writeSnapshot(target: string, task: StoredTask, preserveRedacted = false): void {
     const temporary = target + '.' + randomUUID() + '.tmp';
     try {
-      writeFileSync(temporary, this.serializeSnapshot(task), { flag: 'wx', mode: 0o600, flush: true });
+      writeFileSync(temporary, this.formatSnapshot(task, preserveRedacted), { flag: 'wx', mode: 0o600, flush: true });
       replaceStateFile(temporary, target);
     } finally { rmSync(temporary, { force: true }); }
+  }
+
+  private loadSnapshotFile(
+    file: string,
+    name: string,
+    selfRealpath: string,
+    migrationOrigin: string | undefined,
+  ): StoredTask | undefined {
+    let stat;
+    try {
+      stat = lstatSync(file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw new SnapshotRejection('unreadable', 'Unreadable persisted task: ' + name, undefined, [], error);
+    }
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 70_000_000) {
+      throw new SnapshotRejection('unsafe-file', 'Unsafe persisted task file');
+    }
+    let text: string;
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw new SnapshotRejection('unreadable', 'Invalid persisted task: ' + name);
+    }
+    const fingerprint = createHash('sha256').update(text).digest('hex');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new SnapshotRejection('invalid-snapshot', 'Invalid persisted task: ' + name, fingerprint);
+    }
+    const copyHints = extractCopyHints(parsed);
+    let data: z.infer<typeof snapshotSchema>;
+    try {
+      data = snapshotSchema.parse(parsed);
+    } catch {
+      throw new SnapshotRejection('invalid-snapshot', 'Invalid persisted task: ' + name, fingerprint, copyHints);
+    }
+    if (data.record.taskId + '.json' !== name || !path.isAbsolute(data.record.workingDirectory) ||
+        data.options.workingDirectory !== data.record.workingDirectory || data.options.prompt !== data.record.prompt ||
+        data.events.some(event => event.taskId !== data.record.taskId || event.sequence > data.cursor)) {
+      throw new SnapshotRejection('identity-mismatch', 'Persisted task does not match its identity', fingerprint, copyHints);
+    }
+    const messages = data.record.messages ?? [];
+    if (messages.some((message, index) => message.taskId !== data.record.taskId || message.sequence > (data.record.messageCursor ?? 0) ||
+      (index > 0 && messages[index - 1]!.sequence >= message.sequence))) {
+      throw new SnapshotRejection('messages-mismatch', 'Persisted messages do not match task identity or cursor', fingerprint, copyHints);
+    }
+    const inbox = data.record.inbox ?? [];
+    if (new Set(inbox.map(item => item.messageId.toLowerCase())).size !== inbox.length ||
+      inbox.some(item => item.taskId !== data.record.taskId || item.receipt.taskId !== data.record.taskId || item.receipt.messageId !== item.messageId) ||
+      (data.record.dispatching && !inbox.some(item => item.messageId === data.record.dispatching!.messageId && item.receipt.state === 'queued'))) {
+      throw new SnapshotRejection('inbox-mismatch', 'Persisted inbox does not match task identity', fingerprint, copyHints);
+    }
+    if (JSON.stringify(data.record.group) !== JSON.stringify(data.options.group)) {
+      throw new SnapshotRejection('group-mismatch', 'Persisted group assignment differs from task options', fingerprint, copyHints);
+    }
+    if ((data.record.peerRequests || data.options.peerContext || data.options.peerOrigin) && !data.record.group) {
+      throw new SnapshotRejection('group-mismatch', 'Peer state requires group membership', fingerprint, copyHints);
+    }
+    if (data.options.peerContext && (data.options.peerContext.groupId.toLowerCase() !== data.record.group!.groupId.toLowerCase() ||
+        data.options.peerContext.nodeKey !== data.record.group!.nodeKey)) {
+      throw new SnapshotRejection('group-mismatch', 'Peer context differs from task group', fingerprint, copyHints);
+    }
+    if (data.options.peerOrigin && (!data.record.sourceMessage || data.options.peerOrigin.groupId.toLowerCase() !== data.record.group!.groupId.toLowerCase())) {
+      throw new SnapshotRejection('group-mismatch', 'Peer input differs from its continuation', fingerprint, copyHints);
+    }
+    const snapshots = data.options.memorySnapshots;
+    if (snapshots?.some(entry => entry.projectId !== computeProjectId(data.record.workingDirectory)) ||
+        JSON.stringify(data.record.memory) !== JSON.stringify(summarizeMemory(snapshots)) ||
+        JSON.stringify(data.options.memory) !== JSON.stringify(snapshots?.map(({ specialist, sha256 }) => ({ specialist, sha256 })))) {
+      throw new SnapshotRejection('memory-mismatch', 'Persisted private memory differs from its project, hashes or metadata', fingerprint, copyHints);
+    }
+    if (data.record.agentPolicy?.sha256 !== data.options.agentPolicy?.sha256) {
+      throw new SnapshotRejection('tool-policy-mismatch', 'Persisted task tool policies disagree', fingerprint, copyHints);
+    }
+    if (data.project) {
+      for (const [directory, kind] of [[data.project.copyDirectory, 'copy'], [data.project.gitDirectory, 'baseline']] as const) {
+        if (!path.isAbsolute(directory) || path.relative(os.tmpdir(), path.dirname(directory)) !== '' || !hasOwnedPrefix(path.basename(directory), kind)) {
+          throw new SnapshotRejection('copy-outside-temporary-directory', 'Persisted copy is outside bridge temporary storage', fingerprint, copyHints);
+        }
+      }
+      if (data.project.sourceDirectory !== data.record.workingDirectory) {
+        throw new SnapshotRejection('source-mismatch', 'Persisted source differs from task', fingerprint, copyHints);
+      }
+      if (Boolean(data.project.executionPolicy) !== Boolean(data.project.executionStateDirectory) ||
+          (data.project.executionPolicy && data.project.executionPolicy.policy.sha256 !== data.record.agentPolicy?.sha256) ||
+          (data.project.executionStateDirectory && !this.tryOwnsExecutionState(data.project.executionStateDirectory, selfRealpath, migrationOrigin))) {
+        throw new SnapshotRejection('execution-policy-mismatch', 'Persisted execution policy differs from task or private storage', fingerprint, copyHints);
+      }
+    }
+    try {
+      return { ...data, events: data.events.map(expandEvent), fingerprint, record: data.record as unknown as TaskRecord, options: data.options as RunOptions,
+        project: data.project && { ...data.project, baseline: new Map(data.project.baseline) } };
+    } catch {
+      throw new SnapshotRejection('invalid-snapshot', 'Invalid persisted task: ' + name, fingerprint, copyHints);
+    }
   }
 
   // With a source, only that file is read, validated as the snapshot the task file name would hold.
   load(source?: { file: string; name: string }): StoredTask[] {
     const names = source ? [source.name] : readdirSync(this.directory).filter(name => uuid.test(name.slice(0, -5)) && name.endsWith('.json'));
-    return names.map(name => {
+    const selfRealpath = realpathSync.native(this.directory);
+    const migrationOrigin = readMigrationMarker(this.directory)?.source;
+    const tasks: StoredTask[] = [];
+    for (const name of names) {
       const file = source?.file ?? path.join(this.directory, name);
-      const stat = lstatSync(file);
-      if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 70_000_000) throw new BridgeError('INVALID_STATE', 'Unsafe persisted task file');
-      let data, fingerprint: string;
-      try { const text = readFileSync(file, 'utf8'); fingerprint = createHash('sha256').update(text).digest('hex'); data = snapshotSchema.parse(JSON.parse(text)); }
-      catch { throw new BridgeError('INVALID_STATE', 'Invalid persisted task: ' + name); }
-      if (data.record.taskId + '.json' !== name || !path.isAbsolute(data.record.workingDirectory) ||
-          data.options.workingDirectory !== data.record.workingDirectory || data.options.prompt !== data.record.prompt ||
-          data.events.some(event => event.taskId !== data.record.taskId || event.sequence > data.cursor)) {
-        throw new BridgeError('INVALID_STATE', 'Persisted task does not match its identity');
-      }
-      const messages = data.record.messages ?? [];
-      if (messages.some((message, index) => message.taskId !== data.record.taskId || message.sequence > (data.record.messageCursor ?? 0) ||
-        (index > 0 && messages[index - 1]!.sequence >= message.sequence))) throw new BridgeError('INVALID_STATE', 'Persisted messages do not match task identity or cursor');
-      const inbox = data.record.inbox ?? [];
-      if (new Set(inbox.map(item => item.messageId.toLowerCase())).size !== inbox.length ||
-        inbox.some(item => item.taskId !== data.record.taskId || item.receipt.taskId !== data.record.taskId || item.receipt.messageId !== item.messageId) ||
-        (data.record.dispatching && !inbox.some(item => item.messageId === data.record.dispatching!.messageId && item.receipt.state === 'queued'))) {
-        throw new BridgeError('INVALID_STATE', 'Persisted inbox does not match task identity');
-      }
-      if (JSON.stringify(data.record.group) !== JSON.stringify(data.options.group)) throw new BridgeError('INVALID_STATE', 'Persisted group assignment differs from task options');
-      if ((data.record.peerRequests || data.options.peerContext || data.options.peerOrigin) && !data.record.group) throw new BridgeError('INVALID_STATE', 'Peer state requires group membership');
-      if (data.options.peerContext && (data.options.peerContext.groupId.toLowerCase() !== data.record.group!.groupId.toLowerCase() ||
-          data.options.peerContext.nodeKey !== data.record.group!.nodeKey)) throw new BridgeError('INVALID_STATE', 'Peer context differs from task group');
-      if (data.options.peerOrigin && (!data.record.sourceMessage || data.options.peerOrigin.groupId.toLowerCase() !== data.record.group!.groupId.toLowerCase())) throw new BridgeError('INVALID_STATE', 'Peer input differs from its continuation');
-      const snapshots = data.options.memorySnapshots;
-      if (snapshots?.some(entry => entry.projectId !== computeProjectId(data.record.workingDirectory)) ||
-          JSON.stringify(data.record.memory) !== JSON.stringify(summarizeMemory(snapshots)) ||
-          JSON.stringify(data.options.memory) !== JSON.stringify(snapshots?.map(({ specialist, sha256 }) => ({ specialist, sha256 })))) {
-        throw new BridgeError('INVALID_STATE', 'Persisted private memory differs from its project, hashes or metadata');
-      }
-      if (data.record.agentPolicy?.sha256 !== data.options.agentPolicy?.sha256) throw new BridgeError('INVALID_STATE', 'Persisted task tool policies disagree');
-      if (data.project) {
-        if (Boolean(data.project.executionPolicy) !== Boolean(data.project.executionStateDirectory) || (data.project.executionStateDirectory && !this.ownsExecutionState(data.project.executionStateDirectory)) || (data.project.executionPolicy && data.project.executionPolicy.policy.sha256 !== data.record.agentPolicy?.sha256)) throw new BridgeError('INVALID_STATE', 'Persisted execution policy differs from task or private storage');
-        for (const [directory, kind] of [[data.project.copyDirectory, 'copy'], [data.project.gitDirectory, 'baseline']] as const) {
-          if (!path.isAbsolute(directory) || path.relative(os.tmpdir(), path.dirname(directory)) !== '' || !hasOwnedPrefix(path.basename(directory), kind)) {
-            throw new BridgeError('INVALID_STATE', 'Persisted copy is outside bridge temporary storage');
-          }
+      try {
+        const task = this.loadSnapshotFile(file, name, selfRealpath, migrationOrigin);
+        if (task) tasks.push(task);
+      } catch (error) {
+        if (error instanceof SnapshotRejection) {
+          if (error.rawError !== undefined) throw error.rawError;
+          throw new BridgeError('INVALID_STATE', error.message);
         }
-        if (data.project.sourceDirectory !== data.record.workingDirectory) throw new BridgeError('INVALID_STATE', 'Persisted source differs from task');
+        throw error;
       }
-      return { ...data, events: data.events.map(expandEvent), fingerprint, record: data.record as unknown as TaskRecord, options: data.options as RunOptions,
-        project: data.project && { ...data.project, baseline: new Map(data.project.baseline) } };
-    }).sort((a, b) => a.record.createdAt.localeCompare(b.record.createdAt));
+    }
+    return tasks.sort((a, b) => a.record.createdAt.localeCompare(b.record.createdAt));
+  }
+
+  loadWithQuarantine(): { tasks: StoredTask[]; quarantined: QuarantinedSnapshot[] } {
+    const names = readdirSync(this.directory).filter(name => {
+      if (!name.endsWith('.json')) return false;
+      const stem = name.slice(0, -5);
+      return stem === stem.toLowerCase() && canonicalUuidSchema.safeParse(stem).success;
+    });
+    const selfRealpath = realpathSync.native(this.directory);
+    const migrationOrigin = readMigrationMarker(this.directory)?.source;
+    const tasks: StoredTask[] = [];
+    const quarantined: QuarantinedSnapshot[] = [];
+    for (const name of names) {
+      const file = path.join(this.directory, name);
+      try {
+        const task = this.loadSnapshotFile(file, name, selfRealpath, migrationOrigin);
+        if (task) tasks.push(task);
+      } catch (error) {
+        if (error instanceof SnapshotRejection) {
+          quarantined.push({
+            taskId: name.slice(0, -5),
+            reason: error.reason,
+            ...(error.fingerprint !== undefined ? { fingerprint: error.fingerprint } : {}),
+            copyHints: error.copyHints,
+          });
+        } else {
+          throw error;
+        }
+      }
+    }
+    return {
+      tasks: tasks.sort((a, b) => a.record.createdAt.localeCompare(b.record.createdAt)),
+      quarantined: quarantined.sort((a, b) => a.taskId.localeCompare(b.taskId)),
+    };
+  }
+
+  private readQuarantinedForDiscard(file: string, expectedFingerprint: string): z.infer<typeof snapshotSchema> {
+    let stat;
+    try {
+      stat = lstatSync(file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new BridgeError('STATE_BUSY', 'Quarantined task snapshot disappeared before discard');
+      }
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 70_000_000) {
+      throw new BridgeError('STATE_BUSY', 'Quarantined task snapshot changed before discard');
+    }
+    let text: string;
+    try {
+      text = readFileSync(file, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+        throw new BridgeError('STATE_BUSY', 'Quarantined task snapshot disappeared before discard');
+      }
+      throw new BridgeError('STATE_BUSY', 'Quarantined task snapshot could not be read for discard');
+    }
+    const fingerprint = createHash('sha256').update(text).digest('hex');
+    if (fingerprint !== expectedFingerprint) {
+      throw new BridgeError('STATE_BUSY', 'Quarantined task snapshot changed before discard');
+    }
+    let data: z.infer<typeof snapshotSchema>;
+    try {
+      data = snapshotSchema.parse(JSON.parse(text));
+    } catch {
+      throw new BridgeError('STATE_BUSY', 'Quarantined task snapshot changed before discard');
+    }
+    if (data.ownerPid !== process.pid && processAlive(data.ownerPid)) {
+      throw new BridgeError('TASK_OWNED_BY_OTHER_SERVER', 'Discard the task in the bridge process that owns it');
+    }
+    if (!['completed', 'failed', 'cancelled', 'timeout'].includes(data.record.status)) {
+      throw new BridgeError('TASK_NOT_READY', 'Cancel and wait for the task before discarding');
+    }
+    return data;
+  }
+
+  discardQuarantinedProject(taskId: string, expectedFingerprint: string): StoredTask {
+    const file = this.file(taskId);
+    let data = this.readQuarantinedForDiscard(file, expectedFingerprint);
+    const lockNames = [...new Set(
+      [data.project?.copyDirectory, data.record.copyDirectory]
+        .filter((value): value is string => typeof value === 'string' && value.length > 0)
+        .map(directory => copyLockName(directory)),
+    )].sort();
+    const releases: Array<() => void> = [];
+    try {
+      for (const lockName of lockNames) {
+        releases.push(this.acquire(lockName));
+      }
+      if (releases.length > 0) {
+        data = this.readQuarantinedForDiscard(file, expectedFingerprint);
+      }
+      const record = { ...data.record, discardedAt: new Date().toISOString() } as unknown as TaskRecord;
+      const updated: StoredTask = {
+        record,
+        options: data.options as RunOptions,
+        ownerPid: data.ownerPid,
+        events: data.events.map(expandEvent),
+        cursor: data.cursor,
+        ...(data.redacted ? { redacted: true as const } : {}),
+      };
+      this.writeSnapshot(file, updated, true);
+      return updated;
+    } finally {
+      while (releases.length > 0) releases.pop()!();
+    }
   }
 
   // Sanitized copies of legacy snapshots are cached per source file version; the source file itself is left to its writers.
   /** Tasks carried over by the migration keep their receipts in the root they were created in. */
-  private ownsExecutionState(directory: string): boolean {
-    const origin = readMigrationMarker(this.directory)?.source;
-    if (origin && samePath(directory, origin)) return true;
-    return path.relative(realpathSync.native(directory), realpathSync.native(this.directory)) === '';
+  private ownsExecutionState(directory: string, selfRealpath: string, migrationOrigin?: string): boolean {
+    if (migrationOrigin && samePath(directory, migrationOrigin)) return true;
+    return path.relative(realpathSync.native(directory), selfRealpath) === '';
+  }
+
+  private tryOwnsExecutionState(directory: string, selfRealpath: string, migrationOrigin?: string): boolean {
+    try {
+      return this.ownsExecutionState(directory, selfRealpath, migrationOrigin);
+    } catch {
+      return false;
+    }
   }
 
   private sanitizedDirectory(): string {

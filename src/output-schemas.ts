@@ -4,6 +4,7 @@ import { memorySummarySchema } from './project-memory.js';
 import { memorySelectionSchema } from './memory-context.js';
 import { z } from 'zod';
 import { resolvedAgentPolicySchema, nativeToolsSchema, mcpSelectionSchema, mcpCatalogToolSchema } from './agent-policy.js';
+import { QUARANTINE_REASONS } from './state-store.js';
 import { bridgeMessageSchema, deliveryModeSchema } from './messages.js';
 import { stagedSkillsSchema } from './skills.js';
 import { criterionSchema, reviewEvidenceSchema } from './verification.js';
@@ -167,6 +168,11 @@ const modelResolutionSchema = z.object({
   errorCode: z.string().optional(),
 }).strict();
 
+const quarantinedTaskSchema = z.object({
+  taskId: id,
+  reason: z.enum(QUARANTINE_REASONS),
+}).strict();
+
 export const successOutputSchemas = {
   black_gravity_wait_many: z.object({ ready: z.boolean(), timedOut: z.boolean(), hasMoreMessages: z.boolean(), tasks: z.array(jointWaitTaskSchema).max(32), waitCommand: waitCommandSchema.optional() }).strict(),
   black_gravity_workflow_result: z.object({ groupId: id, finalNode: z.string(), taskId: id, outputSha256: hash, summary: z.string().max(2000).optional(),
@@ -187,6 +193,7 @@ export const successOutputSchemas = {
     approvalMode: z.enum(['auto', 'ask']).optional(),
     configurationIssues: z.array(z.object({ variable: z.string(), index: count.optional(), reason: z.enum(['invalid-json', 'not-a-list', 'too-many-entries', 'not-a-string', 'not-absolute', 'not-found', 'access-denied', 'not-a-directory', 'volume-root', 'unresolvable', 'not-an-object', 'legacy-format', 'invalid-format', 'invalid-name', 'forbidden-name', 'invalid-pattern', 'invalid-entry', 'duplicate', 'too-large', 'unsafe-file', 'link', 'not-directory', 'unusable', 'opt-out-unsupported', 'legacy-state-busy', 'legacy-state-conflict', 'legacy-state-migration-failed']) }).strict()).optional(),
     maintenanceIssues: z.array(z.object({ operation: z.literal('copy-cleanup'), code: z.string().regex(/^[A-Z][A-Z0-9_]{0,63}$/), since: z.string(), failures: count }).strict()).optional(),
+    quarantinedTasks: z.array(quarantinedTaskSchema).optional(),
     installed: z.boolean(), path: z.string(), version: z.string().optional(), authenticated: z.boolean().nullable(),
     capabilities: z.object({
       structuredOutput: z.boolean(), streaming: z.boolean(), sandbox: z.boolean(), readOnlyMode: z.boolean(),
@@ -274,7 +281,10 @@ export const successOutputSchemas = {
   black_gravity_discard: task,
   black_gravity_cleanup: z.object({ discardedTaskIds: z.array(id) }).strict(),
   black_gravity_status: task,
-  black_gravity_tasks: z.object({ tasks: z.array(taskRecordSchema) }).strict(),
+  black_gravity_tasks: z.object({
+    tasks: z.array(taskRecordSchema),
+    quarantinedTasks: z.array(quarantinedTaskSchema).optional(),
+  }).strict(),
   black_gravity_events: z.object({
     events: z.array(z.object({ taskId: id, sequence: z.number().int().positive(), timestamp, type: z.string(), data: z.unknown(), raw: z.unknown().optional() }).strict()),
     nextCursor: count, oldestAvailable: z.number().int().positive(), truncated: z.boolean(),

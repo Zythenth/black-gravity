@@ -138,6 +138,7 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
       approvalMode: tasks.approvalMode,
       configurationIssues: tasks.configurationIssues,
       maintenanceIssues: tasks.maintenanceIssues,
+      ...(tasks.isStateDirectoryUsable() ? { quarantinedTasks: tasks.currentQuarantinedTasks() } : {}),
       windowsRuntime: await tasks.windowsRuntimeStatus(),
       testExecutor: tasks.testExecutorStatus(),
       antiAiCraft: await tasks.antiAiCraftStatus(),
@@ -521,9 +522,12 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_tasks')) server.registerTool('black_gravity_tasks', {
     outputSchema: outputSchemas.black_gravity_tasks,
-    description: 'Recover task IDs and metadata from local bridge state, including tasks from earlier server processes.',
+    description: 'Recover task IDs and metadata from local bridge state, including tasks from earlier server processes and quarantined snapshots.',
     inputSchema: {},
-  }, safe(() => ({ tasks: tasks.list().map(task => { const delivered = clientTask(task); if ('prompt' in delivered) { const { prompt: _prompt, ...metadata } = delivered; return metadata; } return delivered; }) })));
+  }, safe(() => ({
+    tasks: tasks.list().map(task => { const delivered = clientTask(task); if ('prompt' in delivered) { const { prompt: _prompt, ...metadata } = delivered; return metadata; } return delivered; }),
+    quarantinedTasks: tasks.lastQuarantinedTasks(),
+  })));
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_events')) server.registerTool('black_gravity_events', {
     outputSchema: outputSchemas.black_gravity_events,
