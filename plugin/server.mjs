@@ -29632,7 +29632,7 @@ var peerContextSchema = external_exports.object({
 
 // dist/src/cli-adapter.js
 import { randomUUID as randomUUID6 } from "node:crypto";
-import { lstatSync as lstatSync3, mkdirSync as mkdirSync3, realpathSync as realpathSync3, unlinkSync, writeFileSync as writeFileSync3 } from "node:fs";
+import { lstatSync as lstatSync4, mkdirSync as mkdirSync3, realpathSync as realpathSync3, unlinkSync, writeFileSync as writeFileSync4 } from "node:fs";
 import { access as access2 } from "node:fs/promises";
 import path15 from "node:path";
 
@@ -30754,7 +30754,7 @@ async function git(cwd, args, input2, allowedCodes = [0], options) {
 
 // dist/src/isolation.js
 import { isUtf8 } from "node:buffer";
-import { createReadStream as createReadStream3 } from "node:fs";
+import { createReadStream as createReadStream3, lstatSync as lstatSync3, readFileSync as readFileSync3, renameSync as renameSync3, rmSync as rmSync3, writeFileSync as writeFileSync3 } from "node:fs";
 import { link, lstat as lstat6, mkdir as mkdir4, mkdtemp, open as open4, readdir as readdir4, readFile as readFile4, realpath as realpath5, rename as rename2, rm as rm2, unlink as unlink3, writeFile as writeFile5 } from "node:fs/promises";
 import os4 from "node:os";
 import path11 from "node:path";
@@ -32499,10 +32499,10 @@ async function hookMain() {
         "absolute_path"
       ].filter((key) => key !== expectedTargetKey);
       const hasUnambiguousTarget = hasObjectArgs && !conflictingTargetKeys.some((key) => key in args);
-      const isPlainObject3 = (val) => Boolean(val) && typeof val === "object" && !Array.isArray(val);
+      const isPlainObject4 = (val) => Boolean(val) && typeof val === "object" && !Array.isArray(val);
       const modernAllowedKeys = toolName === "read_file" ? ["Path", "StartLine", "EndLine", "ByteOffset", "toolAction", "toolSummary"] : toolName === "write_file" ? ["Path", "Content", "Overwrite", "Append", "ArtifactMetadata", "toolAction", "toolSummary"] : ["Path", "Target", "Replacement", "ArtifactMetadata", "toolAction", "toolSummary"];
       const modernMetadataValid = hasObjectArgs && ["toolAction", "toolSummary"].every((key) => args[key] === void 0 || typeof args[key] === "string" && args[key].length <= 2e3);
-      const modernEnvelopeValid = !isModernFileTool || modernMetadataValid && Object.keys(args).every((key) => modernAllowedKeys.includes(key)) && (toolName !== "read_file" || (args.StartLine === void 0 || Number.isSafeInteger(args.StartLine) && args.StartLine >= 1) && (args.EndLine === void 0 || Number.isSafeInteger(args.EndLine) && args.EndLine >= 1) && (args.StartLine === void 0 || args.EndLine === void 0 || args.StartLine <= args.EndLine) && (args.ByteOffset === void 0 || Number.isSafeInteger(args.ByteOffset) && args.ByteOffset >= 0)) && (toolName !== "write_file" || typeof args.Content === "string" && (args.Overwrite === void 0 || typeof args.Overwrite === "boolean") && (args.Append === void 0 || typeof args.Append === "boolean") && !(args.Append === true && args.Overwrite === true) && (args.ArtifactMetadata === void 0 || isPlainObject3(args.ArtifactMetadata))) && (toolName !== "edit_file" || typeof args.Target === "string" && typeof args.Replacement === "string" && (args.ArtifactMetadata === void 0 || isPlainObject3(args.ArtifactMetadata)));
+      const modernEnvelopeValid = !isModernFileTool || modernMetadataValid && Object.keys(args).every((key) => modernAllowedKeys.includes(key)) && (toolName !== "read_file" || (args.StartLine === void 0 || Number.isSafeInteger(args.StartLine) && args.StartLine >= 1) && (args.EndLine === void 0 || Number.isSafeInteger(args.EndLine) && args.EndLine >= 1) && (args.StartLine === void 0 || args.EndLine === void 0 || args.StartLine <= args.EndLine) && (args.ByteOffset === void 0 || Number.isSafeInteger(args.ByteOffset) && args.ByteOffset >= 0)) && (toolName !== "write_file" || typeof args.Content === "string" && (args.Overwrite === void 0 || typeof args.Overwrite === "boolean") && (args.Append === void 0 || typeof args.Append === "boolean") && !(args.Append === true && args.Overwrite === true) && (args.ArtifactMetadata === void 0 || isPlainObject4(args.ArtifactMetadata))) && (toolName !== "edit_file" || typeof args.Target === "string" && typeof args.Replacement === "string" && (args.ArtifactMetadata === void 0 || isPlainObject4(args.ArtifactMetadata)));
       const rawTarget = hasUnambiguousTarget && modernEnvelopeValid ? args[expectedTargetKey] : void 0;
       let pathValid = typeof rawTarget === "string" && rawTarget.length > 0 && rawTarget.length <= 4e3;
       let pathDenyReason = "Invalid or non-absolute target file path";
@@ -34348,6 +34348,99 @@ async function assertLineEndingsRestored(project) {
 }
 async function clearLineEndingConversions(project) {
   await rm2(path11.join(project.gitDirectory, LINE_ENDINGS_MARKER_NAME), { force: true });
+}
+var PROCESS_CLEANUP_MARKER_NAME = "PROCESS_CLEANUP_UNVERIFIED";
+function isPlainObject2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function writeProcessCleanupMarkerSync(project, marker) {
+  const target = path11.join(project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME);
+  const temporary = path11.join(project.gitDirectory, `${PROCESS_CLEANUP_MARKER_NAME}.${randomUUID4()}.tmp`);
+  try {
+    writeFileSync3(temporary, JSON.stringify(marker) + "\n", { encoding: "utf8", flag: "wx", mode: 384, flush: true });
+    renameSync3(temporary, target);
+  } finally {
+    rmSync3(temporary, { force: true });
+  }
+}
+function readProcessCleanupMarkerSync(project) {
+  const markerPath = path11.join(project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME);
+  let info;
+  try {
+    info = lstatSync3(markerPath);
+  } catch (error62) {
+    if (error62.code === "ENOENT")
+      return void 0;
+    throw new BridgeError("PROCESS_CLEANUP_UNVERIFIED", "The unverified process cleanup record is unreadable; discard this copy");
+  }
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new BridgeError("PROCESS_CLEANUP_UNVERIFIED", "The unverified process cleanup record is not a regular file; discard this copy");
+  }
+  let raw;
+  try {
+    raw = readFileSync3(markerPath, "utf8");
+  } catch (error62) {
+    if (error62.code === "ENOENT")
+      return void 0;
+    throw new BridgeError("PROCESS_CLEANUP_UNVERIFIED", "The unverified process cleanup record is unreadable; discard this copy");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new BridgeError("PROCESS_CLEANUP_UNVERIFIED", "The unverified process cleanup record is unreadable; discard this copy");
+  }
+  if (!isPlainObject2(parsed) || parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+    throw new BridgeError("PROCESS_CLEANUP_UNVERIFIED", "The unverified process cleanup record is unreadable; discard this copy");
+  }
+  const entries2 = [];
+  for (const item of parsed.entries) {
+    if (!isPlainObject2(item) || typeof item.launchId !== "string" || !item.launchId || typeof item.taskId !== "string" || !item.taskId || typeof item.provider !== "string" || !item.provider || typeof item.spawnedAt !== "string" || !Number.isFinite(Date.parse(item.spawnedAt)) || item.pid !== void 0 && (typeof item.pid !== "number" || !Number.isInteger(item.pid) || item.pid <= 0)) {
+      throw new BridgeError("PROCESS_CLEANUP_UNVERIFIED", "The unverified process cleanup record is unreadable; discard this copy");
+    }
+    entries2.push({
+      launchId: item.launchId,
+      taskId: item.taskId,
+      provider: item.provider,
+      ...typeof item.pid === "number" ? { pid: item.pid } : {},
+      spawnedAt: item.spawnedAt
+    });
+  }
+  return { version: 1, entries: entries2 };
+}
+function upsertProcessCleanupMarkerEntrySync(project, entry2) {
+  const existing = readProcessCleanupMarkerSync(project);
+  const normalized = {
+    launchId: entry2.launchId,
+    taskId: entry2.taskId,
+    provider: entry2.provider,
+    ...typeof entry2.pid === "number" && Number.isInteger(entry2.pid) && entry2.pid > 0 ? { pid: entry2.pid } : {},
+    spawnedAt: entry2.spawnedAt
+  };
+  const entries2 = existing ? [...existing.entries] : [];
+  const index = entries2.findIndex((item) => item.launchId === normalized.launchId);
+  if (index >= 0)
+    entries2[index] = normalized;
+  else
+    entries2.push(normalized);
+  writeProcessCleanupMarkerSync(project, { version: 1, entries: entries2 });
+}
+function removeProcessCleanupMarkerEntriesSync(project, launchIds) {
+  const existing = readProcessCleanupMarkerSync(project);
+  if (!existing)
+    return;
+  const ids = new Set(launchIds);
+  const remaining = existing.entries.filter((entry2) => !ids.has(entry2.launchId));
+  if (remaining.length === 0) {
+    rmSync3(path11.join(project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME), { force: true });
+    return;
+  }
+  if (remaining.length === existing.entries.length)
+    return;
+  writeProcessCleanupMarkerSync(project, { version: 1, entries: remaining });
+}
+function removeProcessCleanupMarkerEntrySync(project, launchId) {
+  removeProcessCleanupMarkerEntriesSync(project, [launchId]);
 }
 var COPY_MISSING_MESSAGE = "The isolated copy of this task no longer exists; a restart or a temporary-directory cleanup may have removed it. The bridge does not recreate it and never runs in the original project. Discard the task and start a new one.";
 var BASELINE_MISSING_MESSAGE = "The private baseline of this task's isolated copy no longer exists; a restart or a temporary-directory cleanup may have removed it. The bridge does not recreate it and never runs in the original project. Discard the task and start a new one.";
@@ -37506,17 +37599,17 @@ function stageSchemaFile(stateDirectory, content) {
   if (!path15.isAbsolute(stateDirectory))
     throw new BridgeError("INVALID_STATE_DIRECTORY", "Schema storage must be absolute");
   mkdirSync3(stateDirectory, { recursive: true, mode: 448 });
-  if (lstatSync3(stateDirectory).isSymbolicLink())
+  if (lstatSync4(stateDirectory).isSymbolicLink())
     throw new BridgeError("INVALID_STATE_DIRECTORY", "Schema storage cannot be a link");
   const root = realpathSync3.native(stateDirectory);
-  const identity = lstatSync3(root);
+  const identity = lstatSync4(root);
   const file3 = path15.join(root, "cli-schema-" + randomUUID6() + ".json");
-  writeFileSync3(file3, content, { flag: "wx", mode: 384 });
+  writeFileSync4(file3, content, { flag: "wx", mode: 384 });
   let cleaned = false;
   return { file: file3, cleanup() {
     if (cleaned)
       return;
-    const current = lstatSync3(root);
+    const current = lstatSync4(root);
     if (!current.isDirectory() || current.isSymbolicLink() || current.dev !== identity.dev || current.ino !== identity.ino) {
       throw new BridgeError("SCHEMA_CLEANUP_FAILED", "Schema storage changed; private schema was preserved");
     }
@@ -38262,14 +38355,11 @@ function sanitizePayload(value, options = {}) {
 // dist/src/process-tree.js
 import { spawn as spawn4 } from "node:child_process";
 import path17 from "node:path";
-async function listWindowsProcesses() {
-  const systemRoot = process.env.SystemRoot || "C:\\Windows";
-  const powershell = path17.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
-  const script = 'Get-CimInstance Win32_Process | ForEach-Object { if ($_.CreationDate) { "$($_.ProcessId) $($_.ParentProcessId) $($_.CreationDate.ToFileTimeUtc())" } }';
+function runBoundedCommand(executable, args) {
   return new Promise((resolve2, reject) => {
     let child;
     try {
-      child = spawn4(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], {
+      child = spawn4(executable, [...args], {
         shell: false,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"]
@@ -38322,38 +38412,44 @@ async function listWindowsProcesses() {
         reject(new Error(`Process listing exited with code ${code}`));
         return;
       }
-      const output2 = Buffer.concat(chunks).toString("utf8");
-      const lines = output2.split(/\r?\n/);
-      const processes = [];
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed)
-          continue;
-        const parts = trimmed.split(/\s+/);
-        if (parts.length < 3)
-          continue;
-        const pid = Number(parts[0]);
-        const parentPid = Number(parts[1]);
-        const ftStr = parts[2];
-        if (!Number.isInteger(pid) || pid < 0 || !Number.isInteger(parentPid) || parentPid < 0) {
-          continue;
-        }
-        if (!ftStr || !/^\d+$/.test(ftStr)) {
-          continue;
-        }
-        try {
-          const ft = BigInt(ftStr);
-          const createdAt = Number(ft / 10000n) - 116444736e5;
-          if (!Number.isFinite(createdAt))
-            continue;
-          processes.push({ pid, parentPid, createdAt });
-        } catch {
-          continue;
-        }
-      }
-      resolve2(processes);
+      resolve2(Buffer.concat(chunks).toString("utf8"));
     });
   });
+}
+async function listWindowsProcesses() {
+  const systemRoot = process.env.SystemRoot || "C:\\Windows";
+  const powershell = path17.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const script = 'Get-CimInstance Win32_Process | ForEach-Object { if ($_.CreationDate) { "$($_.ProcessId) $($_.ParentProcessId) $($_.CreationDate.ToFileTimeUtc())" } }';
+  const output2 = await runBoundedCommand(powershell, ["-NoProfile", "-NonInteractive", "-Command", script]);
+  const lines = output2.split(/\r?\n/);
+  const processes = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed)
+      continue;
+    const parts = trimmed.split(/\s+/);
+    if (parts.length < 3)
+      continue;
+    const pid = Number(parts[0]);
+    const parentPid = Number(parts[1]);
+    const ftStr = parts[2];
+    if (!Number.isInteger(pid) || pid < 0 || !Number.isInteger(parentPid) || parentPid < 0) {
+      continue;
+    }
+    if (!ftStr || !/^\d+$/.test(ftStr)) {
+      continue;
+    }
+    try {
+      const ft = BigInt(ftStr);
+      const createdAt = Number(ft / 10000n) - 116444736e5;
+      if (!Number.isFinite(createdAt))
+        continue;
+      processes.push({ pid, parentPid, createdAt });
+    } catch {
+      continue;
+    }
+  }
+  return processes;
 }
 function ownedProcesses(processes, rootPid, spawnedAt) {
   const root = processes.find((p) => p.pid === rootPid && p.createdAt >= spawnedAt - 2e3);
@@ -38913,7 +39009,8 @@ var AgyExecutionAdapter = class {
       };
     }
   }
-  async execute(request, hooks) {
+  async execute(request, context) {
+    const hooks = context;
     const terminationBefore = this.terminationFromSignal(hooks);
     if (terminationBefore) {
       return this.terminatedResult(request.taskId, terminationBefore, void 0, void 0, void 0, 0);
@@ -46446,7 +46543,7 @@ var Protocol = class {
     };
   }
 };
-function isPlainObject2(value) {
+function isPlainObject3(value) {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 function mergeCapabilities(base, additional) {
@@ -46457,7 +46554,7 @@ function mergeCapabilities(base, additional) {
     if (addValue === void 0)
       continue;
     const baseValue = result[k];
-    if (isPlainObject2(baseValue) && isPlainObject2(addValue)) {
+    if (isPlainObject3(baseValue) && isPlainObject3(addValue)) {
       result[k] = { ...baseValue, ...addValue };
     } else {
       result[k] = addValue;
@@ -47966,7 +48063,7 @@ var EMPTY_COMPLETION_RESULT = {
 
 // dist/src/state-store.js
 import { createHash as createHash20, randomUUID as randomUUID8 } from "node:crypto";
-import { closeSync as closeSync3, lstatSync as lstatSync4, mkdirSync as mkdirSync4, openSync as openSync3, readFileSync as readFileSync3, readdirSync as readdirSync3, realpathSync as realpathSync4, renameSync as renameSync3, rmSync as rmSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { closeSync as closeSync3, lstatSync as lstatSync5, mkdirSync as mkdirSync4, openSync as openSync3, readFileSync as readFileSync4, readdirSync as readdirSync3, realpathSync as realpathSync4, renameSync as renameSync4, rmSync as rmSync4, writeFileSync as writeFileSync5 } from "node:fs";
 import path19 from "node:path";
 import os7 from "node:os";
 
@@ -48448,12 +48545,12 @@ function assertReplaceable(target) {
   });
 }
 function replaceStateFile2(temporary, target) {
-  retryTransient(() => renameSync3(temporary, target));
+  retryTransient(() => renameSync4(temporary, target));
 }
 function removeCachedFile(file3) {
   try {
-    if (lstatSync4(file3).isFile())
-      rmSync3(file3, { force: true });
+    if (lstatSync5(file3).isFile())
+      rmSync4(file3, { force: true });
   } catch {
   }
 }
@@ -48480,7 +48577,7 @@ function stateDirectoryProblem(directory) {
   if (!validation.valid)
     return validation.reason;
   try {
-    const stat4 = lstatSync4(directory);
+    const stat4 = lstatSync5(directory);
     if (stat4.isSymbolicLink())
       return "link";
     if (!stat4.isDirectory())
@@ -48509,7 +48606,7 @@ var StateStore = class {
       throw new BridgeError("INVALID_STATE_DIRECTORY", message);
     }
     mkdirSync4(directory, { recursive: true, mode: 448 });
-    const stat4 = lstatSync4(directory);
+    const stat4 = lstatSync5(directory);
     if (stat4.isSymbolicLink()) {
       throw new StateStoreLinkError();
     }
@@ -48520,8 +48617,8 @@ var StateStore = class {
   probeWritable() {
     readdirSync3(this.directory);
     const probeFile = path19.join(this.directory, ".startup-probe-" + randomUUID8());
-    writeFileSync4(probeFile, "", { flag: "wx", mode: 384 });
-    rmSync3(probeFile);
+    writeFileSync5(probeFile, "", { flag: "wx", mode: 384 });
+    rmSync4(probeFile);
   }
   file(taskId) {
     if (!uuid3.test(taskId))
@@ -48533,7 +48630,7 @@ var StateStore = class {
     const file3 = path19.join(this.directory, "integration-approvals.json");
     let stat4;
     try {
-      stat4 = lstatSync4(file3);
+      stat4 = lstatSync5(file3);
     } catch (error62) {
       if (error62.code === "ENOENT")
         return { roots: [], issues: [] };
@@ -48544,7 +48641,7 @@ var StateStore = class {
     }
     let content;
     try {
-      content = readFileSync3(file3, "utf8");
+      content = readFileSync4(file3, "utf8");
     } catch (error62) {
       if (error62.code === "ENOENT")
         return { roots: [], issues: [] };
@@ -48596,20 +48693,20 @@ var StateStore = class {
       if (roots.includes(canonical))
         return;
       const snapshot = integrationApprovalsSchema.parse({ version: 1, roots: [...roots, canonical] });
-      writeFileSync4(temporary, JSON.stringify(snapshot), { flag: "wx", mode: 384, flush: true });
+      writeFileSync5(temporary, JSON.stringify(snapshot), { flag: "wx", mode: 384, flush: true });
       replaceStateFile2(temporary, target);
     } finally {
-      rmSync3(temporary, { force: true });
+      rmSync4(temporary, { force: true });
       release();
     }
   }
   loadModel() {
     const file3 = path19.join(this.directory, "model-selection.json");
     try {
-      const stat4 = lstatSync4(file3);
+      const stat4 = lstatSync5(file3);
       if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.size > 1024)
         throw new Error("Unsafe model selection");
-      return modelSelectionSchema.parse(JSON.parse(readFileSync3(file3, "utf8")));
+      return modelSelectionSchema.parse(JSON.parse(readFileSync4(file3, "utf8")));
     } catch (error62) {
       if (error62.code === "ENOENT")
         return void 0;
@@ -48619,10 +48716,10 @@ var StateStore = class {
   loadSandboxPolicy() {
     const file3 = path19.join(this.directory, "sandbox-policy.json");
     try {
-      const stat4 = lstatSync4(file3);
+      const stat4 = lstatSync5(file3);
       if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.size > maxSandboxPolicyFileBytes)
         throw new Error("Unsafe sandbox policy");
-      return parseSandboxPolicySnapshot(JSON.parse(readFileSync3(file3, "utf8")));
+      return parseSandboxPolicySnapshot(JSON.parse(readFileSync4(file3, "utf8")));
     } catch (error62) {
       if (error62.code === "ENOENT") {
         const policy = sandboxPolicySchema.parse({});
@@ -48642,10 +48739,10 @@ var StateStore = class {
     const temporary = target + "." + randomUUID8() + ".tmp";
     try {
       this.loadSandboxPolicy();
-      writeFileSync4(temporary, JSON.stringify(validated), { flag: "wx", mode: 384, flush: true });
+      writeFileSync5(temporary, JSON.stringify(validated), { flag: "wx", mode: 384, flush: true });
       replaceStateFile2(temporary, target);
     } finally {
-      rmSync3(temporary, { force: true });
+      rmSync4(temporary, { force: true });
     }
   }
   saveModel(model) {
@@ -48655,10 +48752,10 @@ var StateStore = class {
     const temporary = target + "." + randomUUID8() + ".tmp";
     try {
       this.loadModel();
-      writeFileSync4(temporary, JSON.stringify(selection), { flag: "wx", mode: 384, flush: true });
+      writeFileSync5(temporary, JSON.stringify(selection), { flag: "wx", mode: 384, flush: true });
       replaceStateFile2(temporary, target);
     } finally {
-      rmSync3(temporary, { force: true });
+      rmSync4(temporary, { force: true });
       release();
     }
   }
@@ -48692,7 +48789,7 @@ var StateStore = class {
         const target = targets[i];
         const temporary = target + "." + randomUUID8() + ".tmp";
         temporaries.push(temporary);
-        writeFileSync4(temporary, entries2[i].content, { flag: "wx", mode: 384, flush: true });
+        writeFileSync5(temporary, entries2[i].content, { flag: "wx", mode: 384, flush: true });
         staged.push({ temporary, target, taskId: entries2[i].taskId });
       }
       for (const { temporary, target, taskId } of staged) {
@@ -48702,7 +48799,7 @@ var StateStore = class {
     } finally {
       for (const temporary of temporaries) {
         try {
-          rmSync3(temporary, { force: true });
+          rmSync4(temporary, { force: true });
         } catch {
         }
       }
@@ -48711,16 +48808,16 @@ var StateStore = class {
   writeSnapshot(target, task2, preserveRedacted = false) {
     const temporary = target + "." + randomUUID8() + ".tmp";
     try {
-      writeFileSync4(temporary, this.formatSnapshot(task2, preserveRedacted), { flag: "wx", mode: 384, flush: true });
+      writeFileSync5(temporary, this.formatSnapshot(task2, preserveRedacted), { flag: "wx", mode: 384, flush: true });
       replaceStateFile2(temporary, target);
     } finally {
-      rmSync3(temporary, { force: true });
+      rmSync4(temporary, { force: true });
     }
   }
   loadSnapshotFile(file3, name, selfRealpath, migrationOrigin) {
     let stat4;
     try {
-      stat4 = lstatSync4(file3);
+      stat4 = lstatSync5(file3);
     } catch (error62) {
       if (error62.code === "ENOENT")
         return void 0;
@@ -48731,7 +48828,7 @@ var StateStore = class {
     }
     let text;
     try {
-      text = readFileSync3(file3, "utf8");
+      text = readFileSync4(file3, "utf8");
     } catch (error62) {
       if (error62.code === "ENOENT")
         return void 0;
@@ -48868,7 +48965,7 @@ var StateStore = class {
   readQuarantinedForDiscard(file3, expectedFingerprint) {
     let stat4;
     try {
-      stat4 = lstatSync4(file3);
+      stat4 = lstatSync5(file3);
     } catch (error62) {
       if (error62.code === "ENOENT") {
         throw new BridgeError("STATE_BUSY", "Quarantined task snapshot disappeared before discard");
@@ -48880,7 +48977,7 @@ var StateStore = class {
     }
     let text;
     try {
-      text = readFileSync3(file3, "utf8");
+      text = readFileSync4(file3, "utf8");
     } catch (error62) {
       if (error62.code === "ENOENT") {
         throw new BridgeError("STATE_BUSY", "Quarantined task snapshot disappeared before discard");
@@ -48950,7 +49047,7 @@ var StateStore = class {
   sanitizedDirectory() {
     const directory = path19.join(this.directory, "sanitized");
     mkdirSync4(directory, { recursive: true, mode: 448 });
-    if (lstatSync4(directory).isSymbolicLink() || !lstatSync4(directory).isDirectory())
+    if (lstatSync5(directory).isSymbolicLink() || !lstatSync5(directory).isDirectory())
       throw new BridgeError("INVALID_STATE", "Sanitized state cache must be a real directory");
     return directory;
   }
@@ -48985,7 +49082,7 @@ var StateStore = class {
     }
   }
   drop(taskId) {
-    rmSync3(this.file(taskId), { force: true });
+    rmSync4(this.file(taskId), { force: true });
     try {
       this.dropSanitized(taskId);
     } catch {
@@ -48995,20 +49092,20 @@ var StateStore = class {
     if (!/^[a-zA-Z0-9-]+$/.test(name))
       throw new BridgeError("INVALID_STATE", "Invalid lock name");
     const file3 = path19.join(this.directory, name + ".lock"), token = randomUUID8();
-    const root = lstatSync4(this.directory, { bigint: true });
+    const root = lstatSync5(this.directory, { bigint: true });
     const busy = () => new BridgeError("STATE_BUSY", "Another operation owns this task or copy, or its lock cannot be verified");
     const checkRoot = () => {
-      const current = lstatSync4(this.directory, { bigint: true });
+      const current = lstatSync5(this.directory, { bigint: true });
       if (current.isSymbolicLink() || !current.isDirectory() || current.dev !== root.dev || current.ino !== root.ino) {
         throw new BridgeError("INVALID_STATE", "Private state storage identity changed");
       }
     };
     const inspect = (target) => {
       try {
-        const stat4 = lstatSync4(target, { bigint: true });
+        const stat4 = lstatSync5(target, { bigint: true });
         if (stat4.isSymbolicLink() || !stat4.isFile() || stat4.nlink !== 1n || stat4.size < 1n || stat4.size > 1024n)
           throw busy();
-        const data = JSON.parse(readFileSync3(target, "utf8"));
+        const data = JSON.parse(readFileSync4(target, "utf8"));
         if (!data || typeof data !== "object" || Array.isArray(data) || typeof data.pid !== "number" || !Number.isSafeInteger(data.pid) || data.pid < 1 || data.token !== void 0 && (typeof data.token !== "string" || !/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(data.token)))
           throw busy();
         return { stat: stat4, pid: data.pid, token: data.token };
@@ -49021,13 +49118,13 @@ var StateStore = class {
       const current = inspect(target);
       if (current.stat.dev !== owned.stat.dev || current.stat.ino !== owned.stat.ino || current.pid !== owned.pid || current.token !== owned.token)
         throw busy();
-      rmSync3(target);
+      rmSync4(target);
     };
     for (let attempt = 0; attempt < 3; attempt++) {
       checkRoot();
       let created = false;
       try {
-        writeFileSync4(file3, JSON.stringify({ pid: process.pid, token }), { flag: "wx", mode: 384, flush: true });
+        writeFileSync5(file3, JSON.stringify({ pid: process.pid, token }), { flag: "wx", mode: 384, flush: true });
         created = true;
       } catch (error62) {
         if (process.platform === "win32" && error62.code === "EPERM")
@@ -49052,7 +49149,7 @@ var StateStore = class {
         throw busy();
       const gate = file3 + ".recovery", gateToken = randomUUID8();
       try {
-        writeFileSync4(gate, JSON.stringify({ pid: process.pid, token: gateToken }), { flag: "wx", mode: 384, flush: true });
+        writeFileSync5(gate, JSON.stringify({ pid: process.pid, token: gateToken }), { flag: "wx", mode: 384, flush: true });
       } catch {
         throw busy();
       }
@@ -49064,7 +49161,7 @@ var StateStore = class {
         const current = inspect(file3);
         if (current.stat.dev !== observed.stat.dev || current.stat.ino !== observed.stat.ino || current.pid !== observed.pid || current.token !== observed.token || processAlive2(current.pid))
           throw busy();
-        rmSync3(file3);
+        rmSync4(file3);
       } finally {
         removeOwned2(gate, ownedGate);
       }
@@ -49905,7 +50002,7 @@ function toolAnnotations(name) {
 }
 
 // dist/src/wait-command.js
-import { lstatSync as lstatSync5, readFileSync as readFileSync4 } from "node:fs";
+import { lstatSync as lstatSync6, readFileSync as readFileSync5 } from "node:fs";
 import path20 from "node:path";
 import { setTimeout as setTimeout2 } from "node:timers/promises";
 var WAIT_EXIT_CODES = {
@@ -49967,7 +50064,7 @@ var waitGroupSchema = external_exports.object({
 function inspectStateDirectory(stateDirectory) {
   let dirStat;
   try {
-    dirStat = lstatSync5(stateDirectory);
+    dirStat = lstatSync6(stateDirectory);
   } catch (error62) {
     const code = error62.code;
     return code === "ENOENT" ? "missing" : "invalid";
@@ -49985,7 +50082,7 @@ function createFileReader(file3, maxBytes, requireSingleLink, parse4) {
     read() {
       let stat4;
       try {
-        stat4 = lstatSync5(file3, { bigint: true });
+        stat4 = lstatSync6(file3, { bigint: true });
       } catch (error62) {
         const code = error62.code;
         return code === "ENOENT" ? { status: "missing" } : { status: "invalid" };
@@ -49996,7 +50093,7 @@ function createFileReader(file3, maxBytes, requireSingleLink, parse4) {
       const key = `${stat4.dev}:${stat4.ino}:${stat4.size}:${stat4.mtimeNs}`;
       if (key !== lastKey || !current) {
         try {
-          current = parse4(JSON.parse(readFileSync4(file3, "utf8")));
+          current = parse4(JSON.parse(readFileSync5(file3, "utf8")));
           lastKey = key;
           failures = 0;
         } catch {
@@ -51060,7 +51157,7 @@ Integration modifies the original. Confirm only after reviewing the patch and th
 }
 
 // dist/src/group-store.js
-import { lstatSync as lstatSync6, readdirSync as readdirSync4, readFileSync as readFileSync5, realpathSync as realpathSync5, rmSync as rmSync4, writeFileSync as writeFileSync5 } from "node:fs";
+import { lstatSync as lstatSync7, readdirSync as readdirSync4, readFileSync as readFileSync6, realpathSync as realpathSync5, rmSync as rmSync5, writeFileSync as writeFileSync6 } from "node:fs";
 import { randomUUID as randomUUID9 } from "node:crypto";
 import path21 from "node:path";
 var GroupStore = class {
@@ -51075,7 +51172,7 @@ var GroupStore = class {
   directoryIdentity() {
     let current = this.root;
     for (; ; ) {
-      const stat5 = lstatSync6(current);
+      const stat5 = lstatSync7(current);
       if (!stat5.isDirectory() || stat5.isSymbolicLink())
         throw new BridgeError("INVALID_STATE", "Unsafe group storage ancestry");
       const parent = path21.dirname(current);
@@ -51083,7 +51180,7 @@ var GroupStore = class {
         break;
       current = parent;
     }
-    const stat4 = lstatSync6(this.root, { bigint: true });
+    const stat4 = lstatSync7(this.root, { bigint: true });
     return stat4.dev.toString() + ":" + stat4.ino.toString();
   }
   file(groupId) {
@@ -51096,10 +51193,10 @@ var GroupStore = class {
   read(groupId) {
     const file3 = this.file(groupId);
     try {
-      const stat4 = lstatSync6(file3);
+      const stat4 = lstatSync7(file3);
       if (!stat4.isFile() || stat4.isSymbolicLink() || stat4.nlink !== 1 || stat4.size > 5 * 1024 * 1024)
         throw Error("Unsafe group file");
-      const record2 = groupRecordSchema.parse(JSON.parse(readFileSync5(file3, "utf8")));
+      const record2 = groupRecordSchema.parse(JSON.parse(readFileSync6(file3, "utf8")));
       if (record2.groupId.toLowerCase() !== groupId.toLowerCase() || record2.definitionSha256 !== groupDefinitionSha256(record2.definition))
         throw Error("Group identity or definition changed");
       for (const node2 of Object.values(record2.nodes))
@@ -51129,10 +51226,10 @@ var GroupStore = class {
         if (!(error62 instanceof BridgeError) || error62.code !== "GROUP_NOT_FOUND")
           throw error62;
       }
-      writeFileSync5(temporary, JSON.stringify(validated), { flag: "wx", mode: 384, flush: true });
+      writeFileSync6(temporary, JSON.stringify(validated), { flag: "wx", mode: 384, flush: true });
       replaceStateFile2(temporary, file3);
     } finally {
-      rmSync4(temporary, { force: true });
+      rmSync5(temporary, { force: true });
     }
   }
 };
@@ -55943,7 +56040,7 @@ async function executeWindowsTest(command2, copyDirectory, options) {
 }
 
 // dist/src/linux-executor.js
-import { accessSync, constants as constants5, statSync as statSync2 } from "node:fs";
+import { accessSync, constants as constants5, realpathSync as realpathSync6, statSync as statSync2 } from "node:fs";
 import { access as access3, chmod as chmod3, lstat as lstat15, mkdtemp as mkdtemp4, readdir as readdir10, readlink, realpath as realpath10, rm as rm7 } from "node:fs/promises";
 import { spawn as spawn7, spawnSync } from "node:child_process";
 import { randomUUID as randomUUID14 } from "node:crypto";
@@ -56094,24 +56191,49 @@ function isExecutableFile(candidate) {
     return false;
   }
 }
-function findBwrapOnPath(pathValue) {
+function resolveTrustedBwrap(candidate, untrustedDirectory) {
+  if (!candidate || candidate.includes("\0") || !path28.isAbsolute(candidate) || !untrustedDirectory || untrustedDirectory.includes("\0")) {
+    return void 0;
+  }
+  let realCandidate;
+  try {
+    realCandidate = realpathSync6(candidate);
+  } catch {
+    return void 0;
+  }
+  let realUntrustedDir;
+  try {
+    realUntrustedDir = realpathSync6(untrustedDirectory);
+  } catch {
+    realUntrustedDir = untrustedDirectory;
+  }
+  return posixContains(realUntrustedDir, realCandidate) ? void 0 : realCandidate;
+}
+function findBwrapOnPath(pathValue, untrustedDirectory) {
   if (!pathValue)
     return void 0;
   for (const entry2 of pathValue.split(path28.posix.delimiter)) {
     if (!entry2 || entry2.includes("\0") || !entry2.startsWith("/"))
       continue;
     const candidate = path28.posix.join(entry2, "bwrap");
-    if (isExecutableFile(candidate))
+    if (!isExecutableFile(candidate))
+      continue;
+    if (untrustedDirectory === void 0)
       return candidate;
+    const trusted = resolveTrustedBwrap(candidate, untrustedDirectory);
+    if (trusted !== void 0)
+      return trusted;
   }
   return void 0;
 }
 function detectBubblewrap(options) {
-  const useCache = !options || options.platform === void 0 && options.bwrapPath === void 0 && options.env === void 0 && options.runner === void 0 && options.useCache !== false;
-  if (useCache && cachedDetection)
+  const canReadCache = !options || options.platform === void 0 && options.bwrapPath === void 0 && options.env === void 0 && options.runner === void 0 && options.useCache !== false;
+  const untrustedDirectory = options?.untrustedDirectory;
+  const canStoreCache = canReadCache && untrustedDirectory === void 0;
+  if (canReadCache && untrustedDirectory === void 0 && cachedDetection)
     return cachedDetection;
   const store = (result) => {
-    if (useCache)
+    if (canStoreCache)
       cachedDetection = result;
     return result;
   };
@@ -56127,11 +56249,27 @@ function detectBubblewrap(options) {
     if (!options.runner && !isExecutableFile(options.bwrapPath)) {
       return store({ available: false, code: "LINUX_BWRAP_MISSING", reason: "bwrap binary is missing or not executable" });
     }
-    bwrapPath = options.bwrapPath;
+    if (untrustedDirectory !== void 0) {
+      const trusted = resolveTrustedBwrap(options.bwrapPath, untrustedDirectory);
+      if (!trusted) {
+        return store({ available: false, code: "LINUX_BWRAP_MISSING", reason: "bwrap path must be outside the task copy" });
+      }
+      bwrapPath = trusted;
+    } else {
+      bwrapPath = options.bwrapPath;
+    }
   } else {
-    bwrapPath = findBwrapOnPath((options?.env ?? process.env).PATH);
+    bwrapPath = findBwrapOnPath((options?.env ?? process.env).PATH, untrustedDirectory);
     if (!bwrapPath) {
       return store({ available: false, code: "LINUX_BWRAP_MISSING", reason: "bwrap binary not found on absolute PATH entries" });
+    }
+  }
+  if (canReadCache && untrustedDirectory !== void 0 && cachedDetection?.path) {
+    try {
+      if (realpathSync6(cachedDetection.path) === bwrapPath) {
+        return { ...cachedDetection, path: bwrapPath };
+      }
+    } catch {
     }
   }
   const runner = options?.runner ?? defaultBwrapSyncRunner;
@@ -56480,9 +56618,13 @@ async function executeLinuxTest(command2, copyDirectory, options) {
     throw new BridgeError("SANDBOX_PERMISSIONS_UNSUPPORTED", "Linux bwrap executor cannot enforce childProcesses: false");
   }
   validateLinuxCommand(command2);
-  const detection = options.detection ?? detectBubblewrap();
+  const detection = options.detection ?? detectBubblewrap({ untrustedDirectory: copyDirectory });
   if (!detection.available || !detection.path) {
     throw new BridgeError(detection.code ?? "LINUX_BWRAP_MISSING", detection.reason ?? "Bubblewrap is unavailable");
+  }
+  const bwrapPath = resolveTrustedBwrap(detection.path, copyDirectory);
+  if (!bwrapPath) {
+    throw new BridgeError("LINUX_BWRAP_MISSING", "bwrap path must be outside the task copy");
   }
   const temp = await realpath10(os10.tmpdir());
   const cwd = await ownedDirectory2(copyDirectory, temp, path28.basename(copyDirectory).startsWith("agy-mcp-copy-") ? "agy-mcp-copy-" : "black-gravity-copy-");
@@ -56727,7 +56869,7 @@ async function executeLinuxTest(command2, copyDirectory, options) {
     if (options.signal?.aborted) {
       return preSpawnFailure("Command cancelled");
     }
-    const child = spawn7(detection.path, args, {
+    const child = spawn7(bwrapPath, args, {
       cwd,
       detached: true,
       shell: false,
@@ -57129,6 +57271,9 @@ var TaskManager = class {
     if (expectedProvider !== this.executor.identity.provider) {
       throw new BridgeError("INVALID_SESSION", `Cannot resume ${expectedProvider} session with ${this.executor.identity.provider} executor`);
     }
+    if (expectedProvider === "opencode" && record2.execution?.adapterVersion !== this.executor.identity.version) {
+      throw new BridgeError("INVALID_SESSION", `This OpenCode session was recorded by adapter version ${record2.execution?.adapterVersion ?? "unknown"}, which cannot resume sessions; start a new task`);
+    }
   }
   pendingSnapshots;
   persist(taskId) {
@@ -57495,7 +57640,8 @@ var TaskManager = class {
     }
     if (options.isolateWorktree === false)
       throw new BridgeError("ISOLATION_REQUIRED", "Direct execution in the source project is disabled");
-    if (options.sessionId && !/^[a-zA-Z0-9-]{1,128}$/.test(options.sessionId))
+    const sessionIdPattern = this.executor instanceof AgyExecutionAdapter ? /^[a-zA-Z0-9-]{1,128}$/ : /^[a-zA-Z0-9_-]{1,128}$/;
+    if (options.sessionId && !sessionIdPattern.test(options.sessionId))
       throw new BridgeError("INVALID_SESSION", `Invalid conversation ID. ${RESUME_GUIDANCE}`);
     const releaseRegistry = this.state.acquire("registry");
     let pendingProjectRelease;
@@ -57731,11 +57877,14 @@ var TaskManager = class {
           throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
       }
       if (this.tasks.size >= this.config.maxRetainedTasks) {
-        const oldestFinished = [...this.tasks.values()].find((task2) => terminal3.has(task2.record.status) && task2 !== contextSource && !this.hasPendingInbox(task2.record) && !(options.sourceMessage && task2 === previous));
+        const candidates = [...this.tasks.values()].filter((task2) => terminal3.has(task2.record.status) && task2 !== contextSource && !this.hasPendingInbox(task2.record) && !(options.sourceMessage && task2 === previous));
+        const oldestFinished = candidates.find((task2) => !this.hasUnverifiedCleanup(task2));
         if (!oldestFinished)
-          throw new BridgeError("QUEUE_FULL", "Task retention limit reached with active tasks");
+          throw this.retentionLimitError(candidates[0]);
         if (oldestFinished !== previous && oldestFinished.project && ![...this.tasks.values()].some((other) => other !== oldestFinished && other.project === oldestFinished.project)) {
-          await this.discard(oldestFinished.record.taskId);
+          if (!await this.discardTask(oldestFinished.record.taskId, true)) {
+            throw this.retentionLimitError(oldestFinished);
+          }
         }
         this.tasks.delete(oldestFinished.record.taskId);
         this.events.drop(oldestFinished.record.taskId);
@@ -57750,6 +57899,7 @@ var TaskManager = class {
       const taskId = randomUUID15();
       options.group = options.groupAdmission ? { ...options.groupAdmission, rootTaskId: taskId } : previous?.record.group && structuredClone(previous.record.group);
       delete options.groupAdmission;
+      const isAgyExecutor = this.executor instanceof AgyExecutionAdapter;
       const record2 = {
         group: options.group,
         memory: summarizeMemory(options.memorySnapshots),
@@ -57771,8 +57921,8 @@ var TaskManager = class {
         handoff: options.handoff ?? previous?.record.handoff,
         comparison: options.comparison,
         tests: previous?.record.tests ?? contextSource?.record.tests,
-        usageIsResume: Boolean(previous),
-        usageBaseline: previous ? this.latestObservedUsage(previous.record.sessionId, workingDirectory) : void 0,
+        usageIsResume: isAgyExecutor ? Boolean(previous) : false,
+        usageBaseline: isAgyExecutor && previous ? this.latestObservedUsage(previous.record.sessionId, workingDirectory) : void 0,
         workingDirectory,
         status: "queued",
         createdAt: (/* @__PURE__ */ new Date()).toISOString(),
@@ -58308,16 +58458,22 @@ var TaskManager = class {
         this.nativeRecoveryError = void 0;
       }
       if (this.tasks.size >= this.config.maxRetainedTasks) {
-        const oldestFinished = [...this.tasks.values()].find((candidate) => terminal3.has(candidate.record.status) && candidate !== current && !this.hasPendingInbox(candidate.record)) ?? (this.hasPendingInbox(current.record) ? void 0 : current);
-        if (!oldestFinished)
-          throw new BridgeError("QUEUE_FULL", "Task retention limit reached with active tasks");
+        const otherCandidates = [...this.tasks.values()].filter((candidate) => terminal3.has(candidate.record.status) && candidate !== current && !this.hasPendingInbox(candidate.record));
+        const oldestFinished = otherCandidates.find((candidate) => !this.hasUnverifiedCleanup(candidate)) ?? (!this.hasPendingInbox(current.record) && !this.hasUnverifiedCleanup(current) ? current : void 0);
+        if (!oldestFinished) {
+          const excluded = otherCandidates[0] ?? (!this.hasPendingInbox(current.record) && this.hasUnverifiedCleanup(current) ? current : void 0);
+          throw this.retentionLimitError(excluded);
+        }
         if (oldestFinished !== current && oldestFinished.project && ![...this.tasks.values()].some((other) => other !== oldestFinished && other.project === oldestFinished.project)) {
-          await this.discard(oldestFinished.record.taskId);
+          if (!await this.discardTask(oldestFinished.record.taskId, true)) {
+            throw this.retentionLimitError(oldestFinished);
+          }
         }
         this.tasks.delete(oldestFinished.record.taskId);
         this.events.drop(oldestFinished.record.taskId);
         this.state.drop(oldestFinished.record.taskId);
       }
+      const isAgyExecutor = this.executor instanceof AgyExecutionAdapter;
       const record2 = {
         parentTaskId: current.record.taskId,
         group: structuredClone(current.record.group),
@@ -58337,8 +58493,8 @@ var TaskManager = class {
         acceptanceCriteria: current.record.acceptanceCriteria,
         handoff: current.record.handoff,
         tests: current.record.tests,
-        usageIsResume: true,
-        usageBaseline: this.latestObservedUsage(current.record.sessionId, current.record.workingDirectory),
+        usageIsResume: isAgyExecutor,
+        usageBaseline: isAgyExecutor ? this.latestObservedUsage(current.record.sessionId, current.record.workingDirectory) : void 0,
         workingDirectory: current.record.workingDirectory,
         copyDirectory: current.project.copyDirectory,
         includedFiles: current.project.includedFiles,
@@ -58402,7 +58558,7 @@ var TaskManager = class {
       return evidence;
     });
   }
-  async withProject(project, operation) {
+  async withProject(project, operation, options) {
     if (this.hasQuarantinedCopySibling(project)) {
       throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
     }
@@ -58413,6 +58569,9 @@ var TaskManager = class {
     let release;
     try {
       release = this.state.acquire(this.projectLock(project));
+      if (options?.cleanupGuard !== false) {
+        await this.assertCopyCleanupConfirmed(project, { lockHeld: true });
+      }
       return await operation();
     } finally {
       release?.();
@@ -58421,6 +58580,10 @@ var TaskManager = class {
     }
   }
   async discard(taskId) {
+    await this.discardTask(taskId, false);
+    return this.status(taskId);
+  }
+  async discardTask(taskId, automatic) {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task2 = this.tasks.get(taskId);
@@ -58446,7 +58609,7 @@ var TaskManager = class {
         this.recoverInboxClaims(true);
         if (hadPendingInbox)
           this.persist(taskId);
-        return { ...reloaded.record, tokenUsage: taskTokenUsage(reloaded.record) };
+        return true;
       } finally {
         release();
       }
@@ -58455,7 +58618,21 @@ var TaskManager = class {
       throw new BridgeError("TASK_NOT_READY", "Cancel and wait for the task before discarding");
     if (task2.project) {
       const project = task2.project;
-      await this.withProject(project, async () => {
+      return await this.withProject(project, async () => {
+        if (automatic) {
+          let marker;
+          try {
+            marker = readProcessCleanupMarkerSync(project);
+          } catch {
+            return false;
+          }
+          if (marker && marker.entries.length > 0) {
+            if (marker.entries.some((entry2) => entry2.provider !== "agy"))
+              return false;
+            if (this.copyHasOpenCodeTask(project.copyDirectory))
+              return false;
+          }
+        }
         this.failPendingInbox(project.copyDirectory, task2, "cancelled", "COPY_DISCARDED");
         await discardProjectCopy(project);
         for (const related of this.tasks.values())
@@ -58464,9 +58641,10 @@ var TaskManager = class {
             related.record.discardedAt = (/* @__PURE__ */ new Date()).toISOString();
             this.events.append(related.record.taskId, "copy.discarded", {});
           }
-      });
+        return true;
+      }, { cleanupGuard: false });
     }
-    return this.status(taskId);
+    return true;
   }
   async cleanup(now = Date.now()) {
     if (this.degraded)
@@ -58475,12 +58653,13 @@ var TaskManager = class {
     const discardedTaskIds = [];
     for (const copyDirectory of new Set([...this.tasks.values()].flatMap((task2) => task2.project ? [task2.project.copyDirectory] : []))) {
       const related = [...this.tasks.values()].filter((task2) => task2.project?.copyDirectory === copyDirectory);
-      if (!related.length || related.some((task2) => this.hasQuarantinedCopySibling(task2.project) || this.busyProjects.has(task2.project) || !terminal3.has(task2.record.status)))
+      if (!related.length || related.some((task2) => this.hasQuarantinedCopySibling(task2.project) || this.busyProjects.has(task2.project) || !terminal3.has(task2.record.status) || this.hasUnverifiedCleanup(task2)))
         continue;
       const latest = Math.max(...related.map((task2) => Date.parse(task2.record.completedAt || task2.record.createdAt)));
       if (now - latest < this.config.copyRetentionHours * 36e5)
         continue;
-      await this.discard(related[0].record.taskId);
+      if (!await this.discardTask(related[0].record.taskId, true))
+        continue;
       discardedTaskIds.push(...related.map((task2) => task2.record.taskId));
     }
     return { discardedTaskIds };
@@ -58568,6 +58747,36 @@ var TaskManager = class {
         releaseSource();
       }
     });
+  }
+  copyHasOpenCodeTask(copyDirectory) {
+    for (const candidate of this.tasks.values()) {
+      if (candidate.project?.copyDirectory === copyDirectory && candidate.record.execution?.provider === "opencode") {
+        return true;
+      }
+    }
+    return false;
+  }
+  hasUnverifiedCleanup(task2) {
+    if (!task2.project || task2.record.discardedAt)
+      return false;
+    let marker;
+    try {
+      marker = readProcessCleanupMarkerSync(task2.project);
+    } catch {
+      return true;
+    }
+    if (marker?.entries.some((entry2) => entry2.provider !== "agy"))
+      return true;
+    const copyHasOpenCode = this.copyHasOpenCodeTask(task2.project.copyDirectory);
+    if (!copyHasOpenCode)
+      return false;
+    return Boolean(task2.record.processCleanup && !task2.record.processCleanup.verified || marker?.entries.length);
+  }
+  retentionLimitError(unverifiedCandidate) {
+    if (unverifiedCandidate) {
+      return new BridgeError("QUEUE_FULL", `Task retention limit reached; task ${unverifiedCandidate.record.taskId} has unconfirmed process cleanup and is retained until it is discarded (black_gravity_discard frees its slot)`);
+    }
+    return new BridgeError("QUEUE_FULL", "Task retention limit reached with active tasks");
   }
   hasPendingInbox(record2) {
     return Boolean(record2.dispatching || record2.inbox?.some((item) => item.receipt.state === "queued"));
@@ -59094,7 +59303,11 @@ var TaskManager = class {
       const isAgyWrite = this.executor instanceof AgyExecutionAdapter && record2.mode !== "read-only";
       const { result: execResult, styles, boms } = await this.runAgyStep(task2, native ? { ...task2.options, prompt: native.prompt } : task2.options, { prepareLf: isAgyWrite, convertLf: isAgyWrite && !native });
       if (task2.termination) {
-        this.finish(task2, task2.termination);
+        if (!(this.executor instanceof AgyExecutionAdapter) && (execResult.status === "cancelled" || execResult.status === "timeout") && execResult.status === task2.termination) {
+          this.finish(task2, task2.termination, execResult.error.code, execResult.error.message);
+        } else {
+          this.finish(task2, task2.termination);
+        }
         return;
       }
       if (native) {
@@ -59146,7 +59359,11 @@ var TaskManager = class {
         }
       }
       if (task2.termination) {
-        this.finish(task2, task2.termination);
+        if (!(this.executor instanceof AgyExecutionAdapter) && (execResult.status === "cancelled" || execResult.status === "timeout") && execResult.status === task2.termination) {
+          this.finish(task2, task2.termination, execResult.error.code, execResult.error.message);
+        } else {
+          this.finish(task2, task2.termination);
+        }
         return;
       }
       if (record2.mode === "read-only")
@@ -59157,7 +59374,7 @@ var TaskManager = class {
         return;
       }
       const deniedReads = await this.verifyPolicyAndReadDenials(task2, execResult, policyReceiptOffset, "No new guarded finish was observed for this conversation");
-      if (record2.mode !== "read-only")
+      if (record2.mode !== "read-only" && styles && boms)
         await this.normalizeEditedFiles(task2, styles, boms);
       const structuredOutput = record2.result?.structured_output ?? execResult.structuredOutput;
       record2.report = await validateRoleReport((record2.roleDefinition ?? resolveRole(record2.role ?? "implementer")).baseRole, structuredOutput, task2.project.copyDirectory);
@@ -59349,10 +59566,21 @@ var TaskManager = class {
       };
       this.events.append(task2.record.taskId, "task.denied-reads", deniedReads);
     }
-    await this.normalizeEditedFiles(task2, styles, boms);
+    if (styles && boms)
+      await this.normalizeEditedFiles(task2, styles, boms);
   }
   async executeWindowsNativeTest(task2) {
     return this.executeLocalNativeTest(task2);
+  }
+  async confirmCopyCleanupForLoop(task2) {
+    try {
+      await this.assertCopyCleanupConfirmed(task2.project, { excludeTaskId: task2.record.taskId, lockHeld: true });
+      return true;
+    } catch (error62) {
+      const message = error62 instanceof Error ? error62.message : String(error62);
+      this.finish(task2, "failed", "PROCESS_CLEANUP_UNVERIFIED", message);
+      return false;
+    }
   }
   async executeLocalNativeTest(task2) {
     const request = this.localTestRequest(task2);
@@ -59384,6 +59612,8 @@ var TaskManager = class {
       for (let attempt = 1; attempt <= request.maxAttempts; attempt++) {
         if (task2.termination)
           break;
+        if (!await this.confirmCopyCleanupForLoop(task2))
+          return;
         const remaining = this.remainingSeconds(deadline);
         if (!remaining) {
           task2.termination ??= "timeout";
@@ -59445,6 +59675,8 @@ var TaskManager = class {
           task2.termination ??= "timeout";
           break;
         }
+        if (!await this.confirmCopyCleanupForLoop(task2))
+          return;
         if (task2.record.group) {
           const budgetLock = this.state.acquire("registry");
           try {
@@ -59494,6 +59726,7 @@ var TaskManager = class {
     if (task2.termination)
       controller.abort(task2.termination);
     let spawnedPid;
+    let agyLaunchId;
     let stepTimer;
     let hookResultSeen = false;
     const request = {
@@ -59526,6 +59759,7 @@ var TaskManager = class {
     };
     let result;
     try {
+      await this.assertCopyCleanupConfirmed(project, { excludeTaskId: record2.taskId, lockHeld: true });
       if (this.executor instanceof AgyExecutionAdapter) {
         const hooks = {
           runOptions: options,
@@ -59535,6 +59769,7 @@ var TaskManager = class {
           repair: config2.repair,
           onProcessStarted: (pid, isRepair) => {
             spawnedPid = pid;
+            agyLaunchId = randomUUID15();
             record2.pid = pid;
             record2.status = "running";
             this.events.append(record2.taskId, "process.started", isRepair ? { pid, repair: true } : { pid });
@@ -59542,6 +59777,15 @@ var TaskManager = class {
           },
           onProcessCleanup: (cleanup) => {
             record2.processCleanup = cleanup;
+            if (!cleanup.verified) {
+              upsertProcessCleanupMarkerEntrySync(project, {
+                launchId: agyLaunchId ?? randomUUID15(),
+                taskId: record2.taskId,
+                provider: "agy",
+                ...typeof spawnedPid === "number" ? { pid: spawnedPid } : {},
+                spawnedAt: cleanup.spawnedAt
+              });
+            }
           },
           onAfterProcessExit: async () => {
             if (spawnedPid === void 0 || record2.processCleanup?.verified) {
@@ -59689,15 +59933,149 @@ var TaskManager = class {
     return { result, styles, boms };
   }
   /**
-   * Bounds a pure E02 ExecutionAdapter against host cancellation and deadlines.
-   * Under the E02 contract ExecutionRequest has no AbortSignal, so host cancellation
-   * or timeout frees the TaskManager slot without being able to forcibly stop provider internals;
-   * late settlements are absorbed so they cannot trigger unhandled rejections or double-finish.
+   * Bounds a pure ExecutionAdapter against host cancellation and deadlines.
+   * Adapters declaring `cancel: 'supported'` receive ExecutionContext (`signal`, `onProcessStarted`,
+   * `onProcessCleanup`) and TaskManager awaits their process reconciliation after abort up to a 30 s safety bound.
+   * Adapters without `cancel: 'supported'` receive only `request`; host cancellation or timeout frees the
+   * TaskManager slot immediately and ignores late settlements without forcibly stopping provider internals.
    */
   async executePureAdapterBounded(adapter, request, task2, signal) {
     if (signal.aborted || task2.termination) {
-      const reason = task2.termination ?? "cancelled";
+      const reason = task2.termination ?? (signal.reason === "timeout" ? "timeout" : "cancelled");
       throw new BridgeError(reason === "timeout" ? "TASK_TIMEOUT" : "TASK_CANCELLED", `Task ${reason}`);
+    }
+    if (isCapabilitySupported(adapter.capabilities, "cancel")) {
+      let processStartedAtMs;
+      let currentLaunch;
+      let fallbackSettled = false;
+      const execPromise2 = Promise.resolve().then(() => adapter.execute(request, {
+        signal,
+        onProcessStarted: (pid) => {
+          if (fallbackSettled)
+            return;
+          const nowMs = Date.now();
+          processStartedAtMs = nowMs;
+          const nowIso = new Date(nowMs).toISOString();
+          const launchId = randomUUID15();
+          currentLaunch = { launchId, pid, spawnedAt: nowIso };
+          if (typeof pid === "number")
+            task2.record.pid = pid;
+          task2.record.status = "running";
+          task2.record.processCleanup = {
+            verified: false,
+            spawnedAt: nowIso,
+            checkedAt: nowIso,
+            remaining: 0
+          };
+          if (task2.project) {
+            upsertProcessCleanupMarkerEntrySync(task2.project, {
+              launchId,
+              taskId: task2.record.taskId,
+              provider: this.executor.identity.provider,
+              ...typeof pid === "number" ? { pid } : {},
+              spawnedAt: nowIso
+            });
+          }
+          this.events.append(task2.record.taskId, "process.started", { pid });
+          this.persist(task2.record.taskId);
+        },
+        onProcessCleanup: (cleanup) => {
+          if (fallbackSettled)
+            return;
+          task2.record.processCleanup = cleanup;
+          if (task2.project) {
+            if (cleanup.verified) {
+              if (currentLaunch) {
+                removeProcessCleanupMarkerEntrySync(task2.project, currentLaunch.launchId);
+              }
+            } else {
+              const launch = currentLaunch ?? {
+                launchId: randomUUID15(),
+                pid: typeof task2.record.pid === "number" ? task2.record.pid : void 0,
+                spawnedAt: cleanup.spawnedAt
+              };
+              currentLaunch = launch;
+              upsertProcessCleanupMarkerEntrySync(task2.project, {
+                launchId: launch.launchId,
+                taskId: task2.record.taskId,
+                provider: this.executor.identity.provider,
+                ...typeof launch.pid === "number" ? { pid: launch.pid } : {},
+                spawnedAt: cleanup.spawnedAt
+              });
+            }
+          }
+          this.events.append(task2.record.taskId, "process.cleanup", {
+            verified: cleanup.verified,
+            remaining: cleanup.remaining
+          });
+        }
+      }));
+      execPromise2.catch(() => void 0);
+      return await new Promise((resolve2, reject) => {
+        let settled = false;
+        let abortTimeout;
+        const cleanup = () => {
+          signal.removeEventListener("abort", onAbort);
+          if (abortTimeout) {
+            clearTimeout(abortTimeout);
+            abortTimeout = void 0;
+          }
+        };
+        const onAbort = () => {
+          if (settled || abortTimeout)
+            return;
+          abortTimeout = setTimeout(() => {
+            if (settled)
+              return;
+            settled = true;
+            fallbackSettled = true;
+            cleanup();
+            const nowIso = (/* @__PURE__ */ new Date()).toISOString();
+            const launch = currentLaunch ?? {
+              launchId: randomUUID15(),
+              pid: void 0,
+              spawnedAt: new Date(processStartedAtMs ?? Date.now()).toISOString()
+            };
+            currentLaunch = launch;
+            task2.record.processCleanup = {
+              verified: false,
+              spawnedAt: launch.spawnedAt,
+              checkedAt: nowIso,
+              remaining: 0
+            };
+            if (task2.project) {
+              upsertProcessCleanupMarkerEntrySync(task2.project, {
+                launchId: launch.launchId,
+                taskId: task2.record.taskId,
+                provider: this.executor.identity.provider,
+                ...typeof launch.pid === "number" ? { pid: launch.pid } : {},
+                spawnedAt: launch.spawnedAt
+              });
+            }
+            this.events.append(task2.record.taskId, "process.cleanup", {
+              verified: false,
+              remaining: 0
+            });
+            const reason = task2.termination ?? (signal.reason === "timeout" ? "timeout" : "cancelled");
+            reject(new BridgeError(reason === "timeout" ? "TASK_TIMEOUT" : "TASK_CANCELLED", `Task ${reason}`));
+          }, 3e4);
+          abortTimeout.unref();
+        };
+        signal.addEventListener("abort", onAbort, { once: true });
+        execPromise2.then((result) => {
+          if (settled)
+            return;
+          settled = true;
+          cleanup();
+          resolve2(result);
+        }, (error62) => {
+          if (settled)
+            return;
+          settled = true;
+          cleanup();
+          reject(error62);
+        });
+      });
     }
     const execPromise = Promise.resolve().then(() => adapter.execute(request));
     execPromise.catch(() => void 0);
@@ -59943,20 +60321,107 @@ var TaskManager = class {
     appendMessage(task2.record, status2 === "completed" ? "final" : "error", source, status2 === "completed" ? text : (task2.record.error?.code ?? status2) + ": " + (task2.record.error?.message ?? text), resultReference(task2.record));
     this.events.append(task2.record.taskId, `task.${status2}`, task2.record.error || { exitCode: task2.record.exitCode });
   }
+  unverifiedCleanupError(taskIds) {
+    const unique = [...new Set(taskIds)];
+    return new BridgeError("PROCESS_CLEANUP_UNVERIFIED", `Processes started by task ${unique.join(", ")} may still be running; discard the task (black_gravity_discard) to release this copy`);
+  }
+  assertNoLegacyOpenCodeUnverified(copyDirectory) {
+    const legacyTaskIds = [];
+    for (const candidate of this.tasks.values()) {
+      if (candidate.project?.copyDirectory === copyDirectory && candidate.record.execution?.provider === "opencode" && candidate.record.processCleanup && !candidate.record.processCleanup.verified) {
+        legacyTaskIds.push(candidate.record.taskId);
+      }
+    }
+    if (legacyTaskIds.length > 0) {
+      throw this.unverifiedCleanupError(legacyTaskIds);
+    }
+  }
+  async reconcileAndRemoveAgyCleanupEntries(project, marker) {
+    const nonAgyEntries = marker.entries.filter((entry2) => entry2.provider !== "agy");
+    if (nonAgyEntries.length > 0) {
+      throw this.unverifiedCleanupError(nonAgyEntries.map((entry2) => entry2.taskId));
+    }
+    const reconciledLaunchIds = [];
+    const reconciledTaskIds = /* @__PURE__ */ new Set();
+    const failedTaskIds = [];
+    for (const entry2 of marker.entries) {
+      const retry = await reconcileOwnedProcesses({
+        pid: entry2.pid,
+        spawnedAt: Date.parse(entry2.spawnedAt),
+        processGroup: process.platform !== "win32"
+      });
+      if (retry.verified) {
+        reconciledLaunchIds.push(entry2.launchId);
+        reconciledTaskIds.add(entry2.taskId);
+      } else {
+        failedTaskIds.push(entry2.taskId);
+      }
+    }
+    if (failedTaskIds.length > 0) {
+      throw this.unverifiedCleanupError(failedTaskIds);
+    }
+    removeProcessCleanupMarkerEntriesSync(project, reconciledLaunchIds);
+    for (const taskId of reconciledTaskIds) {
+      const task2 = this.tasks.get(taskId);
+      if (task2?.record.processCleanup?.verified === false) {
+        task2.record.processCleanup = { ...task2.record.processCleanup, verified: true, checkedAt: (/* @__PURE__ */ new Date()).toISOString(), remaining: 0 };
+        this.persist(taskId);
+      }
+    }
+  }
+  async assertCopyCleanupConfirmed(project, options) {
+    await assertManagedCopyPresent(project);
+    if (this.hasQuarantinedCopySibling(project)) {
+      throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
+    }
+    this.assertNoLegacyOpenCodeUnverified(project.copyDirectory);
+    const marker = readProcessCleanupMarkerSync(project);
+    if (!marker || marker.entries.length === 0)
+      return;
+    const nonAgyEntries = marker.entries.filter((entry2) => entry2.provider !== "agy");
+    if (nonAgyEntries.length > 0) {
+      throw this.unverifiedCleanupError(nonAgyEntries.map((entry2) => entry2.taskId));
+    }
+    const hasNonTerminal = [...this.tasks.values()].some((task2) => task2.project?.copyDirectory === project.copyDirectory && task2.record.taskId !== options?.excludeTaskId && !terminal3.has(task2.record.status));
+    if (!options?.lockHeld && this.busyProjects.has(project) || hasNonTerminal) {
+      throw new BridgeError("TASK_NOT_READY", "Wait for all operations on this copy to finish");
+    }
+    if (options?.lockHeld) {
+      await this.reconcileAndRemoveAgyCleanupEntries(project, marker);
+      return;
+    }
+    this.busyProjects.add(project);
+    let release;
+    try {
+      release = this.state.acquire(this.projectLock(project));
+      const freshMarker = readProcessCleanupMarkerSync(project);
+      if (!freshMarker || freshMarker.entries.length === 0)
+        return;
+      await this.reconcileAndRemoveAgyCleanupEntries(project, freshMarker);
+    } finally {
+      release?.();
+      this.busyProjects.delete(project);
+    }
+  }
   // A copy whose processes may still run cannot be reused; another observation may confirm they ended.
   async assertProcessesReconciled(record2) {
     const existing = this.tasks.get(record2.taskId);
-    if (existing?.project && this.hasQuarantinedCopySibling(existing.project)) {
-      throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
+    if (existing?.project) {
+      await this.assertCopyCleanupConfirmed(existing.project);
+    } else if (record2.copyDirectory) {
+      this.assertNoLegacyOpenCodeUnverified(record2.copyDirectory);
     }
     const cleanup = record2.processCleanup;
     if (!cleanup)
       return;
     if (!cleanup.verified) {
+      if (record2.execution?.provider === "opencode") {
+        throw this.unverifiedCleanupError([record2.taskId]);
+      }
       const retry = await reconcileOwnedProcesses({ pid: record2.pid, spawnedAt: Date.parse(cleanup.spawnedAt), processGroup: process.platform !== "win32" });
       record2.processCleanup = { ...cleanup, verified: retry.verified, checkedAt: (/* @__PURE__ */ new Date()).toISOString(), remaining: retry.remaining.length };
       if (!retry.verified)
-        throw new BridgeError("PROCESS_CLEANUP_UNVERIFIED", "Processes started by this task may still be running; stop them before reusing its copy");
+        throw this.unverifiedCleanupError([record2.taskId]);
     }
     const task2 = this.tasks.get(record2.taskId);
     const project = task2?.project;

@@ -1,18 +1,31 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const rawArgs = process.argv.slice(2);
 let recordFile;
+let spawnLogFile;
+let sessionsFile;
 let scenario = 'read';
+let sessionListHang = false;
 let index = 0;
 while (index < rawArgs.length) {
   if (rawArgs[index] === '--record' && index + 1 < rawArgs.length) {
     recordFile = rawArgs[index + 1];
     index += 2;
+  } else if (rawArgs[index] === '--spawn-log' && index + 1 < rawArgs.length) {
+    spawnLogFile = rawArgs[index + 1];
+    index += 2;
+  } else if (rawArgs[index] === '--sessions' && index + 1 < rawArgs.length) {
+    sessionsFile = rawArgs[index + 1];
+    index += 2;
   } else if (rawArgs[index] === '--scenario' && index + 1 < rawArgs.length) {
     scenario = rawArgs[index + 1];
     index += 2;
+  } else if (rawArgs[index] === '--session-list-hang') {
+    sessionListHang = true;
+    index += 1;
   } else {
     break;
   }
@@ -20,6 +33,11 @@ while (index < rawArgs.length) {
 
 const argv = rawArgs.slice(index);
 const subcommand = argv[0];
+
+if (spawnLogFile) {
+  mkdirSync(path.dirname(spawnLogFile), { recursive: true });
+  appendFileSync(spawnLogFile, JSON.stringify({ argv, pid: process.pid }) + '\n', 'utf8');
+}
 
 function writeRecord(stdinText) {
   if (!recordFile) return;
@@ -40,6 +58,35 @@ function writeRecord(stdinText) {
 if (subcommand === '--version') {
   writeRecord('');
   process.stdout.write('opencode v0.0.0-mock\n');
+  process.exit(0);
+}
+
+if (subcommand === 'session' && argv[1] === 'list') {
+  if (sessionListHang) {
+    const grandchild = spawn(
+      process.execPath,
+      ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
+      {
+        detached: process.platform !== 'win32',
+        stdio: 'ignore',
+      },
+    );
+    if (recordFile) {
+      mkdirSync(path.dirname(recordFile), { recursive: true });
+      writeFileSync(`${recordFile}.session-list-pid`, String(process.pid), 'utf8');
+      if (grandchild.pid !== undefined) {
+        writeFileSync(`${recordFile}.session-list-grandchild-pid`, String(grandchild.pid), 'utf8');
+      }
+    }
+    process.on('SIGTERM', () => {});
+    setInterval(() => {}, 1000);
+    await new Promise(() => {});
+  }
+  if (sessionsFile && existsSync(sessionsFile)) {
+    process.stdout.write(readFileSync(sessionsFile, 'utf8'));
+  } else {
+    process.stdout.write('[]\n');
+  }
   process.exit(0);
 }
 
@@ -64,7 +111,13 @@ for await (const chunk of process.stdin) {
 }
 writeRecord(stdin);
 
-const sessionID = 'ses_mock1';
+const sessionFlagIndex = argv.indexOf('--session');
+const requestedSessionID = sessionFlagIndex !== -1 && sessionFlagIndex + 1 < argv.length
+  ? argv[sessionFlagIndex + 1]
+  : undefined;
+const sessionID = scenario === 'resume-mismatch'
+  ? (requestedSessionID === 'ses_mismatch_other' ? 'ses_mismatch_alt' : 'ses_mismatch_other')
+  : (requestedSessionID ?? 'ses_mock1');
 const send = obj => process.stdout.write(JSON.stringify(obj) + '\n');
 const emitStepFinish = (tokens = { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } }) => {
   send({
@@ -84,7 +137,7 @@ const emitStepFinish = (tokens = { input: 1, output: 1, reasoning: 0, cache: { r
   });
 };
 
-if (scenario === 'read') {
+if (scenario === 'read' || scenario === 'resume-mismatch') {
   const match = stdin.match(/READ:([^\r\n]+)/);
   const relPath = match ? match[1].trim() : '';
   const content = readFileSync(path.join(process.cwd(), relPath), 'utf8');
@@ -520,5 +573,184 @@ if (scenario === 'worktree-remove') {
   process.exit(0);
 }
 
-process.stderr.write(`Unknown mock scenario: ${scenario}\n`);
-process.exit(2);
+if (scenario === 'hang') {
+  send({
+    type: 'step_start',
+    timestamp: Date.now(),
+    sessionID,
+    part: { id: 'prt_start_hang', sessionID, messageID: 'msg_1', type: 'step-start', snapshot: 'snap_1' },
+  });
+  const grandchild = spawn(
+    process.execPath,
+    ['-e', "process.on('SIGTERM',()=>{});setInterval(()=>{},1000)"],
+    {
+      detached: process.platform !== 'win32',
+      stdio: 'ignore',
+    },
+  );
+  if (recordFile && grandchild.pid !== undefined) {
+    mkdirSync(path.dirname(recordFile), { recursive: true });
+    writeFileSync(`${recordFile}.grandchild-pid`, String(grandchild.pid), 'utf8');
+  }
+  process.on('SIGTERM', () => {});
+  setInterval(() => {}, 1000);
+} else if (scenario === 'tool-running-hang') {
+  send({
+    type: 'step_start',
+    timestamp: Date.now(),
+    sessionID,
+    part: { id: 'prt_start_tool_hang', sessionID, messageID: 'msg_1', type: 'step-start', snapshot: 'snap_1' },
+  });
+  send({
+    type: 'tool_use',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      partID: 'prt_tool_running',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'tool',
+      id: 'call_1',
+      callID: 'call_1',
+      tool: 'write',
+      state: { status: 'running', input: { path: 'partial.txt' } },
+    },
+  });
+  process.on('SIGTERM', () => {});
+  setInterval(() => {}, 1000);
+} else if (scenario === 'auth-error') {
+  send({
+    type: 'error',
+    timestamp: Date.now(),
+    sessionID,
+    error: { type: 'provider.auth', message: 'Invalid API key provided', status: 401, response: { body: 'secret-body' } },
+  });
+  process.exit(1);
+} else if (scenario === 'quota-error') {
+  send({
+    type: 'error',
+    timestamp: Date.now(),
+    sessionID,
+    error: { type: 'provider.quota', message: 'Insufficient quota', status: 429, response: {} },
+  });
+  process.exit(1);
+} else if (scenario === 'region-error') {
+  send({
+    type: 'error',
+    timestamp: Date.now(),
+    sessionID,
+    error: {
+      type: 'unknown',
+      message: 'This OpenCode Go model is hosted outside Europe and the United States. Select Global at https://opencode.ai/console/org_TEST/settings/privacy#regions to use it.',
+    },
+  });
+  process.exit(1);
+} else if (scenario === 'retry-loop') {
+  send({
+    type: 'step_start',
+    timestamp: Date.now(),
+    sessionID,
+    part: { id: 'prt_start_retry', sessionID, messageID: 'msg_1', type: 'step-start', snapshot: 'snap_1' },
+  });
+  let attempt = 0;
+  setInterval(() => {
+    attempt += 1;
+    send({
+      type: 'retry',
+      timestamp: Date.now(),
+      sessionID,
+      messageID: 'msg_1',
+      attempt,
+      nextRetryAt: Date.now() + 50,
+      error: { type: 'provider.rate-limit', message: 'Rate limit exceeded', status: 429, response: {} },
+    });
+  }, 50);
+} else if (scenario === 'retry-burst') {
+  send({
+    type: 'step_start',
+    timestamp: Date.now(),
+    sessionID,
+    part: { id: 'prt_start_retry', sessionID, messageID: 'msg_1', type: 'step-start', snapshot: 'snap_1' },
+  });
+  for (let attempt = 1; attempt <= 12; attempt += 1) {
+    send({
+      type: 'retry',
+      timestamp: Date.now(),
+      sessionID,
+      messageID: 'msg_1',
+      attempt,
+      nextRetryAt: Date.now() + 50,
+      error: { type: 'provider.rate-limit', message: 'Rate limit exceeded', status: 429, response: {} },
+    });
+  }
+  setInterval(() => {}, 1000);
+} else if (scenario === 'auth-then-retries') {
+  send({
+    type: 'error',
+    timestamp: Date.now(),
+    sessionID,
+    error: { type: 'provider.auth', message: 'Invalid API key provided', status: 401, response: {} },
+  });
+  let attempt = 0;
+  setInterval(() => {
+    attempt += 1;
+    send({
+      type: 'retry',
+      timestamp: Date.now(),
+      sessionID,
+      messageID: 'msg_1',
+      attempt,
+      nextRetryAt: Date.now() + 50,
+      error: { type: 'provider.rate-limit', message: 'Rate limit exceeded', status: 429, response: {} },
+    });
+  }, 50);
+} else if (scenario === 'retry-auth') {
+  send({
+    type: 'retry',
+    timestamp: Date.now(),
+    sessionID,
+    messageID: 'msg_1',
+    attempt: 1,
+    nextRetryAt: Date.now() + 50,
+    error: { type: 'provider.auth', message: 'Invalid API key provided', status: 401, response: {} },
+  });
+  setInterval(() => {}, 1000);
+} else if (scenario === 'retry-quota') {
+  send({
+    type: 'retry',
+    timestamp: Date.now(),
+    sessionID,
+    messageID: 'msg_1',
+    attempt: 1,
+    nextRetryAt: Date.now() + 50,
+    error: { type: 'provider.quota', message: 'Insufficient quota', status: 429, response: {} },
+  });
+  setInterval(() => {}, 1000);
+} else if (scenario === 'slow-complete') {
+  send({
+    type: 'step_start',
+    timestamp: Date.now(),
+    sessionID,
+    part: { id: 'prt_start_slow', sessionID, messageID: 'msg_1', type: 'step-start', snapshot: 'snap_1' },
+  });
+  setTimeout(() => {
+    send({
+      type: 'text',
+      timestamp: Date.now(),
+      sessionID,
+      part: {
+        id: 'prt_text_slow',
+        sessionID,
+        messageID: 'msg_1',
+        type: 'text',
+        text: 'slow complete',
+        time: { start: Date.now(), end: Date.now() },
+      },
+    });
+    emitStepFinish();
+    process.exit(0);
+  }, 2000);
+} else {
+  process.stderr.write(`Unknown mock scenario: ${scenario}\n`);
+  process.exit(2);
+}

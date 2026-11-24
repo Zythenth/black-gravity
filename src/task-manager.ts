@@ -17,7 +17,7 @@ import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { appendMessage, deliveryModeSchema, extractAgentMessages, readMessages, resultReference, type DeliveryMode } from './messages.js';
 import { CliAdapter, taskPrompt } from './cli-adapter.js';
 import { AgyExecutionAdapter, MAX_DENIED_READS, type AgyExecutionHooks, type AgyExecutionResult } from './agy-execution-adapter.js';
-import type { ExecutionAdapter, ExecutionAdapterIdentity, ExecutionIdentity, ExecutionRequest, ExecutionResult } from './execution-contract.js';
+import { isCapabilitySupported, type ExecutionAdapter, type ExecutionAdapterIdentity, type ExecutionIdentity, type ExecutionRequest, type ExecutionResult } from './execution-contract.js';
 import { terminateSubprocess, redactDiagnostic, redactionContextDigest, containsCredential } from './subprocess.js';
 import { reconcileOwnedProcesses } from './process-tree.js';
 import { sanitizePayload } from './payload-safety.js';
@@ -26,7 +26,7 @@ import { prepareCraft, mergePermanentSkills, verifyCraftSelection, craftStatus, 
 import { convertCrlfToLf, listCopyFiles, normalizeEditedLineEndings, planLineEndings, restoreByteOrderMarks, restoreCrlfLineEndings, type LineEndingStyle } from './line-endings.js';
 import { assertForbiddenDirectoriesUsable, assertSecretExclusionsUsable, assertAgyPathUsable, assertWindowsNodeCacheDirectoryUsable, assertAntiAiCraftDirectoryUsable, type Config, type ApprovalMode, type ConfigurationIssue, type ConfigurationIssueReason, type TestExecutor } from './config.js';
 import { EventStore } from './event-store.js';
-import { assertManagedCopyPresent, assertTextIsUtf8, createProjectCopy, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, forkProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, clearLineEndingConversions, type ChangePreview, type ProjectCopy } from './isolation.js';
+import { assertManagedCopyPresent, assertTextIsUtf8, createProjectCopy, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, forkProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, clearLineEndingConversions, readProcessCleanupMarkerSync, upsertProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntriesSync, type ChangePreview, type ProcessCleanupMarker, type ProjectCopy } from './isolation.js';
 import { assertNoAgentConfigInCopy, ensureAgentGuard } from './agent-config.js';
 import { BridgeError, type DeniedReads, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt, type TestEvidence } from './types.js';
 import { validatePrompt, validateRuntimeCacheSeparation, validateWorkingDirectory, validateStateSeparation } from './validation.js';
@@ -226,6 +226,12 @@ export class TaskManager {
     const expectedProvider = record.execution?.provider ?? 'agy';
     if (expectedProvider !== this.executor.identity.provider) {
       throw new BridgeError('INVALID_SESSION', `Cannot resume ${expectedProvider} session with ${this.executor.identity.provider} executor`);
+    }
+    if (expectedProvider === 'opencode' && record.execution?.adapterVersion !== this.executor.identity.version) {
+      throw new BridgeError(
+        'INVALID_SESSION',
+        `This OpenCode session was recorded by adapter version ${record.execution?.adapterVersion ?? 'unknown'}, which cannot resume sessions; start a new task`,
+      );
     }
   }
 
@@ -573,7 +579,8 @@ export class TaskManager {
       if (options.workingDirectory !== workingDirectory) throw new BridgeError('GROUP_CHANGED', 'Group project no longer resolves to its saved canonical directory');
     }
     if (options.isolateWorktree === false) throw new BridgeError('ISOLATION_REQUIRED', 'Direct execution in the source project is disabled');
-    if (options.sessionId && !/^[a-zA-Z0-9-]{1,128}$/.test(options.sessionId)) throw new BridgeError('INVALID_SESSION', `Invalid conversation ID. ${RESUME_GUIDANCE}`);
+    const sessionIdPattern = this.executor instanceof AgyExecutionAdapter ? /^[a-zA-Z0-9-]{1,128}$/ : /^[a-zA-Z0-9_-]{1,128}$/;
+    if (options.sessionId && !sessionIdPattern.test(options.sessionId)) throw new BridgeError('INVALID_SESSION', `Invalid conversation ID. ${RESUME_GUIDANCE}`);
     const releaseRegistry = this.state.acquire('registry');
     let pendingProjectRelease: (() => void) | undefined;
     let contextProject: ProjectCopy | undefined;
@@ -762,10 +769,13 @@ export class TaskManager {
         if (this.hasQuarantinedCopySibling(previous.project)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
       }
       if (this.tasks.size >= this.config.maxRetainedTasks) {
-        const oldestFinished = [...this.tasks.values()].find(task => terminal.has(task.record.status) && task !== contextSource && !this.hasPendingInbox(task.record) && !(options.sourceMessage && task === previous));
-        if (!oldestFinished) throw new BridgeError('QUEUE_FULL', 'Task retention limit reached with active tasks');
+        const candidates = [...this.tasks.values()].filter(task => terminal.has(task.record.status) && task !== contextSource && !this.hasPendingInbox(task.record) && !(options.sourceMessage && task === previous));
+        const oldestFinished = candidates.find(task => !this.hasUnverifiedCleanup(task));
+        if (!oldestFinished) throw this.retentionLimitError(candidates[0]);
         if (oldestFinished !== previous && oldestFinished.project && ![...this.tasks.values()].some(other => other !== oldestFinished && other.project === oldestFinished.project)) {
-          await this.discard(oldestFinished.record.taskId);
+          if (!await this.discardTask(oldestFinished.record.taskId, true)) {
+            throw this.retentionLimitError(oldestFinished);
+          }
         }
         this.tasks.delete(oldestFinished.record.taskId);
         this.events.drop(oldestFinished.record.taskId);
@@ -780,10 +790,11 @@ export class TaskManager {
       const taskId = randomUUID();
       options.group = options.groupAdmission ? { ...options.groupAdmission, rootTaskId: taskId } : previous?.record.group && structuredClone(previous.record.group);
       delete options.groupAdmission;
+      const isAgyExecutor = this.executor instanceof AgyExecutionAdapter;
       const record: TaskRecord = { group: options.group, memory: summarizeMemory(options.memorySnapshots), ...(options.craft ? { craft: { revision: options.craft.revision, manifestSha256: options.craft.manifestSha256, permanent: options.craft.permanent, catalog: options.craft.catalog.map(entry => entry.name) } } : {}), parentTaskId: options.parentTaskId, sourceMessage: options.sourceMessage, deliveryMode: options.deliveryMode, providedSkills: options.providedSkills, taskId, sessionId: options.sessionId, model, effort: options.effort, execution: this.initialExecutionIdentity(model, options.effort), mode, role, roleDefinition, prompt: options.prompt,
         acceptanceCriteria, handoff: options.handoff ?? previous?.record.handoff, comparison: options.comparison,
-        tests: previous?.record.tests ?? contextSource?.record.tests, usageIsResume: Boolean(previous),
-        usageBaseline: previous ? this.latestObservedUsage(previous.record.sessionId, workingDirectory) : undefined,
+        tests: previous?.record.tests ?? contextSource?.record.tests, usageIsResume: isAgyExecutor ? Boolean(previous) : false,
+        usageBaseline: isAgyExecutor && previous ? this.latestObservedUsage(previous.record.sessionId, workingDirectory) : undefined,
         workingDirectory, status: 'queued', createdAt: new Date().toISOString(),
         outputSchema: recordOutputSchema, artifactPaths: recordArtifactPaths, agentPolicy: options.agentPolicy };
       this.tasks.set(record.taskId, { record, ownerPid: process.pid, owned: true, options: { ...options, model: model ?? null, role, acceptanceCriteria, workingDirectory, timeoutSeconds, mode }, project: previous?.project ?? contextProject, releaseProject: pendingProjectRelease });
@@ -1225,20 +1236,28 @@ export class TaskManager {
         this.nativeRecoveryError = undefined;
       }
       if (this.tasks.size >= this.config.maxRetainedTasks) {
-        const oldestFinished = [...this.tasks.values()].find(candidate => terminal.has(candidate.record.status) && candidate !== current && !this.hasPendingInbox(candidate.record)) ?? (this.hasPendingInbox(current.record) ? undefined : current);
-        if (!oldestFinished) throw new BridgeError('QUEUE_FULL', 'Task retention limit reached with active tasks');
+        const otherCandidates = [...this.tasks.values()].filter(candidate => terminal.has(candidate.record.status) && candidate !== current && !this.hasPendingInbox(candidate.record));
+        const oldestFinished = otherCandidates.find(candidate => !this.hasUnverifiedCleanup(candidate)) ?? (!this.hasPendingInbox(current.record) && !this.hasUnverifiedCleanup(current) ? current : undefined);
+        if (!oldestFinished) {
+          const excluded = otherCandidates[0] ?? (!this.hasPendingInbox(current.record) && this.hasUnverifiedCleanup(current) ? current : undefined);
+          throw this.retentionLimitError(excluded);
+        }
         if (oldestFinished !== current && oldestFinished.project && ![...this.tasks.values()].some(other => other !== oldestFinished && other.project === oldestFinished.project)) {
-          await this.discard(oldestFinished.record.taskId);
+          if (!await this.discardTask(oldestFinished.record.taskId, true)) {
+            throw this.retentionLimitError(oldestFinished);
+          }
         }
         this.tasks.delete(oldestFinished.record.taskId);
         this.events.drop(oldestFinished.record.taskId);
         this.state.drop(oldestFinished.record.taskId);
       }
+      const isAgyExecutor = this.executor instanceof AgyExecutionAdapter;
       const record: TaskRecord = { parentTaskId: current.record.taskId, group: structuredClone(current.record.group), memory: structuredClone(current.record.memory), craft: current.record.craft, deliveryMode: current.record.deliveryMode, providedSkills: current.project.providedSkills, taskId: randomUUID(), sessionId: current.record.sessionId, model: current.record.model, effort: current.record.effort,
         execution: this.initialExecutionIdentity(current.record.model, current.record.effort),
         mode: 'write', role: current.record.role, roleDefinition: current.record.roleDefinition, prompt: backend === 'windows-lpac' ? 'Run the requested tests in the Windows sandbox.' : 'Run the requested tests in the Linux sandbox.',
         acceptanceCriteria: current.record.acceptanceCriteria, handoff: current.record.handoff, tests: current.record.tests,
-        usageIsResume: true, usageBaseline: this.latestObservedUsage(current.record.sessionId, current.record.workingDirectory),
+        usageIsResume: isAgyExecutor,
+        usageBaseline: isAgyExecutor ? this.latestObservedUsage(current.record.sessionId, current.record.workingDirectory) : undefined,
         workingDirectory: current.record.workingDirectory, copyDirectory: current.project.copyDirectory, includedFiles: current.project.includedFiles,
         status: 'queued', createdAt: new Date().toISOString(),
         outputSchema: current.record.outputSchema, artifactPaths: current.record.artifactPaths, agentPolicy: current.record.agentPolicy };
@@ -1273,7 +1292,7 @@ export class TaskManager {
     });
   }
 
-  private async withProject<T>(project: ProjectCopy, operation: () => Promise<T>): Promise<T> {
+  private async withProject<T>(project: ProjectCopy, operation: () => Promise<T>, options?: { cleanupGuard?: boolean }): Promise<T> {
     if (this.hasQuarantinedCopySibling(project)) {
       throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
     }
@@ -1282,11 +1301,23 @@ export class TaskManager {
     }
     this.busyProjects.add(project);
     let release: (() => void) | undefined;
-    try { release = this.state.acquire(this.projectLock(project)); return await operation(); }
+    try {
+      release = this.state.acquire(this.projectLock(project));
+      // The marker is read from disk under the copy lock, so a marker written by another bridge instance is always seen, whatever this instance's task map says.
+      if (options?.cleanupGuard !== false) {
+        await this.assertCopyCleanupConfirmed(project, { lockHeld: true });
+      }
+      return await operation();
+    }
     finally { release?.(); this.busyProjects.delete(project); this.scheduleInbox(project.copyDirectory); }
   }
 
   async discard(taskId: string): Promise<TaskRecord> {
+    await this.discardTask(taskId, false);
+    return this.status(taskId);
+  }
+
+  private async discardTask(taskId: string, automatic: boolean): Promise<boolean> {
     this.assertStateDirectoryUsable();
     this.refresh();
     const task = this.tasks.get(taskId);
@@ -1312,7 +1343,7 @@ export class TaskManager {
         this.failPendingInbox(undefined, reloaded, 'cancelled', 'COPY_DISCARDED');
         this.recoverInboxClaims(true);
         if (hadPendingInbox) this.persist(taskId);
-        return { ...reloaded.record, tokenUsage: taskTokenUsage(reloaded.record) };
+        return true;
       } finally {
         release();
       }
@@ -1320,7 +1351,21 @@ export class TaskManager {
     if (!terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Cancel and wait for the task before discarding');
     if (task.project) {
       const project = task.project;
-      await this.withProject(project, async () => {
+      return await this.withProject(project, async () => {
+        if (automatic) {
+          // The check before the lock can be stale because another bridge instance may mark the copy in between.
+          let marker: ProcessCleanupMarker | undefined;
+          try {
+            marker = readProcessCleanupMarkerSync(project);
+          } catch {
+            return false;
+          }
+          if (marker && marker.entries.length > 0) {
+            if (marker.entries.some(entry => entry.provider !== 'agy')) return false;
+            if (this.copyHasOpenCodeTask(project.copyDirectory)) return false;
+            // Agy-only copies are discarded without process reconciliation or termination, as before OpenCode support, because a stale PID may have been reused by an unrelated process.
+          }
+        }
         this.failPendingInbox(project.copyDirectory, task, 'cancelled', 'COPY_DISCARDED');
         await discardProjectCopy(project);
         for (const related of this.tasks.values()) if (related.project === project) {
@@ -1328,9 +1373,10 @@ export class TaskManager {
           related.record.discardedAt = new Date().toISOString();
           this.events.append(related.record.taskId, 'copy.discarded', {});
         }
-      });
+        return true;
+      }, { cleanupGuard: false });
     }
-    return this.status(taskId);
+    return true;
   }
 
   async cleanup(now = Date.now()): Promise<{ discardedTaskIds: string[] }> {
@@ -1340,10 +1386,10 @@ export class TaskManager {
     // discard() reloads the state, which replaces the copy objects of tasks this server does not run, so each copy is looked up again by directory.
     for (const copyDirectory of new Set([...this.tasks.values()].flatMap(task => task.project ? [task.project.copyDirectory] : []))) {
       const related = [...this.tasks.values()].filter(task => task.project?.copyDirectory === copyDirectory);
-      if (!related.length || related.some(task => this.hasQuarantinedCopySibling(task.project!) || this.busyProjects.has(task.project!) || !terminal.has(task.record.status))) continue;
+      if (!related.length || related.some(task => this.hasQuarantinedCopySibling(task.project!) || this.busyProjects.has(task.project!) || !terminal.has(task.record.status) || this.hasUnverifiedCleanup(task))) continue;
       const latest = Math.max(...related.map(task => Date.parse(task.record.completedAt || task.record.createdAt)));
       if (now - latest < this.config.copyRetentionHours * 3600000) continue;
-      await this.discard(related[0]!.record.taskId);
+      if (!await this.discardTask(related[0]!.record.taskId, true)) continue;
       discardedTaskIds.push(...related.map(task => task.record.taskId));
     }
     return { discardedTaskIds };
@@ -1416,6 +1462,40 @@ export class TaskManager {
         return preview;
       } finally { releaseSource(); }
     });
+  }
+
+  private copyHasOpenCodeTask(copyDirectory: string): boolean {
+    for (const candidate of this.tasks.values()) {
+      if (candidate.project?.copyDirectory === copyDirectory && candidate.record.execution?.provider === 'opencode') {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private hasUnverifiedCleanup(task: InternalTask): boolean {
+    if (!task.project || task.record.discardedAt) return false;
+    let marker: ProcessCleanupMarker | undefined;
+    try {
+      marker = readProcessCleanupMarkerSync(task.project);
+    } catch {
+      return true;
+    }
+    if (marker?.entries.some(entry => entry.provider !== 'agy')) return true;
+    const copyHasOpenCode = this.copyHasOpenCodeTask(task.project.copyDirectory);
+    // Agy-only copies keep the pre-OpenCode behaviour where unconfirmed cleanup does not block automatic discard.
+    if (!copyHasOpenCode) return false;
+    return Boolean((task.record.processCleanup && !task.record.processCleanup.verified) || marker?.entries.length);
+  }
+
+  private retentionLimitError(unverifiedCandidate: InternalTask | undefined): BridgeError {
+    if (unverifiedCandidate) {
+      return new BridgeError(
+        'QUEUE_FULL',
+        `Task retention limit reached; task ${unverifiedCandidate.record.taskId} has unconfirmed process cleanup and is retained until it is discarded (black_gravity_discard frees its slot)`,
+      );
+    }
+    return new BridgeError('QUEUE_FULL', 'Task retention limit reached with active tasks');
   }
 
   private hasPendingInbox(record: TaskRecord): boolean {
@@ -1847,7 +1927,11 @@ export class TaskManager {
         { prepareLf: isAgyWrite, convertLf: isAgyWrite && !native },
       );
       if (task.termination) {
-        this.finish(task, task.termination);
+        if (!(this.executor instanceof AgyExecutionAdapter) && (execResult.status === 'cancelled' || execResult.status === 'timeout') && execResult.status === task.termination) {
+          this.finish(task, task.termination, execResult.error.code, execResult.error.message);
+        } else {
+          this.finish(task, task.termination);
+        }
         return;
       }
       if (native) {
@@ -1884,7 +1968,11 @@ export class TaskManager {
         }
       }
       if (task.termination) {
-        this.finish(task, task.termination);
+        if (!(this.executor instanceof AgyExecutionAdapter) && (execResult.status === 'cancelled' || execResult.status === 'timeout') && execResult.status === task.termination) {
+          this.finish(task, task.termination, execResult.error.code, execResult.error.message);
+        } else {
+          this.finish(task, task.termination);
+        }
         return;
       }
       if (record.mode === 'read-only') await verifyReadOnlyCopy(task.project, readOnlyBaseline);
@@ -1894,7 +1982,7 @@ export class TaskManager {
         return;
       }
       const deniedReads = await this.verifyPolicyAndReadDenials(task, execResult, policyReceiptOffset, 'No new guarded finish was observed for this conversation');
-      if (record.mode !== 'read-only') await this.normalizeEditedFiles(task, styles!, boms!);
+      if (record.mode !== 'read-only' && styles && boms) await this.normalizeEditedFiles(task, styles, boms);
       const structuredOutput = (record.result as { structured_output?: unknown } | undefined)?.structured_output ?? execResult.structuredOutput;
       record.report = await validateRoleReport((record.roleDefinition ?? resolveRole(record.role ?? 'implementer')).baseRole,
         structuredOutput, task.project.copyDirectory);
@@ -2052,11 +2140,22 @@ export class TaskManager {
       };
       this.events.append(task.record.taskId, 'task.denied-reads', deniedReads);
     }
-    await this.normalizeEditedFiles(task, styles!, boms!);
+    if (styles && boms) await this.normalizeEditedFiles(task, styles, boms);
   }
 
   private async executeWindowsNativeTest(task: InternalTask): Promise<void> {
     return this.executeLocalNativeTest(task);
+  }
+
+  private async confirmCopyCleanupForLoop(task: InternalTask): Promise<boolean> {
+    try {
+      await this.assertCopyCleanupConfirmed(task.project!, { excludeTaskId: task.record.taskId, lockHeld: true });
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.finish(task, 'failed', 'PROCESS_CLEANUP_UNVERIFIED', message);
+      return false;
+    }
   }
 
   private async executeLocalNativeTest(task: InternalTask): Promise<void> {
@@ -2080,6 +2179,7 @@ export class TaskManager {
     try {
       for (let attempt = 1; attempt <= request.maxAttempts; attempt++) {
         if (task.termination) break;
+        if (!await this.confirmCopyCleanupForLoop(task)) return;
         const remaining = this.remainingSeconds(deadline);
         if (!remaining) { task.termination ??= 'timeout'; break; }
         const beforePreview = await previewProjectCopy(task.project, this.config);
@@ -2120,6 +2220,7 @@ export class TaskManager {
         }
         const repairSeconds = this.remainingSeconds(deadline);
         if (!repairSeconds) { task.termination ??= 'timeout'; break; }
+        if (!await this.confirmCopyCleanupForLoop(task)) return;
         if (task.record.group) {
           const budgetLock = this.state.acquire('registry');
           try { this.refresh(); this.checkGroupBudget(task.record.group.groupId, { taskId: task.record.taskId, zeroTokens: !modelInvoked }); }
@@ -2171,6 +2272,7 @@ export class TaskManager {
     task.executionAbort = controller;
     if (task.termination) controller.abort(task.termination);
     let spawnedPid: number | undefined;
+    let agyLaunchId: string | undefined;
     let stepTimer: NodeJS.Timeout | undefined;
     let hookResultSeen = false;
     const request: ExecutionRequest = {
@@ -2202,6 +2304,7 @@ export class TaskManager {
     };
     let result: ExecutionResult;
     try {
+      await this.assertCopyCleanupConfirmed(project, { excludeTaskId: record.taskId, lockHeld: true });
       if (this.executor instanceof AgyExecutionAdapter) {
         const hooks: AgyExecutionHooks = {
           runOptions: options,
@@ -2211,6 +2314,7 @@ export class TaskManager {
           repair: config.repair,
           onProcessStarted: (pid, isRepair) => {
             spawnedPid = pid;
+            agyLaunchId = randomUUID();
             record.pid = pid;
             record.status = 'running';
             this.events.append(record.taskId, 'process.started', isRepair ? { pid, repair: true } : { pid });
@@ -2218,6 +2322,15 @@ export class TaskManager {
           },
           onProcessCleanup: cleanup => {
             record.processCleanup = cleanup;
+            if (!cleanup.verified) {
+              upsertProcessCleanupMarkerEntrySync(project, {
+                launchId: agyLaunchId ?? randomUUID(),
+                taskId: record.taskId,
+                provider: 'agy',
+                ...(typeof spawnedPid === 'number' ? { pid: spawnedPid } : {}),
+                spawnedAt: cleanup.spawnedAt,
+              });
+            }
           },
           onAfterProcessExit: async () => {
             if (spawnedPid === undefined || record.processCleanup?.verified) {
@@ -2309,7 +2422,7 @@ export class TaskManager {
         };
         result = await this.executor.execute(request, hooks);
       } else {
-        // Pure E02 ExecutionAdapter: invoke only execute(request) and enforce host cancellation/timeout around it.
+        // Pure ExecutionAdapter: pass ExecutionContext when cancel is supported, or bound host cancellation around execute(request).
         record.status = 'running';
         startStepTimer();
         result = await this.executePureAdapterBounded(this.executor, request, task, controller.signal);
@@ -2358,10 +2471,11 @@ export class TaskManager {
   }
 
   /**
-   * Bounds a pure E02 ExecutionAdapter against host cancellation and deadlines.
-   * Under the E02 contract ExecutionRequest has no AbortSignal, so host cancellation
-   * or timeout frees the TaskManager slot without being able to forcibly stop provider internals;
-   * late settlements are absorbed so they cannot trigger unhandled rejections or double-finish.
+   * Bounds a pure ExecutionAdapter against host cancellation and deadlines.
+   * Adapters declaring `cancel: 'supported'` receive ExecutionContext (`signal`, `onProcessStarted`,
+   * `onProcessCleanup`) and TaskManager awaits their process reconciliation after abort up to a 30 s safety bound.
+   * Adapters without `cancel: 'supported'` receive only `request`; host cancellation or timeout frees the
+   * TaskManager slot immediately and ignores late settlements without forcibly stopping provider internals.
    */
   private async executePureAdapterBounded(
     adapter: ExecutionAdapter,
@@ -2370,8 +2484,137 @@ export class TaskManager {
     signal: AbortSignal,
   ): Promise<ExecutionResult> {
     if (signal.aborted || task.termination) {
-      const reason = task.termination ?? 'cancelled';
+      const reason = task.termination ?? (signal.reason === 'timeout' ? 'timeout' : 'cancelled');
       throw new BridgeError(reason === 'timeout' ? 'TASK_TIMEOUT' : 'TASK_CANCELLED', `Task ${reason}`);
+    }
+    if (isCapabilitySupported(adapter.capabilities, 'cancel')) {
+      let processStartedAtMs: number | undefined;
+      let currentLaunch: { launchId: string; pid: number | undefined; spawnedAt: string } | undefined;
+      let fallbackSettled = false;
+      const execPromise = Promise.resolve().then(() => adapter.execute(request, {
+        signal,
+        onProcessStarted: pid => {
+          if (fallbackSettled) return;
+          const nowMs = Date.now();
+          processStartedAtMs = nowMs;
+          const nowIso = new Date(nowMs).toISOString();
+          const launchId = randomUUID();
+          currentLaunch = { launchId, pid, spawnedAt: nowIso };
+          if (typeof pid === 'number') task.record.pid = pid;
+          task.record.status = 'running';
+          task.record.processCleanup = {
+            verified: false,
+            spawnedAt: nowIso,
+            checkedAt: nowIso,
+            remaining: 0,
+          };
+          if (task.project) {
+            upsertProcessCleanupMarkerEntrySync(task.project, {
+              launchId,
+              taskId: task.record.taskId,
+              provider: this.executor.identity.provider,
+              ...(typeof pid === 'number' ? { pid } : {}),
+              spawnedAt: nowIso,
+            });
+          }
+          this.events.append(task.record.taskId, 'process.started', { pid });
+          this.persist(task.record.taskId);
+        },
+        onProcessCleanup: cleanup => {
+          if (fallbackSettled) return;
+          task.record.processCleanup = cleanup;
+          if (task.project) {
+            if (cleanup.verified) {
+              if (currentLaunch) {
+                removeProcessCleanupMarkerEntrySync(task.project, currentLaunch.launchId);
+              }
+            } else {
+              const launch = currentLaunch ?? {
+                launchId: randomUUID(),
+                pid: typeof task.record.pid === 'number' ? task.record.pid : undefined,
+                spawnedAt: cleanup.spawnedAt,
+              };
+              currentLaunch = launch;
+              upsertProcessCleanupMarkerEntrySync(task.project, {
+                launchId: launch.launchId,
+                taskId: task.record.taskId,
+                provider: this.executor.identity.provider,
+                ...(typeof launch.pid === 'number' ? { pid: launch.pid } : {}),
+                spawnedAt: cleanup.spawnedAt,
+              });
+            }
+          }
+          this.events.append(task.record.taskId, 'process.cleanup', {
+            verified: cleanup.verified,
+            remaining: cleanup.remaining,
+          });
+        },
+      }));
+      execPromise.catch(() => undefined);
+      return await new Promise<ExecutionResult>((resolve, reject) => {
+        let settled = false;
+        let abortTimeout: NodeJS.Timeout | undefined;
+        const cleanup = () => {
+          signal.removeEventListener('abort', onAbort);
+          if (abortTimeout) {
+            clearTimeout(abortTimeout);
+            abortTimeout = undefined;
+          }
+        };
+        const onAbort = () => {
+          if (settled || abortTimeout) return;
+          abortTimeout = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            fallbackSettled = true;
+            cleanup();
+            const nowIso = new Date().toISOString();
+            const launch = currentLaunch ?? {
+              launchId: randomUUID(),
+              pid: undefined,
+              spawnedAt: new Date(processStartedAtMs ?? Date.now()).toISOString(),
+            };
+            currentLaunch = launch;
+            task.record.processCleanup = {
+              verified: false,
+              spawnedAt: launch.spawnedAt,
+              checkedAt: nowIso,
+              remaining: 0,
+            };
+            if (task.project) {
+              upsertProcessCleanupMarkerEntrySync(task.project, {
+                launchId: launch.launchId,
+                taskId: task.record.taskId,
+                provider: this.executor.identity.provider,
+                ...(typeof launch.pid === 'number' ? { pid: launch.pid } : {}),
+                spawnedAt: launch.spawnedAt,
+              });
+            }
+            this.events.append(task.record.taskId, 'process.cleanup', {
+              verified: false,
+              remaining: 0,
+            });
+            const reason = task.termination ?? (signal.reason === 'timeout' ? 'timeout' : 'cancelled');
+            reject(new BridgeError(reason === 'timeout' ? 'TASK_TIMEOUT' : 'TASK_CANCELLED', `Task ${reason}`));
+          }, 30_000);
+          abortTimeout.unref();
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+        execPromise.then(
+          result => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve(result);
+          },
+          error => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(error);
+          },
+        );
+      });
     }
     const execPromise = Promise.resolve().then(() => adapter.execute(request));
     execPromise.catch(() => undefined);
@@ -2636,18 +2879,131 @@ export class TaskManager {
     this.events.append(task.record.taskId, `task.${status}`, task.record.error || { exitCode: task.record.exitCode });
   }
 
+  private unverifiedCleanupError(taskIds: readonly string[]): BridgeError {
+    const unique = [...new Set(taskIds)];
+    return new BridgeError(
+      'PROCESS_CLEANUP_UNVERIFIED',
+      `Processes started by task ${unique.join(', ')} may still be running; discard the task (black_gravity_discard) to release this copy`,
+    );
+  }
+
+  private assertNoLegacyOpenCodeUnverified(copyDirectory: string): void {
+    const legacyTaskIds: string[] = [];
+    for (const candidate of this.tasks.values()) {
+      if (
+        candidate.project?.copyDirectory === copyDirectory &&
+        candidate.record.execution?.provider === 'opencode' &&
+        candidate.record.processCleanup &&
+        !candidate.record.processCleanup.verified
+      ) {
+        legacyTaskIds.push(candidate.record.taskId);
+      }
+    }
+    if (legacyTaskIds.length > 0) {
+      throw this.unverifiedCleanupError(legacyTaskIds);
+    }
+  }
+
+  private async reconcileAndRemoveAgyCleanupEntries(
+    project: ProjectCopy,
+    marker: ProcessCleanupMarker,
+  ): Promise<void> {
+    const nonAgyEntries = marker.entries.filter(entry => entry.provider !== 'agy');
+    if (nonAgyEntries.length > 0) {
+      throw this.unverifiedCleanupError(nonAgyEntries.map(entry => entry.taskId));
+    }
+    const reconciledLaunchIds: string[] = [];
+    const reconciledTaskIds = new Set<string>();
+    const failedTaskIds: string[] = [];
+    for (const entry of marker.entries) {
+      const retry = await reconcileOwnedProcesses({
+        pid: entry.pid,
+        spawnedAt: Date.parse(entry.spawnedAt),
+        processGroup: process.platform !== 'win32',
+      });
+      if (retry.verified) {
+        reconciledLaunchIds.push(entry.launchId);
+        reconciledTaskIds.add(entry.taskId);
+      } else {
+        failedTaskIds.push(entry.taskId);
+      }
+    }
+    if (failedTaskIds.length > 0) {
+      throw this.unverifiedCleanupError(failedTaskIds);
+    }
+    removeProcessCleanupMarkerEntriesSync(project, reconciledLaunchIds);
+    // The record follows the confirmed marker so retention stops excluding the task.
+    for (const taskId of reconciledTaskIds) {
+      const task = this.tasks.get(taskId);
+      if (task?.record.processCleanup?.verified === false) {
+        task.record.processCleanup = { ...task.record.processCleanup, verified: true, checkedAt: new Date().toISOString(), remaining: 0 };
+        this.persist(taskId);
+      }
+    }
+  }
+
+  private async assertCopyCleanupConfirmed(
+    project: ProjectCopy,
+    options?: { excludeTaskId?: string; lockHeld?: boolean },
+  ): Promise<void> {
+    await assertManagedCopyPresent(project);
+    if (this.hasQuarantinedCopySibling(project)) {
+      throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+    }
+    this.assertNoLegacyOpenCodeUnverified(project.copyDirectory);
+    const marker = readProcessCleanupMarkerSync(project);
+    if (!marker || marker.entries.length === 0) return;
+
+    const nonAgyEntries = marker.entries.filter(entry => entry.provider !== 'agy');
+    if (nonAgyEntries.length > 0) {
+      throw this.unverifiedCleanupError(nonAgyEntries.map(entry => entry.taskId));
+    }
+
+    const hasNonTerminal = [...this.tasks.values()].some(
+      task =>
+        task.project?.copyDirectory === project.copyDirectory &&
+        task.record.taskId !== options?.excludeTaskId &&
+        !terminal.has(task.record.status),
+    );
+    if ((!options?.lockHeld && this.busyProjects.has(project)) || hasNonTerminal) {
+      throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
+    }
+
+    if (options?.lockHeld) {
+      await this.reconcileAndRemoveAgyCleanupEntries(project, marker);
+      return;
+    }
+
+    this.busyProjects.add(project);
+    let release: (() => void) | undefined;
+    try {
+      release = this.state.acquire(this.projectLock(project));
+      const freshMarker = readProcessCleanupMarkerSync(project);
+      if (!freshMarker || freshMarker.entries.length === 0) return;
+      await this.reconcileAndRemoveAgyCleanupEntries(project, freshMarker);
+    } finally {
+      release?.();
+      this.busyProjects.delete(project);
+    }
+  }
+
   // A copy whose processes may still run cannot be reused; another observation may confirm they ended.
   private async assertProcessesReconciled(record: TaskRecord): Promise<void> {
     const existing = this.tasks.get(record.taskId);
-    if (existing?.project && this.hasQuarantinedCopySibling(existing.project)) {
-      throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+    if (existing?.project) {
+      await this.assertCopyCleanupConfirmed(existing.project);
+    } else if (record.copyDirectory) {
+      this.assertNoLegacyOpenCodeUnverified(record.copyDirectory);
     }
     const cleanup = record.processCleanup;
     if (!cleanup) return;
     if (!cleanup.verified) {
+      if (record.execution?.provider === 'opencode') {
+        throw this.unverifiedCleanupError([record.taskId]);
+      }
       const retry = await reconcileOwnedProcesses({ pid: record.pid, spawnedAt: Date.parse(cleanup.spawnedAt), processGroup: process.platform !== 'win32' });
       record.processCleanup = { ...cleanup, verified: retry.verified, checkedAt: new Date().toISOString(), remaining: retry.remaining.length };
-      if (!retry.verified) throw new BridgeError('PROCESS_CLEANUP_UNVERIFIED', 'Processes started by this task may still be running; stop them before reusing its copy');
+      if (!retry.verified) throw this.unverifiedCleanupError([record.taskId]);
     }
     // Only this task's own launch, whose cleanup is now confirmed, can release the files it converted. Every write of the
     // conversion record happens under the copy's lock, so ownership is checked again while holding it.

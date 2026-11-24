@@ -1,4 +1,4 @@
-import { accessSync, constants, statSync, type BigIntStats, type Stats } from 'node:fs';
+import { accessSync, constants, realpathSync, statSync, type BigIntStats, type Stats } from 'node:fs';
 import { access, chmod, lstat, mkdtemp, readdir, readlink, realpath, rm } from 'node:fs/promises';
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -40,6 +40,7 @@ export interface DetectBubblewrapOptions {
   env?: NodeJS.ProcessEnv;
   runner?: BwrapSyncRunner;
   useCache?: boolean;
+  untrustedDirectory?: string;
 }
 
 export interface LinuxExecution {
@@ -264,28 +265,52 @@ function isExecutableFile(candidate: string): boolean {
   }
 }
 
-function findBwrapOnPath(pathValue: string | undefined): string | undefined {
+export function resolveTrustedBwrap(candidate: string, untrustedDirectory: string): string | undefined {
+  if (!candidate || candidate.includes('\0') || !path.isAbsolute(candidate) || !untrustedDirectory || untrustedDirectory.includes('\0')) {
+    return undefined;
+  }
+  let realCandidate: string;
+  try {
+    realCandidate = realpathSync(candidate);
+  } catch {
+    return undefined;
+  }
+  let realUntrustedDir: string;
+  try {
+    realUntrustedDir = realpathSync(untrustedDirectory);
+  } catch {
+    realUntrustedDir = untrustedDirectory;
+  }
+  return posixContains(realUntrustedDir, realCandidate) ? undefined : realCandidate;
+}
+
+function findBwrapOnPath(pathValue: string | undefined, untrustedDirectory?: string): string | undefined {
   if (!pathValue) return undefined;
   for (const entry of pathValue.split(path.posix.delimiter)) {
     if (!entry || entry.includes('\0') || !entry.startsWith('/')) continue;
     const candidate = path.posix.join(entry, 'bwrap');
-    if (isExecutableFile(candidate)) return candidate;
+    if (!isExecutableFile(candidate)) continue;
+    if (untrustedDirectory === undefined) return candidate;
+    const trusted = resolveTrustedBwrap(candidate, untrustedDirectory);
+    if (trusted !== undefined) return trusted;
   }
   return undefined;
 }
 
 export function detectBubblewrap(options?: DetectBubblewrapOptions): BubblewrapDetection {
-  const useCache = !options || (
+  const canReadCache = !options || (
     options.platform === undefined &&
     options.bwrapPath === undefined &&
     options.env === undefined &&
     options.runner === undefined &&
     options.useCache !== false
   );
-  if (useCache && cachedDetection) return cachedDetection;
+  const untrustedDirectory = options?.untrustedDirectory;
+  const canStoreCache = canReadCache && untrustedDirectory === undefined;
+  if (canReadCache && untrustedDirectory === undefined && cachedDetection) return cachedDetection;
 
   const store = (result: BubblewrapDetection): BubblewrapDetection => {
-    if (useCache) cachedDetection = result;
+    if (canStoreCache) cachedDetection = result;
     return result;
   };
 
@@ -302,11 +327,29 @@ export function detectBubblewrap(options?: DetectBubblewrapOptions): BubblewrapD
     if (!options.runner && !isExecutableFile(options.bwrapPath)) {
       return store({ available: false, code: 'LINUX_BWRAP_MISSING', reason: 'bwrap binary is missing or not executable' });
     }
-    bwrapPath = options.bwrapPath;
+    if (untrustedDirectory !== undefined) {
+      const trusted = resolveTrustedBwrap(options.bwrapPath, untrustedDirectory);
+      if (!trusted) {
+        return store({ available: false, code: 'LINUX_BWRAP_MISSING', reason: 'bwrap path must be outside the task copy' });
+      }
+      bwrapPath = trusted;
+    } else {
+      bwrapPath = options.bwrapPath;
+    }
   } else {
-    bwrapPath = findBwrapOnPath((options?.env ?? process.env).PATH);
+    bwrapPath = findBwrapOnPath((options?.env ?? process.env).PATH, untrustedDirectory);
     if (!bwrapPath) {
       return store({ available: false, code: 'LINUX_BWRAP_MISSING', reason: 'bwrap binary not found on absolute PATH entries' });
+    }
+  }
+
+  if (canReadCache && untrustedDirectory !== undefined && cachedDetection?.path) {
+    try {
+      if (realpathSync(cachedDetection.path) === bwrapPath) {
+        return { ...cachedDetection, path: bwrapPath };
+      }
+    } catch {
+      // Ignore unresolvable cached path and probe freshly.
     }
   }
 
@@ -733,9 +776,13 @@ export async function executeLinuxTest(
   }
   validateLinuxCommand(command);
 
-  const detection = options.detection ?? detectBubblewrap();
+  const detection = options.detection ?? detectBubblewrap({ untrustedDirectory: copyDirectory });
   if (!detection.available || !detection.path) {
     throw new BridgeError(detection.code ?? 'LINUX_BWRAP_MISSING', detection.reason ?? 'Bubblewrap is unavailable');
+  }
+  const bwrapPath = resolveTrustedBwrap(detection.path, copyDirectory);
+  if (!bwrapPath) {
+    throw new BridgeError('LINUX_BWRAP_MISSING', 'bwrap path must be outside the task copy');
   }
 
   const temp = await realpath(os.tmpdir());
@@ -995,7 +1042,7 @@ export async function executeLinuxTest(
       return preSpawnFailure('Command cancelled');
     }
 
-    const child = spawn(detection.path, args, {
+    const child = spawn(bwrapPath, args, {
       cwd,
       detached: true,
       shell: false,

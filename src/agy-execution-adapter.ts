@@ -6,6 +6,7 @@ import {
   type ExecutionAdapter,
   type ExecutionAdapterIdentity,
   type ExecutionCapabilities,
+  type ExecutionContext,
   type ExecutionRequest,
   type ExecutionResult,
 } from './execution-contract.js';
@@ -387,7 +388,10 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
     }
   }
 
-  async execute(request: ExecutionRequest, hooks?: AgyExecutionHooks): Promise<AgyExecutionResult> {
+  execute(request: ExecutionRequest, hooks?: AgyExecutionHooks): Promise<AgyExecutionResult>;
+  execute(request: ExecutionRequest, context?: ExecutionContext): Promise<AgyExecutionResult>;
+  async execute(request: ExecutionRequest, context?: AgyExecutionHooks | ExecutionContext): Promise<AgyExecutionResult> {
+    const hooks = context as AgyExecutionHooks | undefined;
     const terminationBefore = this.terminationFromSignal(hooks);
     if (terminationBefore) {
       return this.terminatedResult(request.taskId, terminationBefore, undefined, undefined, undefined, 0);

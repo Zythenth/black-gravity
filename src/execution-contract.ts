@@ -67,10 +67,16 @@ export interface ExecutionModel {
   readonly id: string;
 }
 
+export interface ExecutionContext {
+  readonly signal?: AbortSignal;
+  readonly onProcessStarted?: (pid: number | undefined) => void;
+  readonly onProcessCleanup?: (cleanup: NonNullable<TaskRecord['processCleanup']>) => void;
+}
+
 export interface ExecutionAdapter {
   readonly identity: ExecutionAdapterIdentity;
   readonly capabilities: ExecutionCapabilities;
-  execute(request: ExecutionRequest): Promise<ExecutionResult>;
+  execute(request: ExecutionRequest, context?: ExecutionContext): Promise<ExecutionResult>;
   // Declares the model-listing capability for the new-model notice.
   listModels?(): Promise<readonly ExecutionModel[]>;
 }

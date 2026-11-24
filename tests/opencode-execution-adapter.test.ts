@@ -14,6 +14,7 @@ import { discardProjectCopy } from '../src/isolation.js';
 import { detectBubblewrap } from '../src/linux-executor.js';
 import {
   OPENCODE_READ_AGENT,
+  OPENCODE_RESUME_REQUIRES_PID_NAMESPACE,
   OPENCODE_WRITE_AGENT,
   OpenCodeExecutionAdapter,
   openCodeConfigContent,
@@ -362,33 +363,45 @@ test('e) stream errors, missing step_finish, protocol garbage, and missing binar
 test('f) capability gates and invalid model names reject before spawning', async t => {
   const ws = createWorkspace(t);
   const rec = path.join(ws.root, 'should-not-spawn.json');
+  const spawnLog = path.join(ws.root, 'gate-spawn-log.jsonl');
+  const resumeAdapter = new OpenCodeExecutionAdapter({
+    executable: process.execPath,
+    prefixArgs: [MOCK_OPENCODE, '--spawn-log', spawnLog, '--record', rec, '--scenario', 'read'],
+    containment: 'none',
+  });
   const adapter = new OpenCodeExecutionAdapter({
     executable: process.execPath,
     prefixArgs: [MOCK_OPENCODE, '--record', rec, '--scenario', 'read'],
   });
 
-  await assert.rejects(
-    () => adapter.execute({
-      taskId: 'gate-write-resume',
-      prompt: 'write resume',
-      workingDirectory: ws.repoDir,
-      role: 'implementer',
-      mode: 'write',
-      session: { id: 'ses_prev' },
-    }),
-    err => err instanceof TypeError && /Execution capability unavailable/.test(err.message),
-  );
-  await assert.rejects(
-    () => adapter.execute({
-      taskId: 'gate-resume',
-      prompt: 'resume',
-      workingDirectory: ws.repoDir,
-      role: 'implementer',
-      mode: 'read-only',
-      session: { id: 'ses_prev' },
-    }),
-    err => err instanceof TypeError && /Execution capability unavailable/.test(err.message),
-  );
+  const writeResumeRes = await resumeAdapter.execute({
+    taskId: 'gate-write-resume',
+    prompt: 'write resume',
+    workingDirectory: ws.repoDir,
+    role: 'implementer',
+    mode: 'write',
+    session: { id: 'ses_prev' },
+  });
+  assert.equal(writeResumeRes.status, 'failed');
+  if (writeResumeRes.status === 'failed') {
+    assert.equal(writeResumeRes.error.code, OPENCODE_RESUME_REQUIRES_PID_NAMESPACE);
+  }
+
+  const readResumeRes = await resumeAdapter.execute({
+    taskId: 'gate-resume',
+    prompt: 'resume',
+    workingDirectory: ws.repoDir,
+    role: 'implementer',
+    mode: 'read-only',
+    session: { id: 'ses_prev' },
+  });
+  assert.equal(readResumeRes.status, 'failed');
+  if (readResumeRes.status === 'failed') {
+    assert.equal(readResumeRes.error.code, OPENCODE_RESUME_REQUIRES_PID_NAMESPACE);
+  }
+
+  assert.equal(existsSync(spawnLog), false);
+
   await assert.rejects(
     () => adapter.execute({
       taskId: 'gate-schema',
@@ -411,6 +424,55 @@ test('f) capability gates and invalid model names reject before spawning', async
     }),
     err => err instanceof BridgeError && err.code === 'INVALID_MODEL',
   );
+  assert.equal(existsSync(rec), false);
+});
+
+test('f2) resume inside the PID namespace checks session list before run', async t => {
+  if (process.platform !== 'linux' || !detectBubblewrap().available) {
+    t.skip('Linux bubblewrap PID namespace unavailable');
+    return;
+  }
+  const ws = createWorkspace(t);
+  const rec = path.join(ws.root, 'f2-should-not-run.json');
+  const spawnLog = path.join(ws.root, 'f2-spawn-log.jsonl');
+  const resumeAdapter = new OpenCodeExecutionAdapter({
+    executable: process.execPath,
+    prefixArgs: [MOCK_OPENCODE, '--spawn-log', spawnLog, '--record', rec, '--scenario', 'read'],
+    containment: 'auto',
+  });
+
+  const writeResumeRes = await resumeAdapter.execute({
+    taskId: 'f2-write-resume',
+    prompt: 'write resume',
+    workingDirectory: ws.repoDir,
+    role: 'implementer',
+    mode: 'write',
+    session: { id: 'ses_prev' },
+  });
+  assert.equal(writeResumeRes.status, 'failed');
+  if (writeResumeRes.status === 'failed') {
+    assert.equal(writeResumeRes.error.code, 'OPENCODE_SESSION_NOT_FOUND');
+  }
+
+  const readResumeRes = await resumeAdapter.execute({
+    taskId: 'f2-read-resume',
+    prompt: 'resume',
+    workingDirectory: ws.repoDir,
+    role: 'implementer',
+    mode: 'read-only',
+    session: { id: 'ses_prev' },
+  });
+  assert.equal(readResumeRes.status, 'failed');
+  if (readResumeRes.status === 'failed') {
+    assert.equal(readResumeRes.error.code, 'OPENCODE_SESSION_NOT_FOUND');
+  }
+
+  const spawnEntries = readFileSync(spawnLog, 'utf8')
+    .trim()
+    .split(/\r?\n/)
+    .map(line => JSON.parse(line) as { argv: string[] });
+  assert.equal(spawnEntries.length, 2);
+  assert.ok(spawnEntries.every(entry => entry.argv[0] === 'session' && entry.argv[1] === 'list'));
   assert.equal(existsSync(rec), false);
 });
 
@@ -716,7 +778,7 @@ test('n) write mode creates a file only in the copy and yields a hashed patch wi
 
   assert.equal(record.execution?.provider, 'opencode');
   assert.equal(record.execution?.adapterId, 'opencode-cli');
-  assert.equal(record.execution?.adapterVersion, '2');
+  assert.equal(record.execution?.adapterVersion, '3');
   assert.equal(record.execution?.requested.model, 'opencode-go/mock-flash');
 });
 

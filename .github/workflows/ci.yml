@@ -93,6 +93,6 @@ jobs:
           bwrap --version
       - run: npm ci
       - run: npm run build
-      - run: node --test dist/tests/linux-executor.test.js
+      - run: node --test dist/tests/linux-executor.test.js dist/tests/opencode-execution-adapter.test.js dist/tests/opencode-lifecycle.test.js
         env:
           BLACK_GRAVITY_REQUIRE_BWRAP: '1'

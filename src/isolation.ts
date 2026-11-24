@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { git, type HostGitOptions } from './host-git.js';
 import { isUtf8 } from 'node:buffer';
-import { createReadStream } from 'node:fs';
+import { createReadStream, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { link, lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -138,6 +138,120 @@ export async function assertLineEndingsRestored(project: ProjectCopy): Promise<v
 
 export async function clearLineEndingConversions(project: ProjectCopy): Promise<void> {
   await rm(path.join(project.gitDirectory, LINE_ENDINGS_MARKER_NAME), { force: true });
+}
+
+export const PROCESS_CLEANUP_MARKER_NAME = 'PROCESS_CLEANUP_UNVERIFIED';
+
+export interface ProcessCleanupMarkerEntry {
+  launchId: string;
+  taskId: string;
+  provider: string;
+  pid?: number;
+  spawnedAt: string;
+}
+
+export interface ProcessCleanupMarker {
+  version: 1;
+  entries: ProcessCleanupMarkerEntry[];
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function writeProcessCleanupMarkerSync(project: { gitDirectory: string }, marker: ProcessCleanupMarker): void {
+  const target = path.join(project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME);
+  const temporary = path.join(project.gitDirectory, `${PROCESS_CLEANUP_MARKER_NAME}.${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temporary, JSON.stringify(marker) + '\n', { encoding: 'utf8', flag: 'wx', mode: 0o600, flush: true });
+    renameSync(temporary, target);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+export function readProcessCleanupMarkerSync(project: { gitDirectory: string }): ProcessCleanupMarker | undefined {
+  const markerPath = path.join(project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME);
+  let info;
+  try {
+    info = lstatSync(markerPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new BridgeError('PROCESS_CLEANUP_UNVERIFIED', 'The unverified process cleanup record is unreadable; discard this copy');
+  }
+  if (!info.isFile() || info.isSymbolicLink()) {
+    throw new BridgeError('PROCESS_CLEANUP_UNVERIFIED', 'The unverified process cleanup record is not a regular file; discard this copy');
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(markerPath, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw new BridgeError('PROCESS_CLEANUP_UNVERIFIED', 'The unverified process cleanup record is unreadable; discard this copy');
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new BridgeError('PROCESS_CLEANUP_UNVERIFIED', 'The unverified process cleanup record is unreadable; discard this copy');
+  }
+  if (!isPlainObject(parsed) || parsed.version !== 1 || !Array.isArray(parsed.entries)) {
+    throw new BridgeError('PROCESS_CLEANUP_UNVERIFIED', 'The unverified process cleanup record is unreadable; discard this copy');
+  }
+  const entries: ProcessCleanupMarkerEntry[] = [];
+  for (const item of parsed.entries) {
+    if (
+      !isPlainObject(item) ||
+      typeof item.launchId !== 'string' || !item.launchId ||
+      typeof item.taskId !== 'string' || !item.taskId ||
+      typeof item.provider !== 'string' || !item.provider ||
+      typeof item.spawnedAt !== 'string' || !Number.isFinite(Date.parse(item.spawnedAt)) ||
+      (item.pid !== undefined && (typeof item.pid !== 'number' || !Number.isInteger(item.pid) || item.pid <= 0))
+    ) {
+      throw new BridgeError('PROCESS_CLEANUP_UNVERIFIED', 'The unverified process cleanup record is unreadable; discard this copy');
+    }
+    entries.push({
+      launchId: item.launchId,
+      taskId: item.taskId,
+      provider: item.provider,
+      ...(typeof item.pid === 'number' ? { pid: item.pid } : {}),
+      spawnedAt: item.spawnedAt,
+    });
+  }
+  return { version: 1, entries };
+}
+
+export function upsertProcessCleanupMarkerEntrySync(project: { gitDirectory: string }, entry: ProcessCleanupMarkerEntry): void {
+  const existing = readProcessCleanupMarkerSync(project);
+  const normalized: ProcessCleanupMarkerEntry = {
+    launchId: entry.launchId,
+    taskId: entry.taskId,
+    provider: entry.provider,
+    ...(typeof entry.pid === 'number' && Number.isInteger(entry.pid) && entry.pid > 0 ? { pid: entry.pid } : {}),
+    spawnedAt: entry.spawnedAt,
+  };
+  const entries = existing ? [...existing.entries] : [];
+  const index = entries.findIndex(item => item.launchId === normalized.launchId);
+  if (index >= 0) entries[index] = normalized;
+  else entries.push(normalized);
+  writeProcessCleanupMarkerSync(project, { version: 1, entries });
+}
+
+export function removeProcessCleanupMarkerEntriesSync(project: { gitDirectory: string }, launchIds: readonly string[]): void {
+  const existing = readProcessCleanupMarkerSync(project);
+  if (!existing) return;
+  const ids = new Set(launchIds);
+  const remaining = existing.entries.filter(entry => !ids.has(entry.launchId));
+  if (remaining.length === 0) {
+    rmSync(path.join(project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME), { force: true });
+    return;
+  }
+  if (remaining.length === existing.entries.length) return;
+  writeProcessCleanupMarkerSync(project, { version: 1, entries: remaining });
+}
+
+export function removeProcessCleanupMarkerEntrySync(project: { gitDirectory: string }, launchId: string): void {
+  removeProcessCleanupMarkerEntriesSync(project, [launchId]);
 }
 
 const COPY_MISSING_MESSAGE =

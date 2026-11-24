@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { CliAdapter } from '../src/cli-adapter.js';
 import { loadConfig } from '../src/config.js';
 import type { ExecutionAdapter, ExecutionRequest, ExecutionResult } from '../src/execution-contract.js';
-import { buildBwrapArgs, buildUnixSocketSeccompFilter, detectBubblewrap, executeLinuxTest, findFifoInTrees, LINUX_SYSTEM_ROOTS, parseBwrapStatus, selectToolchainAliases, type BwrapSyncRunner } from '../src/linux-executor.js';
+import { buildBwrapArgs, buildUnixSocketSeccompFilter, detectBubblewrap, executeLinuxTest, findFifoInTrees, LINUX_SYSTEM_ROOTS, parseBwrapStatus, resolveTrustedBwrap, selectToolchainAliases, type BwrapSyncRunner } from '../src/linux-executor.js';
 import { TaskManager } from '../src/task-manager.js';
 import { ControlledCliAdapter } from './controlled-cli-adapter.js';
 
@@ -680,7 +680,7 @@ test('executeLinuxTest aborts before spawning when signal is aborted during prep
       {
         timeoutSeconds: 10,
         stateDirectory: state,
-        detection: { available: true, path: '/nonexistent/bwrap', version: 'bubblewrap 0.9.0' },
+        detection: { available: true, path: process.execPath, version: 'bubblewrap 0.9.0' },
         signal: controller.signal,
         onProcess: () => {
           spawned = true;
@@ -2131,4 +2131,143 @@ test('TaskManager runs black_gravity_test with linux-bwrap, records linux-execut
     await tasks.shutdown();
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
+});
+
+test('detectBubblewrap skips untrusted PATH candidates and refuses bwrapPath inside the copy before running', async t => {
+  if (process.platform !== 'linux') {
+    t.skip('Linux Bubblewrap discovery test requires Linux');
+    return;
+  }
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), 'bg-bw-')));
+  try {
+    const copy = path.join(root, 'copy');
+    const copyBin = path.join(copy, 'bin');
+    const symlinkDirBin = path.join(root, 'sym-dir');
+    const symlinkFileBin = path.join(root, 'sym-file-bin');
+    const trustedBin = path.join(root, 'trusted-bin');
+    const aliasBin = path.join(root, 'alias-bin');
+    await mkdir(copyBin, { recursive: true });
+    await mkdir(symlinkFileBin, { recursive: true });
+    await mkdir(trustedBin, { recursive: true });
+
+    const copyBwrap = path.join(copyBin, 'bwrap');
+    await writeFile(copyBwrap, '#!/bin/sh\nexit 1\n', 'utf8');
+    await chmod(copyBwrap, 0o755);
+
+    await symlink(copyBin, symlinkDirBin);
+    await symlink(copyBwrap, path.join(symlinkFileBin, 'bwrap'));
+
+    let realBwrap: string;
+    let realBwrapDir: string;
+    if (hostDetection?.available && hostDetection.path) {
+      realBwrap = await realpath(hostDetection.path);
+      realBwrapDir = path.dirname(realBwrap);
+    } else {
+      realBwrap = path.join(trustedBin, 'bwrap');
+      await writeFile(realBwrap, '#!/bin/sh\nexit 0\n', 'utf8');
+      await chmod(realBwrap, 0o755);
+      realBwrapDir = trustedBin;
+    }
+    await symlink(realBwrapDir, aliasBin);
+
+    const calledFiles: string[] = [];
+    const runner: BwrapSyncRunner = (file, args) => {
+      calledFiles.push(file);
+      return {
+        status: 0,
+        signal: null,
+        stdout: args[0] === '--version' ? 'bubblewrap 0.9.0\n' : '',
+        stderr: '',
+      };
+    };
+
+    const fromPath = detectBubblewrap({
+      platform: 'linux',
+      env: { PATH: [copyBin, symlinkDirBin, symlinkFileBin, realBwrapDir].join(path.posix.delimiter) },
+      untrustedDirectory: copy,
+      runner,
+    });
+    assert.equal(fromPath.available, true);
+    assert.equal(fromPath.path, realBwrap);
+    assert.ok(calledFiles.length > 0);
+    assert.ok(calledFiles.every(file => file === realBwrap), `Unexpected runner calls: ${JSON.stringify(calledFiles)}`);
+
+    calledFiles.length = 0;
+    for (const badPath of [copyBwrap, path.join(symlinkFileBin, 'bwrap')]) {
+      const rejected = detectBubblewrap({
+        platform: 'linux',
+        bwrapPath: badPath,
+        untrustedDirectory: copy,
+        runner,
+      });
+      assert.equal(rejected.available, false);
+      assert.equal(rejected.code, 'LINUX_BWRAP_MISSING');
+      assert.equal(rejected.reason, 'bwrap path must be outside the task copy');
+      assert.equal(calledFiles.length, 0);
+    }
+
+    calledFiles.length = 0;
+    const plain = detectBubblewrap({
+      platform: 'linux',
+      env: { PATH: aliasBin },
+      runner,
+    });
+    assert.equal(plain.available, true);
+    assert.equal(plain.path, path.join(aliasBin, 'bwrap'));
+    assert.deepEqual(calledFiles, [path.join(aliasBin, 'bwrap'), path.join(aliasBin, 'bwrap')]);
+    assert.equal(resolveTrustedBwrap(path.join(aliasBin, 'bwrap'), copy), realBwrap);
+    assert.equal(resolveTrustedBwrap(copyBwrap, copy), undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  }
+});
+
+test('executeLinuxTest refuses detection inside the copy without spawning', async t => {
+  if (process.platform !== 'linux') {
+    t.skip('Linux Bubblewrap executor requires Linux');
+    return;
+  }
+  await fixture(async (copy, _outside, source, state) => {
+    const copyBin = path.join(copy, 'bin');
+    await mkdir(copyBin, { recursive: true });
+    const marker = path.join(copy, 'bwrap-ran.txt');
+    const evilBwrap = path.join(copyBin, 'bwrap');
+    await writeFile(evilBwrap, `#!/bin/sh\necho ran > ${JSON.stringify(marker)}\nexit 1\n`, 'utf8');
+    await chmod(evilBwrap, 0o755);
+
+    await assert.rejects(
+      executeLinuxTest(
+        { executable: process.execPath, args: ['-e', 'process.exit(0)'] },
+        copy,
+        {
+          timeoutSeconds: 10,
+          stateDirectory: state,
+          protectedPaths: [source],
+          detection: { available: true, path: evilBwrap, version: 'evil' },
+        },
+      ),
+      { code: 'LINUX_BWRAP_MISSING' },
+    );
+    assert.equal(existsSync(marker), false);
+  });
+});
+
+test('executeLinuxTest with host detection keeps working and reports the same bwrapVersion', async t => {
+  if (!requireLinuxBwrap(t)) return;
+  await fixture(async (copy, _outside, source, state) => {
+    const result = await executeLinuxTest(
+      { executable: process.execPath, args: ['-e', 'process.stdout.write("normal-bwrap-ok")'] },
+      copy,
+      {
+        timeoutSeconds: 15,
+        stateDirectory: state,
+        protectedPaths: [source],
+        detection: hostDetection,
+      },
+    );
+    assert.equal(result.error, undefined, JSON.stringify(result));
+    assert.equal(result.exitCode, 0, result.output);
+    assert.equal(result.output, 'normal-bwrap-ok');
+    assert.equal(result.bwrapVersion, hostDetection?.version);
+  });
 });
