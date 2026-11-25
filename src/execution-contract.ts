@@ -1,4 +1,4 @@
-import type { TaskStatus, RunOptions, TaskRecord } from './types.js';
+import type { TaskStatus, RunOptions, TaskRecord, DeniedReads } from './types.js';
 import type { TaskRole, Effort } from './roles.js';
 import type { BridgeMessage } from './messages.js';
 
@@ -59,7 +59,7 @@ interface ExecutionResultFields {
 export type ExecutionResult = ExecutionResultFields & (
   | { readonly status: Exclude<TaskStatus, 'completed' | 'failed' | 'cancelled' | 'timeout'> }
   | { readonly status: 'needs-host'; readonly message: ExecutionHostMessage }
-  | { readonly status: 'completed'; readonly response: string; readonly structuredOutput?: unknown }
+  | { readonly status: 'completed'; readonly response: string; readonly structuredOutput?: unknown; readonly toolErrors?: DeniedReads }
   | { readonly status: 'failed' | 'cancelled' | 'timeout'; readonly error: NonNullable<TaskRecord['error']> }
 );
 

@@ -7,6 +7,7 @@ const rawArgs = process.argv.slice(2);
 let recordFile;
 let spawnLogFile;
 let sessionsFile;
+let toolErrorsFile;
 let scenario = 'read';
 let sessionListHang = false;
 let index = 0;
@@ -19,6 +20,9 @@ while (index < rawArgs.length) {
     index += 2;
   } else if (rawArgs[index] === '--sessions' && index + 1 < rawArgs.length) {
     sessionsFile = rawArgs[index + 1];
+    index += 2;
+  } else if (rawArgs[index] === '--tool-errors' && index + 1 < rawArgs.length) {
+    toolErrorsFile = rawArgs[index + 1];
     index += 2;
   } else if (rawArgs[index] === '--scenario' && index + 1 < rawArgs.length) {
     scenario = rawArgs[index + 1];
@@ -750,6 +754,64 @@ if (scenario === 'hang') {
     emitStepFinish();
     process.exit(0);
   }, 2000);
+} else if (scenario === 'tool-errors') {
+  const replaceCwd = value => {
+    if (typeof value === 'string') return value.replaceAll('{cwd}', process.cwd());
+    if (Array.isArray(value)) return value.map(replaceCwd);
+    if (value && typeof value === 'object') {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, replaceCwd(v)]));
+    }
+    return value;
+  };
+  const entries = toolErrorsFile ? JSON.parse(readFileSync(toolErrorsFile, 'utf8')) : [];
+  if (!Array.isArray(entries)) {
+    process.stderr.write('Expected JSON array in --tool-errors file\n');
+    process.exit(2);
+  }
+  entries.forEach((entry, idx) => {
+    if (typeof entry.writeFile === 'string') {
+      const target = path.resolve(process.cwd(), entry.writeFile);
+      mkdirSync(path.dirname(target), { recursive: true });
+      writeFileSync(target, 'x', 'utf8');
+    }
+    const input = entry.input !== undefined ? replaceCwd(entry.input) : {};
+    const error = typeof entry.error === 'string' ? replaceCwd(entry.error) : undefined;
+    send({
+      type: 'tool_use',
+      timestamp: Date.now(),
+      sessionID,
+      part: {
+        partID: `prt_tool_${idx + 1}`,
+        sessionID,
+        messageID: 'msg_1',
+        type: 'tool',
+        id: entry.callID ?? `call_${idx + 1}`,
+        ...(entry.callID !== undefined ? { callID: entry.callID } : {}),
+        tool: entry.tool,
+        state: {
+          status: entry.status,
+          input,
+          ...(error !== undefined ? { error } : {}),
+          ...(entry.status === 'completed' ? { output: 'ok', title: 'ok' } : {}),
+        },
+      },
+    });
+  });
+  send({
+    type: 'text',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      id: 'prt_text_1',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'text',
+      text: 'done',
+      time: { start: Date.now(), end: Date.now() },
+    },
+  });
+  emitStepFinish();
+  process.exit(0);
 } else {
   process.stderr.write(`Unknown mock scenario: ${scenario}\n`);
   process.exit(2);

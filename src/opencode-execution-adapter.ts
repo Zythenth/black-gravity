@@ -4,13 +4,17 @@
  * Write mode permits only file tools inside the isolated copy without an OS sandbox; shell commands, access outside
  * the copy, and web tools are denied by OpenCode configuration, and tests run through the bridge test executor.
  * Never passes `--auto`, so any permission resolving to "ask" is auto-rejected in non-interactive runs and classified as
- * `EXECUTION_INCOMPLETE`. Inherited `OPENCODE_*` variables are stripped, project/Claude configs are neutralized via the
- * `OPENCODE_*` environment variables constructed below, and formatters and language servers are disabled in both modes.
+ * `EXECUTION_INCOMPLETE`. Ordinary read/glob/grep missing-path and binary-file errors inside the copy are classified as
+ * bounded `toolErrors` instead of `EXECUTION_INCOMPLETE`, while permission denials, external paths, write-tool errors,
+ * disallowed tools, and unclassified errors remain incomplete. Inherited `OPENCODE_*` variables are stripped,
+ * project/Claude configs are neutralized via the `OPENCODE_*` environment variables constructed below, and formatters and
+ * language servers are disabled in both modes.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
 import { readlinkSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { MAX_DENIED_READS } from './agy-execution-adapter.js';
 import { cliEnvironment } from './cli-environment.js';
 import {
   assertExecutionCapabilities,
@@ -39,7 +43,7 @@ import {
   terminateSubprocess,
   type RedactionState,
 } from './subprocess.js';
-import { BridgeError, type TaskRecord } from './types.js';
+import { BridgeError, type DeniedRead, type DeniedReads, type TaskRecord } from './types.js';
 
 export const OPENCODE_ADAPTER_VERSION = '3';
 export const MAX_OPENCODE_PROVIDER_RETRIES = 3;
@@ -397,6 +401,101 @@ function classifyProviderError(errType: string | undefined, message: string): Pr
   return undefined;
 }
 
+const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f\u0085\u2028\u2029]/;
+const READ_NOT_FOUND_WITH_DIR_RE = /^File not found: (.+)\n\nThe folder (.+) does not exist\. The nearest folder that does is (.+)\.$/;
+const READ_NOT_FOUND_RE = /^File not found: (.+)$/;
+const READ_BINARY_RE = /^Cannot read binary file: (.+)$/;
+const SEARCH_PATH_MISSING_RE = /^Search path does not exist: (.+)$/;
+
+function extractReadToolError(
+  tool: string,
+  error: string,
+): { path: string; directories?: readonly [string, string] } | undefined {
+  if (tool === 'read') {
+    const withDir = READ_NOT_FOUND_WITH_DIR_RE.exec(error);
+    if (withDir) {
+      const [, filePath, missingDir, nearestDir] = withDir;
+      if (
+        !filePath ||
+        !missingDir ||
+        !nearestDir ||
+        CONTROL_CHAR_RE.test(filePath) ||
+        CONTROL_CHAR_RE.test(missingDir) ||
+        CONTROL_CHAR_RE.test(nearestDir)
+      ) {
+        return undefined;
+      }
+      return { path: filePath, directories: [missingDir, nearestDir] };
+    }
+    const single = READ_NOT_FOUND_RE.exec(error) ?? READ_BINARY_RE.exec(error);
+    if (!single?.[1] || CONTROL_CHAR_RE.test(single[1])) {
+      return undefined;
+    }
+    return { path: single[1] };
+  }
+  if (tool === 'grep' || tool === 'glob') {
+    const match = SEARCH_PATH_MISSING_RE.exec(error);
+    if (!match?.[1] || CONTROL_CHAR_RE.test(match[1])) {
+      return undefined;
+    }
+    return { path: match[1] };
+  }
+  return undefined;
+}
+
+export function classifyOpenCodeReadToolError(
+  tool: string,
+  error: string,
+  input: unknown,
+  workingDirectory: string,
+  secrets: readonly string[] = [],
+): DeniedRead | undefined {
+  if (typeof tool !== 'string' || typeof error !== 'string' || typeof workingDirectory !== 'string' || !workingDirectory) {
+    return undefined;
+  }
+  const extracted = extractReadToolError(tool, error);
+  if (extracted === undefined) {
+    return undefined;
+  }
+
+  const resolvedWorkingDir = path.resolve(workingDirectory);
+  let realWorkingDir: string;
+  try {
+    realWorkingDir = path.resolve(realpathSync(resolvedWorkingDir));
+  } catch {
+    realWorkingDir = resolvedWorkingDir;
+  }
+
+  const isInsideWorkingDir = (candidate: string): boolean => {
+    const resolved = path.resolve(resolvedWorkingDir, candidate);
+    return (
+      isInsideOrEqualDirectory(resolved, resolvedWorkingDir) ||
+      isInsideOrEqualDirectory(resolved, realWorkingDir)
+    );
+  };
+
+  if (![extracted.path, ...(extracted.directories ?? [])].every(isInsideWorkingDir)) {
+    return undefined;
+  }
+
+  if (isRecord(input)) {
+    for (const field of ['path', 'filePath'] as const) {
+      const value = input[field];
+      if (typeof value === 'string') {
+        if (CONTROL_CHAR_RE.test(value) || !isInsideWorkingDir(value)) {
+          return undefined;
+        }
+      }
+    }
+  }
+
+  return {
+    toolName: tool,
+    path: redactChild(extracted.path, secrets).slice(0, 1000),
+    reason: redactChild(error, secrets).slice(0, 500),
+  };
+}
+
 function normalizeComparableDirectory(directory: string): string {
   const resolved = realpathSync(directory);
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
@@ -724,6 +823,9 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     const latestToolCalls = new Map<string, { tool: string; status: string; detail: string }>();
     let toolCallSeq = 0;
     const incompleteItems: string[] = [];
+    const classifiedToolErrorKeys = new Set<string>();
+    const toolErrorItems: DeniedRead[] = [];
+    let toolErrorTotal = 0;
     const errorMessages: string[] = [];
     let providerRetries = 0;
     let retryLimitStopRequested = false;
@@ -811,11 +913,24 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
                 ? part.id
                 : `__unnamed_${toolCallSeq}`;
             toolCallSeq += 1;
-            const rawDetail = typeof state?.error === 'string' && state.error.trim()
-              ? state.error.trim()
+            const rawError = typeof state?.error === 'string' ? state.error : undefined;
+            const rawDetail = rawError && rawError.trim()
+              ? rawError.trim()
               : status;
             latestToolCalls.set(callKey, { tool: redactedTool, status: redactedStatus, detail: rawDetail });
-            if (!allowedTools.has(tool) || (status !== 'completed' && status !== 'pending' && status !== 'running')) {
+            const classifiedToolError =
+              status === 'error' && allowedTools.has(tool) && rawError !== undefined
+                ? classifyOpenCodeReadToolError(tool, rawError, state?.input, request.workingDirectory, childSecrets)
+                : undefined;
+            if (classifiedToolError) {
+              if (!classifiedToolErrorKeys.has(callKey)) {
+                classifiedToolErrorKeys.add(callKey);
+                toolErrorTotal += 1;
+                if (toolErrorItems.length < MAX_DENIED_READS) {
+                  toolErrorItems.push(classifiedToolError);
+                }
+              }
+            } else if (!allowedTools.has(tool) || (status !== 'completed' && status !== 'pending' && status !== 'running')) {
               addIncomplete(tool, rawDetail);
             }
             break;
@@ -1062,6 +1177,10 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       };
     }
 
+    const toolErrors: DeniedReads | undefined = toolErrorTotal > 0
+      ? { total: toolErrorTotal, items: toolErrorItems }
+      : undefined;
+
     return {
       taskId: request.taskId,
       ...(session ? { session } : {}),
@@ -1070,6 +1189,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       processCleanup,
       status: 'completed',
       response,
+      ...(toolErrors ? { toolErrors } : {}),
     };
   }
 

@@ -1996,6 +1996,7 @@ export class TaskManager {
         record.deniedReads = deniedReads;
         this.events.append(record.taskId, 'task.denied-reads', deniedReads);
       }
+      this.recordToolErrors(task, execResult.toolErrors);
       this.finish(task, 'completed');
     } catch (error) {
       if (task.timer) { clearTimeout(task.timer); task.timer = undefined; }
@@ -2140,6 +2141,7 @@ export class TaskManager {
       };
       this.events.append(task.record.taskId, 'task.denied-reads', deniedReads);
     }
+    this.recordToolErrors(task, execResult.toolErrors);
     if (styles && boms) await this.normalizeEditedFiles(task, styles, boms);
   }
 
@@ -2646,6 +2648,16 @@ export class TaskManager {
         },
       );
     });
+  }
+
+  private recordToolErrors(task: InternalTask, toolErrors: DeniedReads | undefined): void {
+    if (!toolErrors || toolErrors.total <= 0) return;
+    const previous = task.record.toolErrors;
+    task.record.toolErrors = {
+      total: (previous?.total ?? 0) + toolErrors.total,
+      items: [...(previous?.items ?? []), ...toolErrors.items].slice(0, MAX_DENIED_READS),
+    };
+    this.events.append(task.record.taskId, 'task.tool-errors', toolErrors);
   }
 
   private async verifyPolicyAndReadDenials(

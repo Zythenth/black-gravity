@@ -35732,6 +35732,7 @@ function compactTask(task2) {
     ...task2.memory !== void 0 ? { memory: structuredClone(task2.memory) } : {},
     ...task2.agentPolicy ? { agentPolicy: task2.agentPolicy, agentPolicyReceipt: task2.agentPolicyReceipt } : {},
     ...task2.deniedReads ? { deniedReads: task2.deniedReads } : {},
+    ...task2.toolErrors ? { toolErrors: task2.toolErrors } : {},
     ...task2.providedSkills?.length ? { providedSkillSummaries: task2.providedSkills.map((skill) => ({ name: skill.name, sha256: skill.sha256, fileCount: skill.files.length })) } : {},
     ...task2.continuationTaskId ? { continuationTaskId: task2.continuationTaskId } : {},
     ...task2.structuredResult ? { structuredResultSha256: task2.structuredResult.sha256 } : {},
@@ -48361,6 +48362,14 @@ var executionIdentitySchema = external_exports.object({
     status: external_exports.enum(["observed", "not-observable"])
   }).strict()
 }).strict();
+var deniedReadsSchema = external_exports.object({
+  total: external_exports.number().int().nonnegative(),
+  items: external_exports.array(external_exports.object({
+    toolName: external_exports.string().max(128),
+    path: external_exports.string().max(1e3).optional(),
+    reason: external_exports.string().max(500)
+  }).strict()).max(50)
+}).strict();
 var snapshotSchema = external_exports.object({
   version: external_exports.literal(1),
   ownerPid: external_exports.number().int().positive(),
@@ -48387,14 +48396,8 @@ var snapshotSchema = external_exports.object({
     roleDefinition: roleDefinitionSchema.optional(),
     providedSkills: stagedSkillsSchema.optional(),
     agentPolicyReceipt: external_exports.object({ sha256: external_exports.string().regex(/^[a-f0-9]{64}$/), decisionCount: external_exports.number().int().nonnegative(), deniedCount: external_exports.number().int().nonnegative(), deniedReadCount: external_exports.number().int().nonnegative().optional() }).strict().optional(),
-    deniedReads: external_exports.object({
-      total: external_exports.number().int().nonnegative(),
-      items: external_exports.array(external_exports.object({
-        toolName: external_exports.string().max(128),
-        path: external_exports.string().max(1e3).optional(),
-        reason: external_exports.string().max(500)
-      }).strict()).max(50)
-    }).strict().optional(),
+    deniedReads: deniedReadsSchema.optional(),
+    toolErrors: deniedReadsSchema.optional(),
     peerRequests: external_exports.array(external_exports.lazy(() => peerMessageInputSchema)).max(20).optional(),
     peerRequestsTruncated: external_exports.boolean().optional(),
     group: external_exports.lazy(() => groupAssignmentSchema).optional(),
@@ -49471,6 +49474,14 @@ function evaluateModelProof(execution) {
 var hash2 = external_exports.string().regex(/^[a-f0-9]{64}$/);
 var id = external_exports.string().uuid();
 var count = external_exports.number().int().nonnegative();
+var deniedReadsSchema2 = external_exports.object({
+  total: count,
+  items: external_exports.array(external_exports.object({
+    toolName: external_exports.string().max(128),
+    path: external_exports.string().max(1e3).optional(),
+    reason: external_exports.string().max(500)
+  }).strict()).max(50)
+}).strict();
 var timestamp = external_exports.string().datetime();
 var status = external_exports.enum(["queued", "starting", "running", "streaming", "completed", "failed", "cancelled", "timeout"]);
 var verificationStatus = external_exports.enum(["passed", "failed", "unverified"]);
@@ -49579,14 +49590,8 @@ var taskRecordSchema = external_exports.object({
   artifactCount: count.optional(),
   agentPolicy: resolvedAgentPolicySchema.optional(),
   agentPolicyReceipt: external_exports.object({ sha256: hash2, decisionCount: count, deniedCount: count, deniedReadCount: count.optional() }).strict().optional(),
-  deniedReads: external_exports.object({
-    total: count,
-    items: external_exports.array(external_exports.object({
-      toolName: external_exports.string().max(128),
-      path: external_exports.string().max(1e3).optional(),
-      reason: external_exports.string().max(500)
-    }).strict()).max(50)
-  }).strict().optional(),
+  deniedReads: deniedReadsSchema2.optional(),
+  toolErrors: deniedReadsSchema2.optional(),
   processCleanup: external_exports.object({ verified: external_exports.boolean(), spawnedAt: timestamp, checkedAt: timestamp, remaining: count }).strict().optional(),
   craft: external_exports.object({ revision: external_exports.string(), manifestSha256: hash2, permanent: external_exports.array(external_exports.string()), catalog: external_exports.array(external_exports.string()) }).strict().optional(),
   craftLoad: external_exports.object({
@@ -59388,6 +59393,7 @@ var TaskManager = class {
         record2.deniedReads = deniedReads;
         this.events.append(record2.taskId, "task.denied-reads", deniedReads);
       }
+      this.recordToolErrors(task2, execResult.toolErrors);
       this.finish(task2, "completed");
     } catch (error62) {
       if (task2.timer) {
@@ -59566,6 +59572,7 @@ var TaskManager = class {
       };
       this.events.append(task2.record.taskId, "task.denied-reads", deniedReads);
     }
+    this.recordToolErrors(task2, execResult.toolErrors);
     if (styles && boms)
       await this.normalizeEditedFiles(task2, styles, boms);
   }
@@ -60107,6 +60114,16 @@ var TaskManager = class {
         reject(error62);
       });
     });
+  }
+  recordToolErrors(task2, toolErrors) {
+    if (!toolErrors || toolErrors.total <= 0)
+      return;
+    const previous = task2.record.toolErrors;
+    task2.record.toolErrors = {
+      total: (previous?.total ?? 0) + toolErrors.total,
+      items: [...previous?.items ?? [], ...toolErrors.items].slice(0, MAX_DENIED_READS)
+    };
+    this.events.append(task2.record.taskId, "task.tool-errors", toolErrors);
   }
   async verifyPolicyAndReadDenials(task2, execResult, receiptOffset, unverifiedMessage) {
     await this.verifyAndRecordExecutionPolicy(task2, receiptOffset, unverifiedMessage);

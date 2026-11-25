@@ -30,6 +30,14 @@ import {
 const hash = z.string().regex(/^[a-f0-9]{64}$/);
 const id = z.string().uuid();
 const count = z.number().int().nonnegative();
+const deniedReadsSchema = z.object({
+  total: count,
+  items: z.array(z.object({
+    toolName: z.string().max(128),
+    path: z.string().max(1000).optional(),
+    reason: z.string().max(500),
+  }).strict()).max(50),
+}).strict();
 const timestamp = z.string().datetime();
 const status = z.enum(['queued', 'starting', 'running', 'streaming', 'completed', 'failed', 'cancelled', 'timeout']);
 const verificationStatus = z.enum(['passed', 'failed', 'unverified']);
@@ -102,14 +110,8 @@ export const taskRecordSchema = z.object({
   artifactCount: count.optional(),
   agentPolicy: resolvedAgentPolicySchema.optional(),
   agentPolicyReceipt: z.object({ sha256: hash, decisionCount: count, deniedCount: count, deniedReadCount: count.optional() }).strict().optional(),
-  deniedReads: z.object({
-    total: count,
-    items: z.array(z.object({
-      toolName: z.string().max(128),
-      path: z.string().max(1000).optional(),
-      reason: z.string().max(500),
-    }).strict()).max(50),
-  }).strict().optional(),
+  deniedReads: deniedReadsSchema.optional(),
+  toolErrors: deniedReadsSchema.optional(),
   processCleanup: z.object({ verified: z.boolean(), spawnedAt: timestamp, checkedAt: timestamp, remaining: count }).strict().optional(),
   craft: z.object({ revision: z.string(), manifestSha256: hash, permanent: z.array(z.string()), catalog: z.array(z.string()) }).strict().optional(),
   craftLoad: z.object({

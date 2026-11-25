@@ -96,6 +96,7 @@ export interface TaskRecord {
   agentPolicy?: ResolvedAgentPolicy;
   agentPolicyReceipt?: { sha256: string; decisionCount: number; deniedCount: number; deniedReadCount?: number };
   deniedReads?: DeniedReads;
+  toolErrors?: DeniedReads;
   processCleanup?: { verified: boolean; spawnedAt: string; checkedAt: string; remaining: number };
   craft?: { revision: string; manifestSha256: string; permanent: string[]; catalog: string[] };
   craftLoad?: {
