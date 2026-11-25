@@ -11,7 +11,7 @@
  * language servers are disabled in both modes.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
-import { readlinkSync, realpathSync } from 'node:fs';
+import { accessSync, constants, readlinkSync, realpathSync, statSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { MAX_DENIED_READS } from './agy-execution-adapter.js';
@@ -1666,6 +1666,29 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       models.push({ id: trimmed });
     }
     return models;
+  }
+
+  availability(): { available: true } | { available: false; reason: string } {
+    try {
+      const real = realpathSync(this.options.executable);
+      if (!statSync(real).isFile()) {
+        return { available: false, reason: 'OPENCODE_UNAVAILABLE: OpenCode executable is not a regular file' };
+      }
+      if (process.platform !== 'win32') {
+        accessSync(real, constants.X_OK);
+      }
+      return { available: true };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException | undefined)?.code;
+      const detail = code === 'ENOENT' || code === 'ENOTDIR'
+        ? 'OpenCode executable not found'
+        : code === 'EACCES' || code === 'EPERM'
+          ? 'OpenCode executable is not executable'
+          : code
+            ? `OpenCode executable unavailable (${code})`
+            : redactDiagnostic(error instanceof Error ? error.message : String(error)) || 'OpenCode executable unavailable';
+      return { available: false, reason: `OPENCODE_UNAVAILABLE: ${detail}` };
+    }
   }
 
   async version(): Promise<string> {

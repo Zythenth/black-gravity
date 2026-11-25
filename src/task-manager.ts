@@ -15,9 +15,9 @@ import { agentPolicySelectionSchema, resolveAgentPolicy, type ResolvedAgentPolic
 import { integrationPreauthorized, type IntegrationApproval } from './integration-policy.js';
 import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { appendMessage, deliveryModeSchema, extractAgentMessages, readMessages, resultReference, type DeliveryMode } from './messages.js';
-import { CliAdapter, taskPrompt } from './cli-adapter.js';
+import { CliAdapter, handoffContext, taskPrompt, type Model } from './cli-adapter.js';
 import { AgyExecutionAdapter, MAX_DENIED_READS, type AgyExecutionHooks, type AgyExecutionResult } from './agy-execution-adapter.js';
-import { isCapabilitySupported, type ExecutionAdapter, type ExecutionAdapterIdentity, type ExecutionIdentity, type ExecutionRequest, type ExecutionResult } from './execution-contract.js';
+import { isCapabilitySupported, type ExecutionAdapter, type ExecutionAdapterIdentity, type ExecutionCapabilities, type ExecutionIdentity, type ExecutionRequest, type ExecutionResult } from './execution-contract.js';
 import { terminateSubprocess, redactDiagnostic, redactionContextDigest, containsCredential } from './subprocess.js';
 import { reconcileOwnedProcesses } from './process-tree.js';
 import { sanitizePayload } from './payload-safety.js';
@@ -54,6 +54,44 @@ const RESUME_GUIDANCE = 'Pass the taskId of the task to continue, or a sessionId
 const RESUME_REFUSED = `Resume requires a completed, non-integrated task in this project. ${RESUME_GUIDANCE}`;
 
 export interface MaintenanceIssue { operation: 'copy-cleanup'; code: string; since: string; failures: number }
+
+export interface ExecutorRegistration {
+  provider: string;
+  adapter?: ExecutionAdapter;
+  unavailableReason?: string;
+}
+
+export interface ExecutorStatusEntry {
+  provider: string;
+  adapterId?: string;
+  adapterVersion?: string;
+  primary: boolean;
+  available: boolean;
+  reason?: string;
+  version?: string;
+}
+
+export interface ExecutorCapabilitiesEntry extends ExecutorStatusEntry {
+  capabilities: ExecutionCapabilities;
+}
+
+interface RegisteredExecutor {
+  provider: string;
+  primary: boolean;
+  adapter?: ExecutionAdapter;
+  unavailableReason?: string;
+}
+
+function formatExecutorFailure(error: unknown): string {
+  if (error instanceof BridgeError) {
+    return `${error.code}: ${redactDiagnostic(error.message)}`;
+  }
+  const rawCode = typeof (error as { code?: unknown })?.code === 'string'
+    ? (error as { code: string }).code
+    : 'EXECUTOR_UNAVAILABLE';
+  const rawMessage = error instanceof Error ? error.message : String(error);
+  return `${rawCode}: ${redactDiagnostic(rawMessage)}`;
+}
 
 function maintenanceErrorCode(error: unknown): string {
   const candidate = error instanceof BridgeError
@@ -101,6 +139,7 @@ export class TaskManager {
   private readonly tasks = new Map<string, InternalTask>();
   private readonly queue: string[] = [];
   private active = 0;
+  private readonly activeTasks = new Map<string, { projectKey: string; kind: string }>();
   private waiting = 0;
   private batching = 0;
   private stopped = false;
@@ -154,9 +193,13 @@ export class TaskManager {
   }
 
   private readonly executor: ExecutionAdapter;
+  private readonly executors = new Map<string, RegisteredExecutor>();
   get executorIdentity(): ExecutionAdapterIdentity {
     const { id, provider, version } = this.executor.identity;
     return Object.freeze({ id, provider, version });
+  }
+  get executorProviders(): readonly [string, ...string[]] {
+    return Object.freeze([...this.executors.keys()] as [string, ...string[]]);
   }
   private readonly linuxBwrapStatus?: BubblewrapDetection;
 
@@ -164,9 +207,31 @@ export class TaskManager {
     private readonly adapter: CliAdapter,
     private readonly config: Config,
     executor?: ExecutionAdapter,
-    runtimeOptions?: { linuxBwrapDetection?: BubblewrapDetection },
+    runtimeOptions?: { linuxBwrapDetection?: BubblewrapDetection; executors?: ReadonlyArray<ExecutorRegistration> },
   ) {
     this.executor = executor ?? new AgyExecutionAdapter(adapter, config);
+    this.executors.set(this.executor.identity.provider, {
+      provider: this.executor.identity.provider,
+      primary: true,
+      adapter: this.executor,
+    });
+    for (const entry of runtimeOptions?.executors ?? []) {
+      if (entry.provider === this.executor.identity.provider) {
+        throw new Error(`Additional executor provider must differ from primary: ${entry.provider}`);
+      }
+      if (this.executors.has(entry.provider)) {
+        throw new Error(`Duplicate executor provider: ${entry.provider}`);
+      }
+      if (entry.adapter && entry.adapter.identity.provider !== entry.provider) {
+        throw new Error(`Executor adapter provider mismatch: expected ${entry.provider}, got ${entry.adapter.identity.provider}`);
+      }
+      this.executors.set(entry.provider, {
+        provider: entry.provider,
+        primary: false,
+        adapter: entry.adapter,
+        unavailableReason: entry.unavailableReason,
+      });
+    }
     if (runtimeOptions?.linuxBwrapDetection) {
       this.linuxBwrapStatus = runtimeOptions.linuxBwrapDetection;
     } else if (process.platform === 'win32') {
@@ -206,11 +271,11 @@ export class TaskManager {
       .catch(error => { this.nativeRecoveryError = error; });
   }
 
-  private initialExecutionIdentity(model: string | undefined, effort: Effort | undefined): ExecutionIdentity {
+  private initialExecutionIdentity(model: string | undefined, effort: Effort | undefined, executor: ExecutionAdapter = this.executor): ExecutionIdentity {
     return {
-      provider: this.executor.identity.provider,
-      adapterId: this.executor.identity.id,
-      adapterVersion: this.executor.identity.version,
+      provider: executor.identity.provider,
+      adapterId: executor.identity.id,
+      adapterVersion: executor.identity.version,
       requested: {
         model: model ?? null,
         effort: effort ?? null,
@@ -222,12 +287,131 @@ export class TaskManager {
     };
   }
 
-  private assertResumeProvider(record: TaskRecord): void {
-    const expectedProvider = record.execution?.provider ?? 'agy';
-    if (expectedProvider !== this.executor.identity.provider) {
-      throw new BridgeError('INVALID_SESSION', `Cannot resume ${expectedProvider} session with ${this.executor.identity.provider} executor`);
+  private executorFor(provider: string): ExecutionAdapter {
+    const entry = this.executors.get(provider);
+    if (!entry) {
+      throw new BridgeError('EXECUTOR_UNAVAILABLE', `${provider} executor is unavailable: Unknown provider: ${provider}`);
     }
-    if (expectedProvider === 'opencode' && record.execution?.adapterVersion !== this.executor.identity.version) {
+    if (!entry.adapter) {
+      throw new BridgeError('EXECUTOR_UNAVAILABLE', `${provider} executor is unavailable: ${entry.unavailableReason ?? 'not configured'}`);
+    }
+    return entry.adapter;
+  }
+
+  private taskExecutor(record: TaskRecord): ExecutionAdapter {
+    return this.executorFor(record.execution?.provider ?? this.executor.identity.provider);
+  }
+
+  private resumeExecutorFor(record: TaskRecord): ExecutionAdapter {
+    const provider = record.execution?.provider ?? 'agy';
+    return this.executors.get(provider)?.adapter ?? this.executor;
+  }
+
+  private async requireAvailableExecutor(provider: string): Promise<ExecutionAdapter> {
+    const entry = this.executors.get(provider);
+    if (!entry) {
+      throw new BridgeError('INVALID_PROVIDER', `Unknown provider: ${provider}`);
+    }
+    if (!entry.adapter) {
+      throw new BridgeError('EXECUTOR_UNAVAILABLE', `${provider} executor is unavailable: ${entry.unavailableReason ?? 'not configured'}`);
+    }
+    if (!entry.primary) {
+      let status: { available: true } | { available: false; reason: string } | undefined;
+      try {
+        status = entry.adapter.availability?.();
+      } catch (error) {
+        throw new BridgeError('EXECUTOR_UNAVAILABLE', `${provider} executor is unavailable: ${formatExecutorFailure(error)}`);
+      }
+      if (status && !status.available) {
+        throw new BridgeError('EXECUTOR_UNAVAILABLE', `${provider} executor is unavailable: ${redactDiagnostic(status.reason)}`);
+      }
+    }
+    return entry.adapter;
+  }
+
+  private probeAdapterStatus(entry: RegisteredExecutor): ExecutorStatusEntry {
+    const adapter = entry.adapter!;
+    let status: { available: true } | { available: false; reason: string } | undefined;
+    try {
+      status = adapter.availability?.();
+    } catch (error) {
+      return {
+        provider: entry.provider,
+        adapterId: adapter.identity.id,
+        adapterVersion: adapter.identity.version,
+        primary: entry.primary,
+        available: false,
+        reason: formatExecutorFailure(error),
+      };
+    }
+    if (status && !status.available) {
+      return {
+        provider: entry.provider,
+        adapterId: adapter.identity.id,
+        adapterVersion: adapter.identity.version,
+        primary: entry.primary,
+        available: false,
+        reason: redactDiagnostic(status.reason),
+      };
+    }
+    return {
+      provider: entry.provider,
+      adapterId: adapter.identity.id,
+      adapterVersion: adapter.identity.version,
+      primary: entry.primary,
+      available: true,
+    };
+  }
+
+  async executorStatus(primary?: { installed: boolean; version?: string | null; error?: string }): Promise<ExecutorStatusEntry[]> {
+    const results: ExecutorStatusEntry[] = [];
+    for (const entry of this.executors.values()) {
+      if (entry.primary) {
+        if (entry.adapter instanceof AgyExecutionAdapter || entry.provider === 'agy') {
+          const status = primary ?? await this.adapter.health();
+          results.push({
+            provider: entry.provider,
+            adapterId: entry.adapter!.identity.id,
+            adapterVersion: entry.adapter!.identity.version,
+            primary: true,
+            available: status.installed,
+            ...(status.version !== undefined && status.version !== null ? { version: status.version } : {}),
+            ...(!status.installed ? { reason: status.error ?? 'AGY_NOT_FOUND: agy executable not found' } : {}),
+          });
+        } else {
+          results.push(this.probeAdapterStatus(entry));
+        }
+        continue;
+      }
+      if (!entry.adapter) {
+        results.push({
+          provider: entry.provider,
+          primary: false,
+          available: false,
+          reason: entry.unavailableReason ?? 'EXECUTOR_UNAVAILABLE: Executor is unavailable',
+        });
+        continue;
+      }
+      results.push(this.probeAdapterStatus(entry));
+    }
+    return results;
+  }
+
+  async executorCapabilities(primary?: { installed: boolean; version?: string | null; error?: string }): Promise<ExecutorCapabilitiesEntry[]> {
+    const statuses = await this.executorStatus(primary);
+    return statuses.map(status => {
+      const entry = this.executors.get(status.provider);
+      const capabilities: ExecutionCapabilities = entry?.adapter ? { ...entry.adapter.capabilities } : {};
+      return { ...status, capabilities };
+    });
+  }
+
+  private assertResumeProvider(record: TaskRecord, executor: ExecutionAdapter = this.executor): void {
+    const expectedProvider = record.execution?.provider ?? 'agy';
+    if (expectedProvider !== executor.identity.provider) {
+      throw new BridgeError('INVALID_SESSION', `Cannot resume ${expectedProvider} session with ${executor.identity.provider} executor`);
+    }
+    if (expectedProvider === 'opencode' && record.execution?.adapterVersion !== executor.identity.version) {
       throw new BridgeError(
         'INVALID_SESSION',
         `This OpenCode session was recorded by adapter version ${record.execution?.adapterVersion ?? 'unknown'}, which cannot resume sessions; start a new task`,
@@ -375,10 +559,33 @@ export class TaskManager {
     }
   }
 
-  getModel(): string | undefined {
+  getModel(provider?: string): string | undefined {
     this.assertStateDirectoryUsable();
-    const selection = this.state.loadModel();
-    return selection === undefined ? this.config.defaultModel : selection.model ?? undefined;
+    const resolved = provider ?? this.executor.identity.provider;
+    if (!this.executors.has(resolved)) {
+      throw new BridgeError('INVALID_PROVIDER', `Unknown provider: ${resolved}`);
+    }
+    if (resolved === this.executor.identity.provider) {
+      const selection = this.state.loadModel();
+      return selection === undefined ? this.config.defaultModel : selection.model ?? undefined;
+    }
+    return this.state.loadModel(resolved)?.model ?? undefined;
+  }
+
+  async listModels(provider?: string): Promise<Model[]> {
+    const resolved = provider ?? this.executor.identity.provider;
+    if (!this.executors.has(resolved)) {
+      throw new BridgeError('INVALID_PROVIDER', `Unknown provider: ${resolved}`);
+    }
+    if (resolved === this.executor.identity.provider) {
+      return this.adapter.listModels();
+    }
+    const executor = this.executorFor(resolved);
+    if (typeof executor.listModels !== 'function') {
+      throw new BridgeError('EXECUTOR_UNAVAILABLE', `${resolved} executor is unavailable: model listing is not supported`);
+    }
+    const models = await executor.listModels();
+    return models.map(model => ({ id: model.id, name: model.id }));
   }
 
   get toolProfile() { return this.config.toolProfile; }
@@ -449,13 +656,17 @@ export class TaskManager {
     } finally { release(); }
   }
 
-  async setModel(model: string | null): Promise<string | null> {
+  async setModel(model: string | null, provider?: string): Promise<string | null> {
     this.assertStateDirectoryUsable();
-    if (model !== null) {
-      const models = await this.adapter.listModels();
-      if (!models.some(item => item.id === model)) throw new BridgeError('MODEL_NOT_AVAILABLE', `Model is not listed by agy: ${model}`);
+    const resolved = provider ?? this.executor.identity.provider;
+    if (!this.executors.has(resolved)) {
+      throw new BridgeError('INVALID_PROVIDER', `Unknown provider: ${resolved}`);
     }
-    this.state.saveModel(model);
+    if (model !== null) {
+      const models = await this.listModels(resolved);
+      if (!models.some(item => item.id === model)) throw new BridgeError('MODEL_NOT_AVAILABLE', `Model is not listed by ${resolved}: ${model}`);
+    }
+    this.state.saveModel(model, resolved === this.executor.identity.provider ? undefined : resolved);
     return model;
   }
 
@@ -535,6 +746,10 @@ export class TaskManager {
   async run(options: RunOptions, resumeTaskId?: string): Promise<TaskRecord> {
     this.assertStateDirectoryUsable();
     options = { ...options };
+    const requestedProvider = options.provider;
+    if (requestedProvider !== undefined && !this.executors.has(requestedProvider)) {
+      throw new BridgeError('INVALID_PROVIDER', `Unknown provider: ${requestedProvider}`);
+    }
     delete options.group;
     if (!options.groupAdmission) delete options.peerContext;
     else if (options.peerContext) {
@@ -550,6 +765,7 @@ export class TaskManager {
       options = applyRoleDefaults(options, initialRoleDefinition);
       if (options.contextTaskId) options = { ...options, skills, includePaths, memory };
     }
+    const policyInputsSupplied = options.allowedTools !== undefined || options.mcpServers !== undefined;
     if (options.groupAdmission && options.mcpServers === undefined) options.mcpServers = [];
     if (options.memory !== undefined) options.memory = memorySelectionSchema.parse(options.memory);
     if (options.effort !== undefined) effortSchema.parse(options.effort);
@@ -571,7 +787,17 @@ export class TaskManager {
     if (options.outputSchema !== undefined) options.outputSchema = validateOutputSchema(options.outputSchema);
     if (options.artifactPaths !== undefined) options.artifactPaths = [...artifactPathsSchema.parse(options.artifactPaths)];
     assertSecretExclusionsUsable(this.config);
-    assertAgyPathUsable(this.config);
+    let resolvedPreLockExecutor: ExecutionAdapter | undefined;
+    if (requestedProvider !== undefined) {
+      resolvedPreLockExecutor = await this.requireAvailableExecutor(requestedProvider);
+      if (resolvedPreLockExecutor instanceof AgyExecutionAdapter) {
+        assertAgyPathUsable(this.config);
+      } else if (policyInputsSupplied) {
+        throw new BridgeError('INVALID_AGENT_POLICY', `${requestedProvider} tasks use the bridge's fixed file tools; allowedTools and mcpServers apply only to agy`);
+      }
+    } else if (!options.sessionId && !resumeTaskId && this.executor instanceof AgyExecutionAdapter) {
+      assertAgyPathUsable(this.config);
+    }
     const workingDirectory = await validateWorkingDirectory(options.workingDirectory, this.forbiddenDirectories());
     await validateRuntimeCacheSeparation(workingDirectory, this.config.windowsNodeCacheDirectory);
     if (options.groupAdmission) {
@@ -579,8 +805,12 @@ export class TaskManager {
       if (options.workingDirectory !== workingDirectory) throw new BridgeError('GROUP_CHANGED', 'Group project no longer resolves to its saved canonical directory');
     }
     if (options.isolateWorktree === false) throw new BridgeError('ISOLATION_REQUIRED', 'Direct execution in the source project is disabled');
-    const sessionIdPattern = this.executor instanceof AgyExecutionAdapter ? /^[a-zA-Z0-9-]{1,128}$/ : /^[a-zA-Z0-9_-]{1,128}$/;
-    if (options.sessionId && !sessionIdPattern.test(options.sessionId)) throw new BridgeError('INVALID_SESSION', `Invalid conversation ID. ${RESUME_GUIDANCE}`);
+    const preLockSessionPattern = (resolvedPreLockExecutor
+      ? resolvedPreLockExecutor instanceof AgyExecutionAdapter
+      : this.executors.size === 1 && this.executor instanceof AgyExecutionAdapter)
+      ? /^[a-zA-Z0-9-]{1,128}$/
+      : /^[a-zA-Z0-9_-]{1,128}$/;
+    if (options.sessionId && !preLockSessionPattern.test(options.sessionId)) throw new BridgeError('INVALID_SESSION', `Invalid conversation ID. ${RESUME_GUIDANCE}`);
     const releaseRegistry = this.state.acquire('registry');
     let pendingProjectRelease: (() => void) | undefined;
     let contextProject: ProjectCopy | undefined;
@@ -618,8 +848,23 @@ export class TaskManager {
       if (options.sessionId && (!previous || (previous.record.status !== 'completed' && previous.record.error?.code !== 'TEST_FAILED') || previous.record.integratedAt)) {
         throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
       }
+      const previousProvider = previous?.record.execution?.provider ?? 'agy';
+      const targetProvider = requestedProvider ?? (previous
+        ? (this.executors.has(previousProvider) ? previousProvider : this.executor.identity.provider)
+        : this.executor.identity.provider);
+      const executor = resolvedPreLockExecutor ?? await this.requireAvailableExecutor(targetProvider);
+      if (!resolvedPreLockExecutor && executor instanceof AgyExecutionAdapter) {
+        assertAgyPathUsable(this.config);
+      }
+      if (options.sessionId) {
+        const sessionIdPattern = executor instanceof AgyExecutionAdapter ? /^[a-zA-Z0-9-]{1,128}$/ : /^[a-zA-Z0-9_-]{1,128}$/;
+        if (!sessionIdPattern.test(options.sessionId)) throw new BridgeError('INVALID_SESSION', `Invalid conversation ID. ${RESUME_GUIDANCE}`);
+      }
       if (previous) {
-        this.assertResumeProvider(previous.record);
+        this.assertResumeProvider(previous.record, executor);
+      }
+      if (!(executor instanceof AgyExecutionAdapter) && policyInputsSupplied) {
+        throw new BridgeError('INVALID_AGENT_POLICY', `${executor.identity.provider} tasks use the bridge's fixed file tools; allowedTools and mcpServers apply only to agy`);
       }
       if (previous?.record.group) options.parentTaskId = previous.record.taskId;
       if (previous?.record.group && new GroupStore(this.config.stateDirectory).read(previous.record.group.groupId).state !== 'running') throw new BridgeError('GROUP_CLOSED', 'Start or resume the group coordinator before another conversation turn');
@@ -631,7 +876,7 @@ export class TaskManager {
       if (budgetGroup) this.checkGroupBudget(budgetGroup.groupId);
       if (previous?.project && this.busyProjects.has(previous.project)) throw new BridgeError('TASK_NOT_READY', 'The copy is being reviewed or removed');
       if (previous?.project && this.hasQuarantinedCopySibling(previous.project)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
-      if (previous && !previous.record.agentPolicy && this.config.enforceAgentPolicy) throw new BridgeError('AGENT_POLICY_CHANGED', 'This legacy session has no enforced policy; start a new task under the configured human ceiling');
+      if (previous && executor instanceof AgyExecutionAdapter && !previous.record.agentPolicy && this.config.enforceAgentPolicy) throw new BridgeError('AGENT_POLICY_CHANGED', 'This legacy session has no enforced policy; start a new task under the configured human ceiling');
       if (previous && (options.allowedTools !== undefined || options.mcpServers !== undefined)) throw new BridgeError('INVALID_AGENT_POLICY', 'Resume retains its original tool policy; use a new task to select different tools');
       if (previous && options.includePaths !== undefined) throw new BridgeError('INVALID_INCLUDE_PATH', 'A resumed task reuses its original file selection');
       if (previous && options.acceptanceCriteria !== undefined) throw new BridgeError('INVALID_CRITERIA', 'A resumed task retains its original acceptance criteria');
@@ -695,18 +940,22 @@ export class TaskManager {
       if (!Number.isInteger(timeoutSeconds) || timeoutSeconds < 1 || timeoutSeconds > 86400) {
         throw new BridgeError('INVALID_TIMEOUT', 'timeoutSeconds must be between 1 and 86400');
       }
-      const selectedModel = options.model !== undefined ? options.model : previous ? previous.record.model : this.getModel();
+      const selectedModel = options.model !== undefined ? options.model : previous ? previous.record.model : this.getModel(executor.identity.provider);
       const model = selectedModel === null ? undefined : selectedModel;
       if (model) {
-        const models = await this.adapter.listModels();
-        if (!models.some(item => item.id === model)) throw new BridgeError('MODEL_NOT_AVAILABLE', 'Model is not listed by agy: ' + model);
+        const models = await this.listModels(executor.identity.provider);
+        if (!models.some(item => item.id === model)) throw new BridgeError('MODEL_NOT_AVAILABLE', `Model is not listed by ${executor.identity.provider}: ${model}`);
       }
       if (previous && role !== (previous.record.role ?? 'implementer')) throw new BridgeError('INVALID_ROLE', 'A resumed task retains its original role');
       const mode = options.mode ?? previous?.record.mode ?? (roleDefinition.baseRole === 'implementer' ? 'write' : 'read-only');
       if (roleDefinition.baseRole !== 'implementer' && mode !== 'read-only') throw new BridgeError('INVALID_ROLE', 'Roles based on planner and reviewer require read-only mode');
       if (roleDefinition.baseRole !== 'implementer' && options.outputSchema !== undefined) throw new BridgeError('INVALID_ROLE', 'Structured output schema requires an implementer base role');
       if (!['write', 'read-only'].includes(mode)) throw new BridgeError('INVALID_MODE', 'mode must be write or read-only');
-      if (previous?.record.agentPolicy) {
+      if (!(executor instanceof AgyExecutionAdapter)) {
+        delete options.allowedTools;
+        delete options.mcpServers;
+        delete options.agentPolicy;
+      } else if (previous?.record.agentPolicy) {
         options.agentPolicy = this.checkAgentPolicySnapshot(previous.record.agentPolicy);
       } else if (options.allowedTools !== undefined || options.mcpServers !== undefined) {
         const selection = agentPolicySelectionSchema.parse({ allowedTools: options.allowedTools, mcpServers: options.mcpServers });
@@ -720,7 +969,7 @@ export class TaskManager {
         options.agentPolicy = resolveAgentPolicy({}, this.config.allowedAgyTools, this.config.mcpCatalog, mode, '28c48913-763e-4ced-aee4-3fe6f0dd25eb');
       } else delete options.agentPolicy;
       if (previous && mode !== previous.record.mode) throw new BridgeError('INVALID_MODE', 'A resumed task must retain its original mode');
-      if (this.queue.length >= this.config.maxQueuedTasks && this.active >= this.config.maxConcurrentTasks) {
+      if (this.queue.length >= this.config.maxQueuedTasks) {
         throw new BridgeError('QUEUE_FULL', 'Task queue is full');
       }
       options.deliveryMode ??= previous?.record.deliveryMode ?? contextSource?.record.deliveryMode ?? 'events';
@@ -790,14 +1039,14 @@ export class TaskManager {
       const taskId = randomUUID();
       options.group = options.groupAdmission ? { ...options.groupAdmission, rootTaskId: taskId } : previous?.record.group && structuredClone(previous.record.group);
       delete options.groupAdmission;
-      const isAgyExecutor = this.executor instanceof AgyExecutionAdapter;
-      const record: TaskRecord = { group: options.group, memory: summarizeMemory(options.memorySnapshots), ...(options.craft ? { craft: { revision: options.craft.revision, manifestSha256: options.craft.manifestSha256, permanent: options.craft.permanent, catalog: options.craft.catalog.map(entry => entry.name) } } : {}), parentTaskId: options.parentTaskId, sourceMessage: options.sourceMessage, deliveryMode: options.deliveryMode, providedSkills: options.providedSkills, taskId, sessionId: options.sessionId, model, effort: options.effort, execution: this.initialExecutionIdentity(model, options.effort), mode, role, roleDefinition, prompt: options.prompt,
+      const isAgyExecutor = executor instanceof AgyExecutionAdapter;
+      const record: TaskRecord = { group: options.group, memory: summarizeMemory(options.memorySnapshots), ...(options.craft ? { craft: { revision: options.craft.revision, manifestSha256: options.craft.manifestSha256, permanent: options.craft.permanent, catalog: options.craft.catalog.map(entry => entry.name) } } : {}), parentTaskId: options.parentTaskId, sourceMessage: options.sourceMessage, deliveryMode: options.deliveryMode, providedSkills: options.providedSkills, taskId, sessionId: options.sessionId, model, effort: options.effort, execution: this.initialExecutionIdentity(model, options.effort, executor), mode, role, roleDefinition, prompt: options.prompt,
         acceptanceCriteria, handoff: options.handoff ?? previous?.record.handoff, comparison: options.comparison,
         tests: previous?.record.tests ?? contextSource?.record.tests, usageIsResume: isAgyExecutor ? Boolean(previous) : false,
         usageBaseline: isAgyExecutor && previous ? this.latestObservedUsage(previous.record.sessionId, workingDirectory) : undefined,
         workingDirectory, status: 'queued', createdAt: new Date().toISOString(),
         outputSchema: recordOutputSchema, artifactPaths: recordArtifactPaths, agentPolicy: options.agentPolicy };
-      this.tasks.set(record.taskId, { record, ownerPid: process.pid, owned: true, options: { ...options, model: model ?? null, role, acceptanceCriteria, workingDirectory, timeoutSeconds, mode }, project: previous?.project ?? contextProject, releaseProject: pendingProjectRelease });
+      this.tasks.set(record.taskId, { record, ownerPid: process.pid, owned: true, options: { ...options, provider: executor.identity.provider, model: model ?? null, role, acceptanceCriteria, workingDirectory, timeoutSeconds, mode }, project: previous?.project ?? contextProject, releaseProject: pendingProjectRelease });
       accepted = true;
       pendingProjectRelease = undefined;
       this.queue.push(record.taskId);
@@ -1191,7 +1440,7 @@ export class TaskManager {
     if (task.agentPolicy) throw new BridgeError('POLICY_TEST_EXECUTOR_UNAVAILABLE', 'Tasks with an enforced tool policy require the bridge Windows LPAC executor for direct tests; native terminal access is not granted by this policy');
     if (sandbox !== undefined) throw new BridgeError('SANDBOX_PERMISSIONS_UNSUPPORTED', 'Per-test sandbox permissions require the Windows LPAC executor');
     return this.run({ prompt: 'Run the requested tests in the native sandbox.', workingDirectory: task.workingDirectory, sessionId: task.sessionId,
-      model: task.model, timeoutSeconds, nativeTest: { ...command, expectedSha256, maxAttempts: retries + 1 } });
+      model: task.model, timeoutSeconds, provider: this.executor.identity.provider, nativeTest: { ...command, expectedSha256, maxAttempts: retries + 1 } });
   }
 
   private async queueLocalTest(backend: LocalTestBackend, sourceTaskId: string, source: TaskRecord, expectedSha256: string, command: TestCommand, retries: number, timeoutSeconds: number, sandbox: unknown): Promise<TaskRecord> {
@@ -1220,7 +1469,8 @@ export class TaskManager {
         current.record.integratedAt) {
         throw new BridgeError('TASK_NOT_READY', 'Tests require a completed write task with an isolated copy and CLI conversation');
       }
-      this.assertResumeProvider(current.record);
+      const sourceExecutor = this.resumeExecutorFor(current.record);
+      this.assertResumeProvider(current.record, sourceExecutor);
       if ([...this.tasks.values()].filter(candidate => candidate.project === current.project).at(-1) !== current) {
         throw new BridgeError('TASK_NOT_READY', 'Run tests from the latest retained task for this isolated copy');
       }
@@ -1228,7 +1478,7 @@ export class TaskManager {
       if (this.hasQuarantinedCopySibling(current.project)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
       const currentPreview = await this.preview(sourceTaskId, false);
       if (currentPreview.sha256 !== nativeTest.expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Copy changed while tests were queued');
-      if (this.queue.length >= this.config.maxQueuedTasks && this.active >= this.config.maxConcurrentTasks) throw new BridgeError('QUEUE_FULL', 'Task queue is full');
+      if (this.queue.length >= this.config.maxQueuedTasks) throw new BridgeError('QUEUE_FULL', 'Task queue is full');
       releaseProject = this.state.acquire(this.projectLock(current.project));
       if (isLocalExecutorFailure && backend === 'windows-lpac') {
         await this.nativeRecovery;
@@ -1251,9 +1501,9 @@ export class TaskManager {
         this.events.drop(oldestFinished.record.taskId);
         this.state.drop(oldestFinished.record.taskId);
       }
-      const isAgyExecutor = this.executor instanceof AgyExecutionAdapter;
+      const isAgyExecutor = sourceExecutor instanceof AgyExecutionAdapter;
       const record: TaskRecord = { parentTaskId: current.record.taskId, group: structuredClone(current.record.group), memory: structuredClone(current.record.memory), craft: current.record.craft, deliveryMode: current.record.deliveryMode, providedSkills: current.project.providedSkills, taskId: randomUUID(), sessionId: current.record.sessionId, model: current.record.model, effort: current.record.effort,
-        execution: this.initialExecutionIdentity(current.record.model, current.record.effort),
+        execution: this.initialExecutionIdentity(current.record.model, current.record.effort, sourceExecutor),
         mode: 'write', role: current.record.role, roleDefinition: current.record.roleDefinition, prompt: backend === 'windows-lpac' ? 'Run the requested tests in the Windows sandbox.' : 'Run the requested tests in the Linux sandbox.',
         acceptanceCriteria: current.record.acceptanceCriteria, handoff: current.record.handoff, tests: current.record.tests,
         usageIsResume: isAgyExecutor,
@@ -1845,12 +2095,58 @@ export class TaskManager {
     await Promise.all(owned.map(task => task.completion));
   }
 
+  private taskKind(task: InternalTask): string {
+    return task.record.execution?.provider ?? this.executor.identity.provider;
+  }
+
+  private isTaskEligible(task: InternalTask): boolean {
+    if (task.record.group) return true;
+    const projectKey = task.record.workingDirectory;
+    const kind = this.taskKind(task);
+    for (const activeEntry of this.activeTasks.values()) {
+      if (activeEntry.projectKey === projectKey) return false;
+      if (kind === 'agy' && activeEntry.kind === 'agy') return false;
+    }
+    if (kind === 'opencode') {
+      const limit = Math.min(this.config.maxConcurrentOpenCodeTasks, this.config.maxConcurrentTasks);
+      let activeOpenCode = 0;
+      for (const activeEntry of this.activeTasks.values()) {
+        if (activeEntry.kind === 'opencode') activeOpenCode++;
+      }
+      if (activeOpenCode >= limit) return false;
+    }
+    return true;
+  }
+
   private pump(): void {
-    while (!this.stopped && !this.batching && this.active < this.config.maxConcurrentTasks && this.queue.length) {
-      const task = this.tasks.get(this.queue.shift()!);
-      if (!task || task.record.status !== 'queued') continue;
+    if (this.stopped || this.batching) return;
+    let index = 0;
+    while (!this.stopped && !this.batching && this.active < this.config.maxConcurrentTasks && index < this.queue.length) {
+      const taskId = this.queue[index]!;
+      const task = this.tasks.get(taskId);
+      if (!task || task.record.status !== 'queued') {
+        this.queue.splice(index, 1);
+        continue;
+      }
+      if (!this.isTaskEligible(task)) {
+        index++;
+        continue;
+      }
+      this.queue.splice(index, 1);
       this.active++;
-      task.completion = this.execute(task).finally(() => { task.releaseProject?.(); task.releaseProject = undefined; task.owned = false; this.active--; this.pump(); if (task.project) this.scheduleInbox(task.project.copyDirectory); });
+      this.activeTasks.set(taskId, {
+        projectKey: task.record.workingDirectory,
+        kind: this.taskKind(task),
+      });
+      task.completion = this.execute(task).finally(() => {
+        task.releaseProject?.();
+        task.releaseProject = undefined;
+        task.owned = false;
+        this.activeTasks.delete(taskId);
+        this.active--;
+        this.pump();
+        if (task.project) this.scheduleInbox(task.project.copyDirectory);
+      });
     }
   }
 
@@ -1920,14 +2216,15 @@ export class TaskManager {
       } else task.editReceipts = undefined;
       assertPermanentDelivery(task.options.craft, task.project.providedSkills);
       await verifyCraftSelection(task.options.craft!);
-      const isAgyWrite = this.executor instanceof AgyExecutionAdapter && record.mode !== 'read-only';
+      const isAgyExecutor = this.taskExecutor(record) instanceof AgyExecutionAdapter;
+      const isAgyWrite = isAgyExecutor && record.mode !== 'read-only';
       const { result: execResult, styles, boms } = await this.runAgyStep(
         task,
         native ? { ...task.options, prompt: native.prompt } : task.options,
         { prepareLf: isAgyWrite, convertLf: isAgyWrite && !native },
       );
       if (task.termination) {
-        if (!(this.executor instanceof AgyExecutionAdapter) && (execResult.status === 'cancelled' || execResult.status === 'timeout') && execResult.status === task.termination) {
+        if (!isAgyExecutor && (execResult.status === 'cancelled' || execResult.status === 'timeout') && execResult.status === task.termination) {
           this.finish(task, task.termination, execResult.error.code, execResult.error.message);
         } else {
           this.finish(task, task.termination);
@@ -1968,7 +2265,7 @@ export class TaskManager {
         }
       }
       if (task.termination) {
-        if (!(this.executor instanceof AgyExecutionAdapter) && (execResult.status === 'cancelled' || execResult.status === 'timeout') && execResult.status === task.termination) {
+        if (!isAgyExecutor && (execResult.status === 'cancelled' || execResult.status === 'timeout') && execResult.status === task.termination) {
           this.finish(task, task.termination, execResult.error.code, execResult.error.message);
         } else {
           this.finish(task, task.termination);
@@ -2121,7 +2418,7 @@ export class TaskManager {
       delivered: this.permanentDeliveredSkills(task.project.providedSkills),
       initListing: 'not-observed',
     };
-    const isAgy = this.executor instanceof AgyExecutionAdapter;
+    const isAgy = this.taskExecutor(task.record) instanceof AgyExecutionAdapter;
     const { result: execResult, styles, boms } = await this.runAgyStep(task, options, {
       prepareLf: isAgy,
       convertLf: isAgy,
@@ -2277,9 +2574,13 @@ export class TaskManager {
     let agyLaunchId: string | undefined;
     let stepTimer: NodeJS.Timeout | undefined;
     let hookResultSeen = false;
+    const executor = this.taskExecutor(record);
+    const isAgyExecutor = executor instanceof AgyExecutionAdapter;
     const request: ExecutionRequest = {
       taskId: record.taskId,
-      prompt: options.prompt,
+      prompt: !isAgyExecutor && options.handoff && !options.sessionId
+        ? options.prompt + handoffContext(options.handoff)
+        : options.prompt,
       workingDirectory: project.copyDirectory,
       role: options.role ?? 'implementer',
       model: record.model,
@@ -2307,7 +2608,7 @@ export class TaskManager {
     let result: ExecutionResult;
     try {
       await this.assertCopyCleanupConfirmed(project, { excludeTaskId: record.taskId, lockHeld: true });
-      if (this.executor instanceof AgyExecutionAdapter) {
+      if (executor instanceof AgyExecutionAdapter) {
         const hooks: AgyExecutionHooks = {
           runOptions: options,
           spawnWorkingDirectory: project.copyDirectory,
@@ -2422,12 +2723,12 @@ export class TaskManager {
             }
           },
         };
-        result = await this.executor.execute(request, hooks);
+        result = await executor.execute(request, hooks);
       } else {
         // Pure ExecutionAdapter: pass ExecutionContext when cancel is supported, or bound host cancellation around execute(request).
         record.status = 'running';
         startStepTimer();
-        result = await this.executePureAdapterBounded(this.executor, request, task, controller.signal);
+        result = await this.executePureAdapterBounded(executor, request, task, controller.signal);
       }
     } catch (error) {
       if (spawnedPid === undefined) await this.restoreLineEndings(task).catch(() => undefined);
@@ -2514,7 +2815,7 @@ export class TaskManager {
             upsertProcessCleanupMarkerEntrySync(task.project, {
               launchId,
               taskId: task.record.taskId,
-              provider: this.executor.identity.provider,
+              provider: adapter.identity.provider,
               ...(typeof pid === 'number' ? { pid } : {}),
               spawnedAt: nowIso,
             });
@@ -2540,7 +2841,7 @@ export class TaskManager {
               upsertProcessCleanupMarkerEntrySync(task.project, {
                 launchId: launch.launchId,
                 taskId: task.record.taskId,
-                provider: this.executor.identity.provider,
+                provider: adapter.identity.provider,
                 ...(typeof launch.pid === 'number' ? { pid: launch.pid } : {}),
                 spawnedAt: cleanup.spawnedAt,
               });
@@ -2587,7 +2888,7 @@ export class TaskManager {
               upsertProcessCleanupMarkerEntrySync(task.project, {
                 launchId: launch.launchId,
                 taskId: task.record.taskId,
-                provider: this.executor.identity.provider,
+                provider: adapter.identity.provider,
                 ...(typeof launch.pid === 'number' ? { pid: launch.pid } : {}),
                 spawnedAt: launch.spawnedAt,
               });

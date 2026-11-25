@@ -4,8 +4,10 @@ Reference for the [core skill](../SKILL.md). Open it when checking or saving the
 
 ## Model preference
 
-- Prefer `model` in `black_gravity_run` for per-task selection. `black_gravity_set_model` persists the default in private state for future tasks, including after a restart. `model: null` persists Auto. The order is the task's choice, the saved preference, `BRIDGE_DEFAULT_MODEL` and the agy default. Check `black_gravity_get_model` before reporting the current preference.
-- For Flash or Argon, use `black_gravity_resolve_model` and pass the returned `modelId`; on `effort-unavailable`, `alias-not-listed`, or `ambiguous`, stop and ask instead of downgrading; in `agy` 1.5.13, effective model and effort are not observable.
+- Prefer `model` in `black_gravity_dispatch` (or `black_gravity_run` for `agy`) for per-task selection. Pass optional `provider` (`agy` or `opencode`, defaulting to the primary executor) to `black_gravity_list_models`, `black_gravity_get_model`, and `black_gravity_set_model`.
+- `black_gravity_set_model` persists the default per provider in private state for future tasks, including after a restart: `model-selection.json` for `agy` and `model-selection-<provider>.json` for additional executors. `model: null` clears or resets the provider default. For `agy`, the order is the task's choice, the saved preference, `BRIDGE_DEFAULT_MODEL`, and the `agy` default; additional executors do not fall back to `BRIDGE_DEFAULT_MODEL`, and omitting `model` with no saved preference runs without `--model`. Check `black_gravity_get_model` before reporting the current preference.
+- For Flash or Argon on `agy`, use `black_gravity_resolve_model` and pass the returned `modelId`; on `effort-unavailable`, `alias-not-listed`, or `ambiguous`, stop and ask instead of downgrading; in `agy` 1.5.13, effective model and effort are not observable.
+- Do not switch executor or model unless the user requests it; on `AGY_AUTH_REQUIRED`, `OPENCODE_AUTH_REQUIRED`, `OPENCODE_QUOTA_EXCEEDED`, or `OPENCODE_REGION_UNAVAILABLE`, offer switching to the other registered executor, either as a new `black_gravity_dispatch` or as `black_gravity_handoff` (with `provider`) from the latest completed task of that copy, instead of switching automatically.
 
 ## Model comparison
 

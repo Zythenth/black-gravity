@@ -79,6 +79,9 @@ export interface ExecutionAdapter {
   execute(request: ExecutionRequest, context?: ExecutionContext): Promise<ExecutionResult>;
   // Declares the model-listing capability for the new-model notice.
   listModels?(): Promise<readonly ExecutionModel[]>;
+  // Checks synchronously whether the executor is locally available without starting a process.
+  availability?(): { available: true } | { available: false; reason: string };
+  version?(): Promise<string>;
 }
 
 // This checks advertised support only. It grants no permissions and does not validate provider output.

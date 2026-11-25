@@ -175,6 +175,31 @@ const quarantinedTaskSchema = z.object({
   reason: z.enum(QUARANTINE_REASONS),
 }).strict();
 
+const executorStatusSchema = z.object({
+  provider: z.string(),
+  adapterId: z.string().optional(),
+  adapterVersion: z.string().optional(),
+  primary: z.boolean(),
+  available: z.boolean(),
+  reason: z.string().optional(),
+  version: z.string().optional(),
+}).strict();
+
+const executionCapabilitySupport = z.enum(['supported', 'unsupported', 'unknown']);
+const executionCapabilitiesSchema = z.object({
+  read: executionCapabilitySupport.optional(),
+  write: executionCapabilitySupport.optional(),
+  sandbox: executionCapabilitySupport.optional(),
+  network: executionCapabilitySupport.optional(),
+  skills: executionCapabilitySupport.optional(),
+  resources: executionCapabilitySupport.optional(),
+  structuredOutput: executionCapabilitySupport.optional(),
+  cancel: executionCapabilitySupport.optional(),
+  resume: executionCapabilitySupport.optional(),
+  observableUsage: executionCapabilitySupport.optional(),
+  modelList: executionCapabilitySupport.optional(),
+}).strict();
+
 export const successOutputSchemas = {
   black_gravity_wait_many: z.object({ ready: z.boolean(), timedOut: z.boolean(), hasMoreMessages: z.boolean(), tasks: z.array(jointWaitTaskSchema).max(32), waitCommand: waitCommandSchema.optional() }).strict(),
   black_gravity_workflow_result: z.object({ groupId: id, finalNode: z.string(), taskId: id, outputSha256: hash, summary: z.string().max(2000).optional(),
@@ -225,13 +250,17 @@ export const successOutputSchemas = {
       }).strict().optional(),
     }).strict().optional(),
     antiAiCraft: antiAiCraftStatusSchema.optional(),
+    executors: z.array(executorStatusSchema).optional(),
     waitCommand: waitCommandSchema.optional(),
   }).strict(),
   black_gravity_list_models: z.object({ models: z.array(z.object({ id: z.string(), name: z.string() }).strict()) }).strict(),
-  black_gravity_capabilities: z.object({ clis: z.array(cliCapabilityRecord) }).strict(),
+  black_gravity_capabilities: z.object({
+    clis: z.array(cliCapabilityRecord),
+    executors: z.array(executorStatusSchema.extend({ capabilities: executionCapabilitiesSchema }).strict()).optional(),
+  }).strict(),
   black_gravity_resolve_model: z.object({ resolution: modelResolutionSchema }).strict(),
   black_gravity_get_agent_policy: z.object({ allowedTools: nativeToolsSchema, mcpServers: z.array(z.object({ id: z.string(), description: z.string().nullable(), nativeServerName: z.string(), tools: z.array(mcpCatalogToolSchema) }).strict()).max(20) }).strict(),
-  black_gravity_get_model: z.object({ model: z.string().nullable() }).strict(),
+  black_gravity_get_model: z.object({ model: z.string().nullable(), provider: z.string().optional() }).strict(),
   black_gravity_get_sandbox_policy: sandboxPolicySnapshot,
   black_gravity_roles: z.object({ roles: z.array(z.object({ name: roleSchema, baseRole: builtinRoleSchema,
     description: z.string().nullable(), custom: z.boolean(), instructionChars: count,
@@ -242,7 +271,7 @@ export const successOutputSchemas = {
     defaultMemory: z.lazy(() => memorySelectionSchema).optional(),
     defaultAllowedTools: nativeToolsSchema.optional(), defaultMcpServers: mcpSelectionSchema.optional(),
     outputSchemaSha256: hash.optional() }).strict()) }).strict(),
-  black_gravity_set_model: z.object({ model: z.string().nullable() }).strict(),
+  black_gravity_set_model: z.object({ model: z.string().nullable(), provider: z.string().optional() }).strict(),
   black_gravity_set_sandbox_policy: sandboxPolicySnapshot,
   black_gravity_usage: z.object({
     scope: z.literal('retained-tasks'), taskCount: count, measuredTaskCount: count, counters: usageCountersSchema, byTask: z.array(usageRow),

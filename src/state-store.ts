@@ -26,6 +26,8 @@ const canonicalUuidSchema = z.string().uuid();
 const SANITIZED_CACHE_VERSION = 1;
 const maxSandboxPolicyFileBytes = 2 * 20 * 1000 * 6 + 4096;
 const modelSelectionSchema = z.object({ version: z.literal(1), model: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/).nullable() }).strict();
+const providerModelSelectionSchema = z.object({ version: z.literal(1), model: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/).nullable() }).strict();
+const PROVIDER_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const integrationApprovalRootSchema = z.string().min(1).max(1000).refine(root =>
   !root.includes('\0') && path.isAbsolute(root) && path.resolve(root) === root && root !== path.parse(root).root &&
   (process.platform !== 'win32' || root === root.toLowerCase()));
@@ -95,7 +97,7 @@ const snapshotSchema = z.object({
       }).strict(),
     }).strict()).max(20).optional(),
   }).passthrough(),
-  options: z.object({ peerContext: z.lazy(() => peerContextSchema).optional(), peerOrigin: z.lazy(() => peerOriginSchema).optional(), group: z.lazy(() => groupAssignmentSchema).optional(), memory: z.lazy(() => memorySelectionSchema).optional(), memorySnapshots: z.lazy(() => memorySnapshotsSchema).optional(), allowedTools: nativeToolsSchema.optional(), mcpServers: mcpSelectionSchema.optional(), agentPolicy: resolvedAgentPolicySchema.optional(), prompt: z.string(), workingDirectory: z.string(), effort: effortSchema.optional(), roleDefinition: roleDefinitionSchema.optional(),
+  options: z.object({ peerContext: z.lazy(() => peerContextSchema).optional(), peerOrigin: z.lazy(() => peerOriginSchema).optional(), group: z.lazy(() => groupAssignmentSchema).optional(), memory: z.lazy(() => memorySelectionSchema).optional(), memorySnapshots: z.lazy(() => memorySnapshotsSchema).optional(), allowedTools: nativeToolsSchema.optional(), mcpServers: mcpSelectionSchema.optional(), agentPolicy: resolvedAgentPolicySchema.optional(), provider: z.string().min(1).max(128).optional(), prompt: z.string(), workingDirectory: z.string(), effort: effortSchema.optional(), roleDefinition: roleDefinitionSchema.optional(),
     outputSchema: z.record(z.string(), z.unknown()).optional(),
     artifactPaths: z.array(z.string().min(1).max(1000)).min(1).max(100).optional(),
   }).passthrough(),
@@ -384,12 +386,30 @@ export class StateStore {
     } finally { rmSync(temporary, { force: true }); release(); }
   }
 
-  loadModel(): { model: string | null } | undefined {
-    const file = path.join(this.directory, 'model-selection.json');
+  private modelSelectionTarget(provider?: string): { file: string; lock: string; schema: typeof modelSelectionSchema } {
+    if (provider === undefined) {
+      return {
+        file: path.join(this.directory, 'model-selection.json'),
+        lock: 'model-selection',
+        schema: modelSelectionSchema,
+      };
+    }
+    if (!PROVIDER_NAME_RE.test(provider)) {
+      throw new BridgeError('INVALID_PROVIDER', `Invalid provider name: ${provider}`);
+    }
+    return {
+      file: path.join(this.directory, `model-selection-${provider}.json`),
+      lock: `model-selection-${provider}`,
+      schema: providerModelSelectionSchema,
+    };
+  }
+
+  loadModel(provider?: string): { model: string | null } | undefined {
+    const { file, schema } = this.modelSelectionTarget(provider);
     try {
       const stat = lstatSync(file);
       if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 1024) throw new Error('Unsafe model selection');
-      return modelSelectionSchema.parse(JSON.parse(readFileSync(file, 'utf8')));
+      return schema.parse(JSON.parse(readFileSync(file, 'utf8')));
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
       throw new BridgeError('INVALID_STATE', 'Invalid persisted model selection');
@@ -425,16 +445,16 @@ export class StateStore {
     } finally { rmSync(temporary, { force: true }); }
   }
 
-  saveModel(model: string | null): void {
-    const selection = modelSelectionSchema.parse({ version: 1, model });
-    const release = this.acquire('model-selection');
-    const target = path.join(this.directory, 'model-selection.json');
-    const temporary = target + '.' + randomUUID() + '.tmp';
+  saveModel(model: string | null, provider?: string): void {
+    const { file, lock, schema } = this.modelSelectionTarget(provider);
+    const selection = schema.parse({ version: 1, model });
+    const release = this.acquire(lock);
+    const temporary = file + '.' + randomUUID() + '.tmp';
     try {
       // Validate an existing record before replacing it, including links and malformed data.
-      this.loadModel();
+      this.loadModel(provider);
       writeFileSync(temporary, JSON.stringify(selection), { flag: 'wx', mode: 0o600, flush: true });
-      replaceStateFile(temporary, target);
+      replaceStateFile(temporary, file);
     } finally { rmSync(temporary, { force: true }); release(); }
   }
 

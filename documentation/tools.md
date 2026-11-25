@@ -19,12 +19,12 @@ Every tool publishes an `outputSchema` describing fields and types in its struct
 
 | Tool | Purpose |
 | --- | --- |
-| `black_gravity_health` | Checks executable, version, apparent authentication, capabilities and `antiAiCraft` snapshot status. |
-| `black_gravity_list_models` | Lists IDs returned by `agy models`. |
-| `black_gravity_capabilities` | Reports each CLI capability as observed, absent or unknown from version and help output only, whether the CLI exposes the model actually used, and recorded edit-tool restrictions. |
+| `black_gravity_health` | Checks executable, version, apparent authentication, capabilities, registered `executors` availability, and `antiAiCraft` snapshot status. |
+| `black_gravity_list_models` | Lists IDs returned by the selected `provider` (defaults to the primary executor). |
+| `black_gravity_capabilities` | Reports each CLI capability as observed, absent or unknown from version and help output only, whether the CLI exposes the model actually used, recorded edit-tool restrictions, and registered `executors` declared capabilities. |
 | `black_gravity_resolve_model` | Resolves the `flash` or `argon` alias and requested effort to an exact ID from `agy models`, without substituting or downgrading, and reports effective-model observability. |
-| `black_gravity_get_model` / `black_gravity_set_model` | Reads or saves the default model. `null` selects Auto. |
-| `black_gravity_context` / `black_gravity_handoff` | Inspects and transfers plans, decisions, criteria and evidence to another role in an independent copy. |
+| `black_gravity_get_model` / `black_gravity_set_model` | Reads or saves the default model for the selected `provider` (defaults to primary). `null` resets to the provider default. |
+| `black_gravity_context` / `black_gravity_handoff` | Inspects and transfers plans, decisions, criteria and evidence to another role in an independent copy, optionally selecting another registered `provider`. |
 | `black_gravity_compare` / `black_gravity_comparison` | Requests reviews from two to four models and gathers findings, differences, failures and observed usage. |
 | `black_gravity_get_agent_policy` | Lists native ceilings and configured MCP IDs and tools without transport or credentials. |
 | `black_gravity_roles` | Lists built-in and configured custom roles. |
@@ -32,7 +32,7 @@ Every tool publishes an `outputSchema` describing fields and types in its struct
 | `black_gravity_set_sandbox_policy` | Replaces the global policy after checking its previous hash, with a human MCP form in `ask` mode. |
 | `black_gravity_send_message` | Queues caller text with an idempotent receipt and official session continuation. |
 | `black_gravity_run` | Starts a task and returns its `taskId`. |
-| `black_gravity_dispatch` | Starts a task through the provider-neutral entry with an explicit `provider` from the registered executors and the same fields as `black_gravity_run`; strict input rejected before dispatch, compact response with the executor identity. |
+| `black_gravity_dispatch` | Starts a task through the provider-neutral entry with an explicit `provider` from the registered executors (see `black_gravity_health` for availability) and the same fields as `black_gravity_run`; strict input rejected before dispatch, compact response with the selected executor identity. |
 | `black_gravity_list_project_files` | Lists files eligible for copying. |
 | `black_gravity_preview` | Shows added, modified and deleted files, line totals, per-file statistics, patch, hash and recorded tests. |
 | `black_gravity_record_test` | Records client-reported command, output and exit code against the hash. |

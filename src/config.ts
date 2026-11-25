@@ -91,8 +91,11 @@ export interface Config extends ProjectLimits {
   mcpCatalog: McpCatalogEntry[];
   agyPath: string;
   agyPathInvalid?: boolean;
+  openCodePath?: string;
+  openCodePathInvalid?: boolean;
   defaultModel?: string;
   maxConcurrentTasks: number;
+  maxConcurrentOpenCodeTasks: number;
   maxQueuedTasks: number;
   maxRetainedTasks: number;
   defaultTimeoutSeconds: number;
@@ -572,6 +575,25 @@ function readAgyPath(value: string | undefined): {
   return { agyPath: value, issues: [] };
 }
 
+function readOpenCodePath(value: string | undefined): {
+  openCodePath?: string;
+  openCodePathInvalid?: boolean;
+  issues: ConfigurationIssue[];
+} {
+  const variable = 'OPENCODE_PATH';
+  if (!value) return { issues: [] };
+  if (value.includes('\0')) {
+    return { openCodePathInvalid: true, issues: [{ variable, reason: 'invalid-entry' }] };
+  }
+  const isAbsolute = process.platform === 'win32'
+    ? isFullWindowsPath(value)
+    : path.isAbsolute(value);
+  if (!isAbsolute) {
+    return { openCodePathInvalid: true, issues: [{ variable, reason: 'not-absolute' }] };
+  }
+  return { openCodePath: value, issues: [] };
+}
+
 function readForbiddenDirectories(value: string | undefined): {
   forbiddenDirectories: string[];
   forbiddenDirectoriesInvalid?: boolean;
@@ -644,6 +666,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const antiAiCraftDir = readAntiAiCraftDirectory(env.BRIDGE_ANTI_AI_CRAFT_DIRECTORY);
   const windowsNodeCache = readWindowsNodeCacheDirectory(env.BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY);
   const agyPath = readAgyPath(env.AGY_PATH);
+  const openCodePath = readOpenCodePath(env.OPENCODE_PATH);
   const stateDir = readStateDirectory(env.BRIDGE_STATE_DIRECTORY);
   const configurationIssues: ConfigurationIssue[] = [
     ...stateDir.issues,
@@ -659,6 +682,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     ...antiAiCraftDir.issues,
     ...windowsNodeCache.issues,
     ...agyPath.issues,
+    ...openCodePath.issues,
   ];
   return {
     approvalMode: approvalMode(env.BRIDGE_APPROVAL_MODE),
@@ -674,8 +698,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     mcpCatalog: mcpCatalog.mcpCatalog,
     agyPath: agyPath.agyPath,
     ...(agyPath.agyPathInvalid ? { agyPathInvalid: true } : {}),
+    ...(openCodePath.openCodePath !== undefined ? { openCodePath: openCodePath.openCodePath } : {}),
+    ...(openCodePath.openCodePathInvalid ? { openCodePathInvalid: true } : {}),
     defaultModel,
     maxConcurrentTasks: positiveInteger(env.MAX_CONCURRENT_TASKS, 1, 16),
+    maxConcurrentOpenCodeTasks: positiveInteger(env.MAX_CONCURRENT_OPENCODE_TASKS, 1, 16),
     maxQueuedTasks: positiveInteger(env.MAX_QUEUED_TASKS, 20, 1000),
     maxRetainedTasks: positiveInteger(env.MAX_RETAINED_TASKS, 100, 10000),
     defaultTimeoutSeconds: positiveInteger(env.DEFAULT_TIMEOUT_SECONDS, 1800, 86400),

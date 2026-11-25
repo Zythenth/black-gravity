@@ -122,9 +122,11 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
         }
       : {};
 
+  const providerEnum = z.enum(tasks.executorProviders);
+
   if (toolEnabled(tasks.toolProfile, 'black_gravity_health')) server.registerTool('black_gravity_health', {
     outputSchema: outputSchemas.black_gravity_health,
-    description: 'Inspect installed agy version, authentication and supported capabilities.',
+    description: 'Inspect installed agy version, authentication, supported capabilities, and registered executor availability.',
     inputSchema: {},
   }, safe(async () => {
     const hasElicitation = Boolean(server.server.getClientCapabilities()?.elicitation?.form);
@@ -132,8 +134,14 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
     const autoMode = tasks.approvalMode === 'auto';
     const available = integrateEnabled && (autoMode || hasElicitation);
     const method = autoMode ? 'automatic' : 'mcp-form-elicitation';
+    const agyHealth = await adapter.health();
+    const executors = await tasks.executorStatus({
+      installed: agyHealth.installed,
+      version: agyHealth.version,
+      error: agyHealth.error,
+    });
     return {
-      ...await adapter.health(),
+      ...agyHealth,
       toolProfile: tasks.toolProfile,
       approvalMode: tasks.approvalMode,
       configurationIssues: tasks.configurationIssues,
@@ -142,6 +150,7 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
       windowsRuntime: await tasks.windowsRuntimeStatus(),
       testExecutor: tasks.testExecutorStatus(),
       antiAiCraft: await tasks.antiAiCraftStatus(),
+      executors,
       ...(tasks.isStateDirectoryUsable() ? waitCommand() : {}),
       bridgeLimitations: {
         interactiveReplies: { available: false, reason: 'The verified agy headless protocol rejects control_request/control_response. This bridge cannot answer pending permission requests; use supported sandbox permissions and inspect failures.' },
@@ -158,15 +167,19 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_list_models')) server.registerTool('black_gravity_list_models', {
     outputSchema: outputSchemas.black_gravity_list_models,
-    description: 'List model IDs actually returned by agy models for this account.',
-    inputSchema: {},
-  }, safe(async () => ({ models: await adapter.listModels() })));
+    description: 'List model IDs returned by the selected provider (defaults to the primary executor).',
+    inputSchema: { provider: providerEnum.optional() },
+  }, async ({ provider }) => safe(async () => ({ models: await tasks.listModels(provider) }))());
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_capabilities')) server.registerTool('black_gravity_capabilities', {
     outputSchema: outputSchemas.black_gravity_capabilities,
-    description: 'Report which capabilities each installed CLI exposes as observed, absent or unknown, using only version and help output. Starts no task and no login. Unknown is not support.',
+    description: 'Report which capabilities each installed CLI and registered executor exposes, using only version, help, and adapter metadata. Starts no task and no login. Unknown is not support.',
     inputSchema: {},
-  }, safe(async () => ({ clis: [await adapter.capabilityRecord({ id: 'agy', version: AGY_ADAPTER_VERSION })] })));
+  }, safe(async () => {
+    const agyRecord = await adapter.capabilityRecord({ id: 'agy', version: AGY_ADAPTER_VERSION });
+    const executors = await tasks.executorCapabilities(agyRecord);
+    return { clis: [agyRecord], executors };
+  }));
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_resolve_model')) server.registerTool('black_gravity_resolve_model', {
     outputSchema: outputSchemas.black_gravity_resolve_model,
@@ -201,9 +214,9 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_get_model')) server.registerTool('black_gravity_get_model', {
     outputSchema: outputSchemas.black_gravity_get_model,
-    description: 'Return the default model selected for subsequent bridge tasks. Null means agy chooses its own default.',
-    inputSchema: {},
-  }, safe(() => ({ model: tasks.getModel() ?? null })));
+    description: 'Return the default model selected for subsequent bridge tasks of the selected provider (defaults to primary). Null means the provider chooses its own default.',
+    inputSchema: { provider: providerEnum.optional() },
+  }, async ({ provider }) => safe(() => ({ model: tasks.getModel(provider) ?? null, ...(provider !== undefined ? { provider } : {}) }))());
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_get_sandbox_policy')) server.registerTool('black_gravity_get_sandbox_policy', {
     outputSchema: outputSchemas.black_gravity_get_sandbox_policy,
@@ -225,9 +238,9 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_set_model')) server.registerTool('black_gravity_set_model', {
     outputSchema: outputSchemas.black_gravity_set_model,
-    description: 'Persist an exact model ID from agy models as the bridge default. Null persists Auto (agy default), overriding BRIDGE_DEFAULT_MODEL. Does not alter agy global settings.',
-    inputSchema: { model: z.string().min(1).max(128).nullable() },
-  }, async ({ model }) => safe(async () => ({ model: await tasks.setModel(model) }))());
+    description: 'Persist an exact model ID from the selected provider\'s model list as the bridge default (defaults to primary). Null resets to the provider default (for primary, overrides BRIDGE_DEFAULT_MODEL). Does not alter CLI global settings.',
+    inputSchema: { model: z.string().min(1).max(128).nullable(), provider: providerEnum.optional() },
+  }, async ({ model, provider }) => safe(async () => ({ model: await tasks.setModel(model, provider), ...(provider !== undefined ? { provider } : {}) }))());
 
   if (tasks.toolProfile === 'full' || tasks.toolProfile === 'implementation') server.registerTool('black_gravity_set_sandbox_policy', {
     outputSchema: outputSchemas.black_gravity_set_sandbox_policy,
@@ -363,23 +376,22 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
     description: 'Copy non-ignored project files to a temporary directory and run agy --sandbox there. includePaths narrows copied files or folders. Returns a taskId; source is unchanged.',
     inputSchema: runSchema,
   }, async args => safe(async () => {
-    const { task, ...wait } = await startTask(args);
+    const { task, ...wait } = await startTask({ ...args, provider: tasks.executorIdentity.provider });
     return { task: clientTask(task), ...wait };
   })());
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_dispatch')) server.registerTool('black_gravity_dispatch', {
     outputSchema: outputSchemas.black_gravity_dispatch,
-    description: 'Start a task through the provider-neutral entry: select an executor from the registered providers and pass the same task fields as black_gravity_run. The input is strict and rejected before dispatch when invalid; the response is compact and large content stays behind the result and patch readers.',
-    inputSchema: z.object({ provider: z.enum([tasks.executorIdentity.provider]), ...runSchema }).strict(),
+    description: 'Start a task through the provider-neutral entry: select an executor from the registered providers (each provider\'s availability is reported in black_gravity_health) and pass the same task fields as black_gravity_run. The input is strict and rejected before dispatch when invalid; the response is compact and large content stays behind the result and patch readers.',
+    inputSchema: z.object({ provider: providerEnum, ...runSchema }).strict(),
   }, async ({ provider, ...args }) => safe(async () => {
-    const identity = tasks.executorIdentity;
-    if (provider !== identity.provider) {
-      throw new BridgeError('INVALID_PROVIDER', `Unknown provider: ${provider}`);
-    }
-    const { task, ...wait } = await startTask(args);
+    const { task, ...wait } = await startTask({ ...args, provider });
+    const execution = task.execution;
     return {
       task: compactTask(task),
-      executor: { provider: identity.provider, adapterId: identity.id, adapterVersion: identity.version },
+      executor: execution
+        ? { provider: execution.provider, adapterId: execution.adapterId, adapterVersion: execution.adapterVersion }
+        : { provider: tasks.executorIdentity.provider, adapterId: tasks.executorIdentity.id, adapterVersion: tasks.executorIdentity.version },
       ...wait,
     };
   })());
@@ -401,8 +413,9 @@ export function createMcpServer(adapter: CliAdapter, tasks: TaskManager, options
 
   if (toolEnabled(tasks.toolProfile, 'black_gravity_handoff')) server.registerTool('black_gravity_handoff', {
     outputSchema: outputSchemas.black_gravity_handoff,
-    description: 'Start a new conversation in an independent copy of a completed task, carrying its structured report, decisions, criteria and test provenance. Bind to the treeSha256 from context. Reviewers inspect modified files without altering the implementation copy. Verification and human integration approval remain required.',
+    description: 'Start a new conversation in an independent copy of a completed task, carrying its structured report, decisions, criteria and test provenance, optionally on another registered provider. Bind to the treeSha256 from context. Reviewers inspect modified files without altering the implementation copy. Verification and human integration approval remain required.',
     inputSchema: { sourceTaskId: z.string().uuid(), expectedContextSha256: z.string().regex(/^[a-f0-9]{64}$/),
+      provider: providerEnum.optional(),
       memory: memorySelectionSchema.optional(), allowedTools: nativeToolsSchema.optional(), mcpServers: mcpSelectionSchema.optional(),
       prompt: z.string().min(1), role: configuredRoleSchema, effort: effortSchema.optional(), model: z.string().min(1).max(128).nullable().optional(), decisions: decisionsSchema.optional(),
       timeoutSeconds: z.number().int().min(1).max(86400).optional() },

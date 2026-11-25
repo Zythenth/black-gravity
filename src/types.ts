@@ -167,6 +167,7 @@ export interface RunOptions extends AgentPolicySelection {
   nativeTest?: BridgeNativeTestRequest;
   acceptanceCriteria?: AcceptanceCriterion[];
   prompt: string;
+  provider?: string;
   model?: string | null;
   effort?: Effort;
   workingDirectory: string;

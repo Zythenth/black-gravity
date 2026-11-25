@@ -60,9 +60,9 @@ For `question` or `blocker`, read the message with `black_gravity_wait` on the r
 
 ## Handoffs between roles
 
-After a task completes, use `black_gravity_context` to inspect criteria, reports and `treeSha256`. Call `black_gravity_handoff` with `sourceTaskId`, the hash, `role`, `prompt` and optionally `model` and `decisions`.
+After a task completes, use `black_gravity_context` to inspect criteria, reports and `treeSha256`. Call `black_gravity_handoff` with `sourceTaskId`, the hash, `role`, `prompt` and optionally `provider`, `model` and `decisions`.
 
-The new task gets an independent copy of current files, including changes awaiting integration. It retains the original project baseline, criteria, up to eight planning or review reports and test provenance. Decisions are client reports. Reports and receipts retain their provenance and grant no integration authority. The whole context must fit the prompt limit. There is no silent truncation.
+The new task gets an independent copy of current files, including changes awaiting integration, and starts a new CLI session on the selected executor (`agy` or `opencode`, defaulting to primary; never reusing the source `sessionId` across executors). It retains the original project baseline, criteria, up to eight planning or review reports and test provenance. Decisions are client reports. Reports and receipts retain their provenance and grant no integration authority. The whole context must fit the prompt limit. There is no silent truncation.
 
 Planning, implementation and review can use separate roles, models and conversations. Treat handoff context as data to verify. The bridge checks hashes at admission and copying, including after queueing. Review checks that its copy stays intact, including ignored files. The implementation copy remains available for testing, verification and authorized integration. An implementation handoff from review preserves the accumulated patch against the original.
 
@@ -95,7 +95,7 @@ Omission retains `events` and its event history. `black_gravity_events` remains 
 
 ## Concurrent execution
 
-The plugin configures two simultaneous tasks. The standalone server defaults to one. `MAX_CONCURRENT_TASKS` accepts 1 to 16. Resumes of the same copy remain sequential.
+The plugin configures two simultaneous tasks. The standalone server defaults to one. `MAX_CONCURRENT_TASKS` accepts 1 to 16, and `MAX_CONCURRENT_OPENCODE_TASKS` accepts 1 to 16 (effective OpenCode concurrency is `min(MAX_CONCURRENT_OPENCODE_TASKS, MAX_CONCURRENT_TASKS)`). Group tasks (group-admitted and group continuations) are governed only by `MAX_CONCURRENT_TASKS`. For standalone (non-group) tasks, the queue is scanned in order and ineligible tasks remain queued in place: at most one active task of any kind runs per project (`workingDirectory`), at most one `agy` task runs overall, and `opencode` tasks run in parallel only across different projects within the effective OpenCode limit. Resumes of the same copy remain sequential.
 
 ## Session messages
 
@@ -155,9 +155,9 @@ Private state locks check file identity and a possession token before release. R
 
 ### Default model
 
-Set `BRIDGE_DEFAULT_MODEL` to an ID returned by `agy models` for the initial default. `black_gravity_set_model` persists a preference shared by servers with the same private state. Precedence is task `model`, saved preference, environment setting and the agy default. Selection is checked against the current list before execution and unavailable IDs return `MODEL_NOT_AVAILABLE`.
+`black_gravity_list_models`, `black_gravity_get_model` and `black_gravity_set_model` accept an optional `provider` parameter (`agy` or `opencode`, defaulting to the primary executor). For the primary executor (`agy`), set `BRIDGE_DEFAULT_MODEL` to an ID returned by `agy models` for the initial default; `black_gravity_set_model` persists a preference in `model-selection.json` shared by servers with the same private state, with precedence: task `model`, saved preference, environment setting and the `agy` default. Additional executors (such as `opencode`) persist their preference separately in `model-selection-<provider>.json` without falling back to `BRIDGE_DEFAULT_MODEL`: when nothing is saved and `model` is omitted, tasks run without `--model`. Selection is checked against the selected executor's current model list before execution and unavailable IDs return `MODEL_NOT_AVAILABLE` naming the executor.
 
-Pass `model: null` for Auto. On a task it skips bridge defaults. In `black_gravity_set_model` it persists the agy default even when the environment variable is set. Omitting `model` uses the current preference. To restore the environment default, stop the server and remove only `model-selection.json` from private state.
+Pass `model: null` for the provider default. On a task it skips bridge defaults. In `black_gravity_set_model` it persists `null` (for primary, overriding `BRIDGE_DEFAULT_MODEL`). Omitting `model` uses the current preference for that provider. To restore the environment default for primary, stop the server and remove only `model-selection.json` from private state.
 
 `black_gravity_resume` accepts exactly one of `taskId` or the `sessionId` from `black_gravity_status` for a completed task, including after a restart, and reuses its isolated copy. Unknown, active, failed (except `TEST_FAILED`), integrated and other-project tasks are refused before starting a process, task or copy. If the isolated copy or its private baseline no longer exists (for example after a restart cleared the temporary directory), resume, preview, tests and integration fail with `COPY_MISSING`; the bridge does not recreate the copy or run in the original project, and `black_gravity_discard` still discards the retained copy and marks the task discarded. Recover IDs with `black_gravity_tasks` and persisted sessions with `black_gravity_sessions`. Interrupted executions are never automatically repeated. They receive `SERVER_RESTARTED` when the previous process has ended. A live recorded PID blocks the copy with `ORPHAN_PROCESS_RUNNING`. The bridge does not kill recovered processes based only on PID. You can track another active server's tasks, but cancellation belongs to the starting server. Local locks prevent concurrent use of one copy. Cancellation stops the local subprocess, and partial copy changes can remain for review.
 

@@ -812,6 +812,107 @@ if (scenario === 'hang') {
   });
   emitStepFinish();
   process.exit(0);
+} else if (scenario === 'hold-write') {
+  const startedMatch = stdin.match(/STARTED:([^\r\n]+)/);
+  const holdMatch = stdin.match(/HOLD:([^\r\n]+)/);
+  const writeMatch = stdin.match(/WRITE:([^\r\n]+)/);
+  if (startedMatch) {
+    const startedFile = startedMatch[1].trim();
+    mkdirSync(path.dirname(startedFile), { recursive: true });
+    writeFileSync(startedFile, String(process.pid), 'utf8');
+  }
+  if (holdMatch) {
+    const holdFile = holdMatch[1].trim();
+    while (!existsSync(holdFile)) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  }
+  send({
+    type: 'step_start',
+    timestamp: Date.now(),
+    sessionID,
+    part: { id: 'prt_start_hold', sessionID, messageID: 'msg_1', type: 'step-start', snapshot: 'snap_1' },
+  });
+  if (writeMatch) {
+    const relPath = writeMatch[1].trim();
+    const target = path.resolve(process.cwd(), relPath);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, 'held opencode write\n', 'utf8');
+    send({
+      type: 'tool_use',
+      timestamp: Date.now(),
+      sessionID,
+      part: {
+        partID: 'prt_tool_hold',
+        sessionID,
+        messageID: 'msg_1',
+        type: 'tool',
+        id: 'call_hold',
+        tool: 'write',
+        state: { status: 'completed', input: { path: relPath }, output: 'written', title: relPath },
+      },
+    });
+  }
+  send({
+    type: 'text',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      id: 'prt_text_hold',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'text',
+      text: 'hold-write done',
+      time: { start: Date.now(), end: Date.now() },
+    },
+  });
+  emitStepFinish();
+  process.exit(0);
+} else if (scenario === 'hold-auth-error') {
+  const startedMatch = stdin.match(/STARTED:([^\r\n]+)/);
+  const holdMatch = stdin.match(/HOLD:([^\r\n]+)/);
+  const failAuth = stdin.includes('FAIL:auth-error');
+  if (startedMatch) {
+    const startedFile = startedMatch[1].trim();
+    mkdirSync(path.dirname(startedFile), { recursive: true });
+    writeFileSync(startedFile, String(process.pid), 'utf8');
+  }
+  if (holdMatch) {
+    const holdFile = holdMatch[1].trim();
+    while (!existsSync(holdFile)) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+  }
+  if (failAuth) {
+    send({
+      type: 'error',
+      timestamp: Date.now(),
+      sessionID,
+      error: { type: 'provider.auth', message: 'Invalid API key provided', status: 401, response: { body: 'secret-body' } },
+    });
+    process.exit(1);
+  }
+  send({
+    type: 'step_start',
+    timestamp: Date.now(),
+    sessionID,
+    part: { id: 'prt_start_hold', sessionID, messageID: 'msg_1', type: 'step-start', snapshot: 'snap_1' },
+  });
+  send({
+    type: 'text',
+    timestamp: Date.now(),
+    sessionID,
+    part: {
+      id: 'prt_text_hold',
+      sessionID,
+      messageID: 'msg_1',
+      type: 'text',
+      text: 'hold-auth-error ok',
+      time: { start: Date.now(), end: Date.now() },
+    },
+  });
+  emitStepFinish();
+  process.exit(0);
 } else {
   process.stderr.write(`Unknown mock scenario: ${scenario}\n`);
   process.exit(2);
