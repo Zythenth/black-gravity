@@ -33801,6 +33801,26 @@ async function preflightProjectFiles(directory, candidates, limits, checkedPathF
   return { eligible, blocked, records };
 }
 
+// dist/src/execution-contract.js
+var PROCESS_CONTAINMENT_LEVELS = ["contained", "tracked", "none"];
+function isCapabilitySupported(capabilities, key) {
+  return Object.hasOwn(capabilities, key) && capabilities[key] === "supported";
+}
+function declaredProcessContainment(adapter) {
+  return adapter?.processContainment ?? "none";
+}
+function assertExecutionCapabilities(request, capabilities) {
+  const required2 = [request.mode === "write" ? "write" : "read"];
+  if (request.session)
+    required2.push("resume");
+  if (request.outputSchema !== void 0)
+    required2.push("structuredOutput");
+  for (const key of required2) {
+    if (!isCapabilitySupported(capabilities, key))
+      throw new TypeError("Execution capability unavailable: " + key);
+  }
+}
+
 // dist/src/agent-config.js
 import * as crypto3 from "node:crypto";
 import { createReadStream as createReadStream2 } from "node:fs";
@@ -34395,7 +34415,7 @@ function readProcessCleanupMarkerSync(project) {
   }
   const entries2 = [];
   for (const item of parsed.entries) {
-    if (!isPlainObject2(item) || typeof item.launchId !== "string" || !item.launchId || typeof item.taskId !== "string" || !item.taskId || typeof item.provider !== "string" || !item.provider || typeof item.spawnedAt !== "string" || !Number.isFinite(Date.parse(item.spawnedAt)) || item.pid !== void 0 && (typeof item.pid !== "number" || !Number.isInteger(item.pid) || item.pid <= 0)) {
+    if (!isPlainObject2(item) || typeof item.launchId !== "string" || !item.launchId || typeof item.taskId !== "string" || !item.taskId || typeof item.provider !== "string" || !item.provider || typeof item.spawnedAt !== "string" || !Number.isFinite(Date.parse(item.spawnedAt)) || item.pid !== void 0 && (typeof item.pid !== "number" || !Number.isInteger(item.pid) || item.pid <= 0) || item.containment !== void 0 && (typeof item.containment !== "string" || !PROCESS_CONTAINMENT_LEVELS.includes(item.containment)) || item.start !== void 0 && (typeof item.start !== "string" || item.start.length < 1 || item.start.length > 64)) {
       throw new BridgeError("PROCESS_CLEANUP_UNVERIFIED", "The unverified process cleanup record is unreadable; discard this copy");
     }
     entries2.push({
@@ -34403,7 +34423,9 @@ function readProcessCleanupMarkerSync(project) {
       taskId: item.taskId,
       provider: item.provider,
       ...typeof item.pid === "number" ? { pid: item.pid } : {},
-      spawnedAt: item.spawnedAt
+      spawnedAt: item.spawnedAt,
+      ...item.containment !== void 0 ? { containment: item.containment } : {},
+      ...item.start !== void 0 ? { start: item.start } : {}
     });
   }
   return { version: 1, entries: entries2 };
@@ -34415,7 +34437,9 @@ function upsertProcessCleanupMarkerEntrySync(project, entry2) {
     taskId: entry2.taskId,
     provider: entry2.provider,
     ...typeof entry2.pid === "number" && Number.isInteger(entry2.pid) && entry2.pid > 0 ? { pid: entry2.pid } : {},
-    spawnedAt: entry2.spawnedAt
+    spawnedAt: entry2.spawnedAt,
+    ...entry2.containment !== void 0 ? { containment: entry2.containment } : {},
+    ...typeof entry2.start === "string" && entry2.start.length >= 1 && entry2.start.length <= 64 ? { start: entry2.start } : {}
   };
   const entries2 = existing ? [...existing.entries] : [];
   const index = entries2.findIndex((item) => item.launchId === normalized.launchId);
@@ -38092,22 +38116,6 @@ var EventStore = class {
   }
 };
 
-// dist/src/execution-contract.js
-function isCapabilitySupported(capabilities, key) {
-  return Object.hasOwn(capabilities, key) && capabilities[key] === "supported";
-}
-function assertExecutionCapabilities(request, capabilities) {
-  const required2 = [request.mode === "write" ? "write" : "read"];
-  if (request.session)
-    required2.push("resume");
-  if (request.outputSchema !== void 0)
-    required2.push("structuredOutput");
-  for (const key of required2) {
-    if (!isCapabilitySupported(capabilities, key))
-      throw new TypeError("Execution capability unavailable: " + key);
-  }
-}
-
 // dist/src/native-tests.js
 import { createHash as createHash15, randomUUID as randomUUID7 } from "node:crypto";
 import { appendFile, mkdir as mkdir5, readFile as readFile6, rm as rm3, writeFile as writeFile6 } from "node:fs/promises";
@@ -38379,8 +38387,16 @@ import { spawn as spawn4 } from "node:child_process";
 import { readdirSync as readdirSync3, readFileSync as readFileSync4, readlinkSync } from "node:fs";
 import { readdir as readdir6, readFile as readFile7 } from "node:fs/promises";
 import path17 from "node:path";
-function runBoundedCommand(executable, args) {
+var PROCESS_LISTING_TIMEOUT_MS = 15e3;
+function abortListingError(signal) {
+  return signal.reason instanceof Error ? signal.reason : new Error("Process listing aborted");
+}
+function runBoundedCommand(executable, args, signal) {
   return new Promise((resolve2, reject) => {
+    if (signal?.aborted) {
+      reject(abortListingError(signal));
+      return;
+    }
     let child;
     try {
       child = spawn4(executable, [...args], {
@@ -38395,19 +38411,24 @@ function runBoundedCommand(executable, args) {
     let settled = false;
     const timer = setTimeout(() => {
       fail3(new Error("Process listing timed out after 15s"));
-    }, 15e3);
+    }, PROCESS_LISTING_TIMEOUT_MS);
     timer.unref();
+    const onAbort = () => {
+      fail3(abortListingError(signal));
+    };
     function fail3(err) {
       if (settled)
         return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       try {
         child.kill();
       } catch {
       }
       reject(err);
     }
+    signal?.addEventListener("abort", onAbort, { once: true });
     const chunks = [];
     let totalBytes = 0;
     const MAX_STDOUT_BYTES = 16 * 1024 * 1024;
@@ -38429,6 +38450,7 @@ function runBoundedCommand(executable, args) {
     });
     child.on("close", (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
       if (settled)
         return;
       settled = true;
@@ -38440,11 +38462,11 @@ function runBoundedCommand(executable, args) {
     });
   });
 }
-async function listWindowsProcesses() {
+async function listWindowsProcesses(options) {
   const systemRoot = process.env.SystemRoot || "C:\\Windows";
   const powershell = path17.join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
   const script = 'Get-CimInstance Win32_Process | ForEach-Object { if ($_.CreationDate) { "$($_.ProcessId) $($_.ParentProcessId) $($_.CreationDate.ToFileTimeUtc())" } }';
-  const output2 = await runBoundedCommand(powershell, ["-NoProfile", "-NonInteractive", "-Command", script]);
+  const output2 = await runBoundedCommand(powershell, ["-NoProfile", "-NonInteractive", "-Command", script], options?.signal);
   const lines = output2.split(/\r?\n/);
   const processes = [];
   for (const line of lines) {
@@ -38511,6 +38533,43 @@ function countPidNamespaceMembers(link2) {
   }
   return count2;
 }
+var BOOT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+var LINUX_START_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):(\d+)$/;
+var BOOT_UNAVAILABLE_START = "boot-unavailable";
+function readBootId() {
+  try {
+    const boot = readFileSync4("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return BOOT_ID_RE.test(boot) ? boot : void 0;
+  } catch {
+    return void 0;
+  }
+}
+function readProcessStart(pid, platform = process.platform) {
+  if (platform !== "linux")
+    return void 0;
+  if (!Number.isInteger(pid) || pid <= 0)
+    return void 0;
+  try {
+    return parseLinuxProcStat(readFileSync4(`/proc/${pid}/stat`, "utf8"))?.start;
+  } catch {
+    return void 0;
+  }
+}
+function recordedProcessStart(pid, platform = process.platform, bootId = readBootId) {
+  if (platform !== "linux")
+    return void 0;
+  const boot = bootId();
+  if (!boot)
+    return BOOT_UNAVAILABLE_START;
+  const ticks = readProcessStart(pid, platform);
+  return ticks !== void 0 ? `${boot}:${ticks}` : void 0;
+}
+function launchHasIdentity(launch, _platform = process.platform) {
+  return typeof launch.start === "string" && launch.start.length > 0;
+}
+function launchIdentityMatches(current, launch, _platform = process.platform) {
+  return typeof launch.start === "string" && launch.start.length > 0 && current.start === launch.start;
+}
 function verifyProcessIdentity(identity) {
   if (process.platform !== "linux")
     return true;
@@ -38524,26 +38583,32 @@ function verifyProcessIdentity(identity) {
     return false;
   }
 }
-function startOrder(identity) {
+function startOrder(identity, platform = process.platform) {
   const trimmed = identity.start.trim();
   if (!trimmed)
     return Number.NaN;
-  if (process.platform === "linux" || process.platform === "win32") {
+  if (platform === "linux" || platform === "win32") {
     const value = Number(trimmed);
     return Number.isFinite(value) ? value : Number.NaN;
   }
   const parsed = Date.parse(trimmed);
   return Number.isFinite(parsed) ? parsed : Number.NaN;
 }
-async function listProcessIdentities() {
+async function listProcessIdentities(options) {
   if (process.platform === "win32") {
-    const processes = await listWindowsProcesses();
+    const processes = await listWindowsProcesses(options);
     return processes.map((p) => ({ pid: p.pid, parentPid: p.parentPid, start: String(p.createdAt) }));
   }
   if (process.platform === "linux") {
+    if (options?.signal?.aborted) {
+      throw abortListingError(options.signal);
+    }
     const entries2 = await readdir6("/proc");
     const identities2 = [];
     for (const entry2 of entries2) {
+      if (options?.signal?.aborted) {
+        throw abortListingError(options.signal);
+      }
       if (!/^\d+$/.test(entry2))
         continue;
       const pid = Number(entry2);
@@ -38565,7 +38630,7 @@ async function listProcessIdentities() {
     }
     return identities2;
   }
-  const output2 = await runBoundedCommand("ps", ["-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart="]);
+  const output2 = await runBoundedCommand("ps", ["-A", "-o", "pid=", "-o", "ppid=", "-o", "lstart="], options?.signal);
   const identities = [];
   for (const line of output2.split(/\r?\n/)) {
     const match = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
@@ -38581,7 +38646,7 @@ async function listProcessIdentities() {
   }
   return identities;
 }
-function collectDescendantEdges(list, initialParents, visitedPids) {
+function collectDescendantEdges(list, initialParents, visitedPids, platform = process.platform) {
   const descendants = [];
   const queue = [...initialParents];
   let head = 0;
@@ -38589,12 +38654,12 @@ function collectDescendantEdges(list, initialParents, visitedPids) {
     const parent = queue[head++];
     if (!parent)
       break;
-    const parentOrder = startOrder(parent);
+    const parentOrder = startOrder(parent, platform);
     if (!Number.isFinite(parentOrder))
       continue;
     for (const proc of list) {
       if (proc.parentPid === parent.pid && !visitedPids.has(proc.pid)) {
-        const childOrder = startOrder(proc);
+        const childOrder = startOrder(proc, platform);
         if (!Number.isFinite(childOrder) || childOrder < parentOrder)
           continue;
         visitedPids.add(proc.pid);
@@ -38605,7 +38670,7 @@ function collectDescendantEdges(list, initialParents, visitedPids) {
   }
   return descendants;
 }
-function expandMatchedTargets(list, seeds) {
+function expandMatchedTargets(list, seeds, platform = process.platform) {
   const matchedRoots = [];
   const visitedPids = /* @__PURE__ */ new Set();
   for (const seed of seeds) {
@@ -38617,7 +38682,7 @@ function expandMatchedTargets(list, seeds) {
       matchedRoots.push(matched);
     }
   }
-  return [...matchedRoots, ...collectDescendantEdges(list, matchedRoots, visitedPids)];
+  return [...matchedRoots, ...collectDescendantEdges(list, matchedRoots, visitedPids, platform)];
 }
 function toObservedProcess(identity) {
   const numeric = Number(identity.start);
@@ -38829,6 +38894,212 @@ async function reconcileTrackedProcesses(root, tracked, options) {
     await killTargets(remaining);
   } while (Date.now() < deadline);
   return { verified: false, method: "process-tree", remaining: remaining.map(toObservedProcess) };
+}
+function parseNumericStart(start) {
+  const trimmed = start.trim();
+  if (!trimmed)
+    return void 0;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : void 0;
+}
+function windowsLeftovers(list, rootPid, minCreatedAt, maxCreatedAt) {
+  const seeds = list.filter((proc) => {
+    if (proc.parentPid !== rootPid)
+      return false;
+    const createdAt = parseNumericStart(proc.start);
+    if (createdAt === void 0 || createdAt < minCreatedAt)
+      return false;
+    return maxCreatedAt === void 0 || createdAt < maxCreatedAt;
+  });
+  return expandMatchedTargets(list, seeds, "win32");
+}
+async function reconcileLaunchIdentity(launch, options) {
+  const pid = launch.pid;
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 1) {
+    return { verified: false, method: "process-identity", remaining: [] };
+  }
+  const graceMs = options?.graceMs ?? 3e3;
+  const platform = options?.platform ?? process.platform;
+  const list = options?.list ?? listProcessIdentities;
+  const signal = options?.signal ?? ((target, sig) => {
+    process.kill(target, sig);
+  });
+  const killWindows = options?.killWindows ?? killProcess;
+  const currentStart = options?.currentStart ?? ((targetPid) => readProcessStart(targetPid, platform));
+  const bootId = options?.bootId ?? readBootId;
+  if (platform !== "linux" && !Number.isFinite(launch.spawnedAt)) {
+    return { verified: false, method: "process-identity", remaining: [] };
+  }
+  let matchLaunch = launch;
+  if (platform === "linux" && launch.start !== void 0) {
+    const parsed = LINUX_START_RE.exec(launch.start);
+    if (!parsed) {
+      return { verified: false, method: "process-identity", remaining: [] };
+    }
+    const currentBoot = bootId();
+    if (!currentBoot) {
+      return { verified: false, method: "process-identity", remaining: [] };
+    }
+    if (parsed[1] !== currentBoot) {
+      return { verified: true, method: "process-identity", remaining: [] };
+    }
+    matchLaunch = { ...launch, start: parsed[2] };
+  }
+  let initial;
+  try {
+    initial = await list();
+  } catch {
+    return { verified: false, method: "process-identity", remaining: [] };
+  }
+  const isPosixGroupAlive = () => {
+    try {
+      signal(-pid, 0);
+      return true;
+    } catch (err) {
+      return err?.code === "EPERM";
+    }
+  };
+  const root = initial.find((proc) => proc.pid === pid);
+  if (root) {
+    if (launchIdentityMatches(root, matchLaunch, platform)) {
+      const identityKey = (identity) => `${identity.pid}\0${identity.start}`;
+      const signalTarget = (target) => {
+        if (target.pid <= 1 || currentStart(target.pid) !== target.start) {
+          return;
+        }
+        if (platform === "win32") {
+          return killWindows(target.pid);
+        }
+        try {
+          signal(target.pid, "SIGKILL");
+        } catch {
+        }
+      };
+      const signalTargets = async (listToSignal) => {
+        for (const target of listToSignal) {
+          const pending = signalTarget(target);
+          if (pending) {
+            await pending;
+          }
+        }
+      };
+      const targets = expandMatchedTargets(initial, [{ pid, start: root.start }], platform);
+      if (platform !== "win32" && matchLaunch.processGroup && currentStart(pid) === matchLaunch.start) {
+        try {
+          signal(-pid, "SIGKILL");
+        } catch {
+        }
+      }
+      await signalTargets(targets);
+      const known = /* @__PURE__ */ new Map();
+      const confirmedKeys = /* @__PURE__ */ new Set();
+      for (const target of targets) {
+        const key = identityKey(target);
+        known.set(key, target);
+        confirmedKeys.add(key);
+      }
+      let remaining = targets;
+      const deadline = Date.now() + graceMs;
+      do {
+        if (graceMs > 0) {
+          const waitMs = Math.min(100, Math.max(1, deadline - Date.now()));
+          await sleep2(waitMs);
+        }
+        let currentList;
+        try {
+          currentList = await list();
+        } catch {
+          return { verified: false, method: "process-identity", remaining: remaining.map(toObservedProcess) };
+        }
+        const currentByKey = /* @__PURE__ */ new Map();
+        for (const proc of currentList) {
+          currentByKey.set(identityKey(proc), proc);
+        }
+        const alive = [];
+        const aliveKeys = /* @__PURE__ */ new Set();
+        for (const key of known.keys()) {
+          const current = currentByKey.get(key);
+          if (current) {
+            alive.push(current);
+            aliveKeys.add(key);
+          }
+        }
+        const queue = [];
+        for (const proc of alive) {
+          queue.push({ parent: proc, signalable: confirmedKeys.has(identityKey(proc)) });
+        }
+        if (platform === "win32") {
+          for (const [key, identity] of known) {
+            if (!aliveKeys.has(key)) {
+              queue.push({ parent: identity, signalable: false });
+            }
+          }
+        }
+        const newlyAttributed = [];
+        const toSignal = [];
+        let head = 0;
+        while (head < queue.length) {
+          const entry2 = queue[head++];
+          if (!entry2)
+            break;
+          const parentOrder = startOrder(entry2.parent, platform);
+          if (!Number.isFinite(parentOrder))
+            continue;
+          for (const proc of currentList) {
+            if (proc.parentPid !== entry2.parent.pid)
+              continue;
+            const key = identityKey(proc);
+            if (known.has(key))
+              continue;
+            const childOrder = startOrder(proc, platform);
+            if (!Number.isFinite(childOrder) || childOrder < parentOrder)
+              continue;
+            known.set(key, proc);
+            if (entry2.signalable) {
+              confirmedKeys.add(key);
+              toSignal.push(proc);
+            }
+            newlyAttributed.push(proc);
+            queue.push({ parent: proc, signalable: entry2.signalable });
+          }
+        }
+        await signalTargets(toSignal);
+        remaining = [...alive, ...newlyAttributed];
+        if (remaining.length === 0 && (platform === "win32" || !launch.processGroup || !isPosixGroupAlive())) {
+          return { verified: true, method: "process-identity", remaining: [] };
+        }
+      } while (Date.now() < deadline);
+      return { verified: false, method: "process-identity", remaining: remaining.map(toObservedProcess) };
+    }
+    if (!launchHasIdentity(matchLaunch, platform)) {
+      return { verified: false, method: "process-identity", remaining: [] };
+    }
+    if (platform !== "win32") {
+      return { verified: launch.processGroup, method: "process-identity", remaining: [] };
+    }
+    const rootCreatedAt = parseNumericStart(root.start);
+    if (rootCreatedAt === void 0) {
+      return { verified: false, method: "process-identity", remaining: [] };
+    }
+    const leftovers = windowsLeftovers(initial, pid, launch.spawnedAt - 2e3, rootCreatedAt);
+    return {
+      verified: leftovers.length === 0,
+      method: "process-identity",
+      remaining: leftovers.map(toObservedProcess)
+    };
+  }
+  if (platform === "win32") {
+    const leftovers = windowsLeftovers(initial, pid, launch.spawnedAt - 2e3);
+    return {
+      verified: leftovers.length === 0,
+      method: "process-identity",
+      remaining: leftovers.map(toObservedProcess)
+    };
+  }
+  if (!launch.processGroup || !isPosixGroupAlive()) {
+    return { verified: true, method: "process-identity", remaining: [] };
+  }
+  return { verified: false, method: "process-identity", remaining: [] };
 }
 
 // dist/src/stream-parser.js
@@ -39191,16 +39462,68 @@ function explicitNonEmptyString(value) {
   return typeof value === "string" && value.trim() ? value.trim() : void 0;
 }
 var AGY_ADAPTER_VERSION = "1";
+function unconfirmedIdentityCleanup() {
+  return { verified: false, method: "process-identity", remaining: [] };
+}
+async function confirmCleanupByIdentity(launch, options) {
+  const now = options?.now ?? Date.now;
+  const deadlineAt = options?.deadlineAt;
+  if (deadlineAt === void 0 || !Number.isFinite(deadlineAt) || deadlineAt - now() < PROCESS_LISTING_TIMEOUT_MS + 1e3) {
+    return unconfirmedIdentityCleanup();
+  }
+  const controller = new AbortController();
+  const abortDelayMs = Math.min(2147483647, Math.max(0, deadlineAt - 500 - now()));
+  const abortTimer = setTimeout(() => {
+    controller.abort();
+  }, abortDelayMs);
+  abortTimer.unref();
+  let onAbortPromise;
+  const abortPromise = new Promise((resolve2) => {
+    if (controller.signal.aborted) {
+      resolve2(unconfirmedIdentityCleanup());
+      return;
+    }
+    onAbortPromise = () => resolve2(unconfirmedIdentityCleanup());
+    controller.signal.addEventListener("abort", onAbortPromise, { once: true });
+  });
+  const baseList = options?.list;
+  const graceMs = Math.max(0, Math.min(options?.graceMs ?? 3e3, deadlineAt - 1e3 - now()));
+  try {
+    const cleanup = await Promise.race([
+      reconcileLaunchIdentity(launch, {
+        graceMs,
+        ...options?.platform !== void 0 ? { platform: options.platform } : {},
+        list: async () => {
+          if (controller.signal.aborted) {
+            throw new Error("Process listing aborted");
+          }
+          return baseList ? await baseList(controller.signal) : await listProcessIdentities({ signal: controller.signal });
+        }
+      }).catch(unconfirmedIdentityCleanup),
+      abortPromise
+    ]);
+    return controller.signal.aborted ? unconfirmedIdentityCleanup() : cleanup;
+  } finally {
+    clearTimeout(abortTimer);
+    if (onAbortPromise) {
+      controller.signal.removeEventListener("abort", onAbortPromise);
+    }
+  }
+}
 var AgyExecutionAdapter = class {
   cli;
   config;
   explicitCapabilities;
+  options;
   identity = { id: "agy", provider: "agy", version: AGY_ADAPTER_VERSION };
+  // Measured: agy's terminal sandbox fails inside bwrap --unshare-pid on the reference host, so agy is tracked rather than contained.
+  processContainment = "tracked";
   observedDiscovery;
-  constructor(cli, config2, explicitCapabilities) {
+  constructor(cli, config2, explicitCapabilities, options) {
     this.cli = cli;
     this.config = config2;
     this.explicitCapabilities = explicitCapabilities;
+    this.options = options;
   }
   get capabilities() {
     if (this.explicitCapabilities)
@@ -39303,6 +39626,7 @@ var AgyExecutionAdapter = class {
       return { taskId: request.taskId, status: "failed", error: toResultError(error62) };
     }
     const spawnedPid = child.pid;
+    const spawnedStart = typeof spawnedPid === "number" ? recordedProcessStart(spawnedPid) : void 0;
     let standaloneTermination;
     let standaloneTimer;
     const onAbort = () => terminateSubprocess(child);
@@ -39488,6 +39812,7 @@ var AgyExecutionAdapter = class {
     child.on("error", onStreamError);
     let exitCode = null;
     let processCleanup;
+    let standaloneDeadlineAt;
     try {
       safeInvoke(() => hooks?.onProcessStarted?.(spawnedPid, Boolean(hooks.repair)));
       if (hookFailure === void 0) {
@@ -39498,6 +39823,7 @@ var AgyExecutionAdapter = class {
             hooks.signal.addEventListener("abort", onAbort, { once: true });
         } else {
           const timeoutSeconds = options.timeoutSeconds ?? this.config.defaultTimeoutSeconds;
+          standaloneDeadlineAt = spawnedAt + timeoutSeconds * 1e3;
           standaloneTimer = setTimeout(() => {
             standaloneTermination = "timeout";
             terminateSubprocess(child);
@@ -39507,23 +39833,52 @@ var AgyExecutionAdapter = class {
       }
       exitCode = await closePromise;
       if (child.pid !== void 0) {
-        const cleanup = await reconcileOwnedProcesses({
+        const listObserved = process.platform === "win32" && this.options?.listProcesses ? async () => {
+          const identities = await this.options.listProcesses();
+          return identities.map((identity) => ({
+            pid: identity.pid,
+            parentPid: identity.parentPid,
+            createdAt: Number(identity.start)
+          }));
+        } : void 0;
+        let cleanup = await reconcileOwnedProcesses({
           pid: child.pid,
           spawnedAt,
           processGroup: isOwnedProcessGroup(child)
-        });
+        }, listObserved ? { list: listObserved } : void 0);
+        let confirmedLater = false;
+        const terminating = Boolean(this.terminationFromSignal(hooks) ?? standaloneTermination);
+        const deadlineAt = hooks?.signal ? hooks.deadlineAt?.() : standaloneDeadlineAt;
+        if (!terminating && !cleanup.verified && cleanup.remaining.length === 0) {
+          const later = await confirmCleanupByIdentity({
+            pid: child.pid,
+            start: spawnedStart,
+            spawnedAt,
+            processGroup: isOwnedProcessGroup(child)
+          }, {
+            list: this.options?.listProcesses,
+            deadlineAt
+          });
+          if (later.verified) {
+            cleanup = later;
+            confirmedLater = true;
+          }
+        }
         processCleanup = {
           verified: cleanup.verified,
           spawnedAt: new Date(spawnedAt).toISOString(),
           checkedAt: (/* @__PURE__ */ new Date()).toISOString(),
-          remaining: cleanup.remaining.length
+          remaining: cleanup.remaining.length,
+          containment: this.processContainment,
+          ...spawnedStart ? { start: spawnedStart } : {}
         };
         safeInvoke(() => {
           hooks?.onProcessCleanup?.(processCleanup);
           hooks?.onEvent?.("process.cleanup", {
             verified: cleanup.verified,
             method: cleanup.method,
-            remaining: cleanup.remaining.length
+            remaining: cleanup.remaining.length,
+            ...confirmedLater ? { confirmedLater: true } : {}
           });
         });
       }
@@ -44770,6 +45125,9 @@ var OpenCodeExecutionAdapter = class {
     provider: "opencode",
     version: OPENCODE_ADAPTER_VERSION
   };
+  // Launches inside the PID namespace report 'contained' per launch, while launches without it stay 'none'
+  // because the server child started with setsid escapes identity tracking.
+  processContainment = "none";
   capabilities = Object.freeze({
     read: "supported",
     write: "supported",
@@ -45611,9 +45969,10 @@ var OpenCodeExecutionAdapter = class {
     }
     let startHookError;
     let hasStartHookError = false;
-    if (child.pid !== void 0 && context?.onProcessStarted) {
+    if (child.pid !== void 0 && (context?.onProcessLaunch || context?.onProcessStarted)) {
       try {
-        context.onProcessStarted(child.pid);
+        context?.onProcessLaunch?.({ containment: usePidNamespace ? "contained" : "none" });
+        context.onProcessStarted?.(child.pid);
       } catch (error62) {
         startHookError = error62;
         hasStartHookError = true;
@@ -45714,7 +46073,8 @@ var OpenCodeExecutionAdapter = class {
       verified: cleanupVerified,
       spawnedAt: new Date(spawnedAt).toISOString(),
       checkedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      remaining: cleanupRemaining
+      remaining: cleanupRemaining,
+      containment: usePidNamespace ? "contained" : "none"
     };
     try {
       context?.onProcessCleanup?.(processCleanup);
@@ -56043,7 +56403,7 @@ var taskRecordSchema = external_exports.object({
   agentPolicyReceipt: external_exports.object({ sha256: hash2, decisionCount: count, deniedCount: count, deniedReadCount: count.optional() }).strict().optional(),
   deniedReads: deniedReadsSchema2.optional(),
   toolErrors: deniedReadsSchema2.optional(),
-  processCleanup: external_exports.object({ verified: external_exports.boolean(), spawnedAt: timestamp, checkedAt: timestamp, remaining: count }).strict().optional(),
+  processCleanup: external_exports.object({ verified: external_exports.boolean(), spawnedAt: timestamp, checkedAt: timestamp, remaining: count, containment: external_exports.enum(["contained", "tracked", "none"]).optional(), start: external_exports.string().min(1).max(64).optional() }).strict().optional(),
   craft: external_exports.object({ revision: external_exports.string(), manifestSha256: hash2, permanent: external_exports.array(external_exports.string()), catalog: external_exports.array(external_exports.string()) }).strict().optional(),
   craftLoad: external_exports.object({
     delivered: external_exports.array(external_exports.object({ name: external_exports.string(), sha256: hash2 }).strict()),
@@ -60718,11 +61078,13 @@ var TaskManager = class {
           } catch {
             return false;
           }
-          if (marker && marker.entries.length > 0) {
-            if (marker.entries.some((entry2) => entry2.provider !== "agy"))
+          if (marker && marker.entries.some((entry2) => this.entryContainment(entry2) !== "tracked")) {
+            return false;
+          }
+          for (const candidate of this.tasks.values()) {
+            if (candidate.project?.copyDirectory === project.copyDirectory && this.recordBlocksCleanup(candidate.record)) {
               return false;
-            if (this.copyHasOpenCodeTask(project.copyDirectory))
-              return false;
+            }
           }
         }
         this.failPendingInbox(project.copyDirectory, task2, "cancelled", "COPY_DISCARDED");
@@ -60840,13 +61202,17 @@ var TaskManager = class {
       }
     });
   }
-  copyHasOpenCodeTask(copyDirectory) {
-    for (const candidate of this.tasks.values()) {
-      if (candidate.project?.copyDirectory === copyDirectory && candidate.record.execution?.provider === "opencode") {
-        return true;
-      }
-    }
-    return false;
+  declaredContainment(provider) {
+    return declaredProcessContainment(provider ? this.executors.get(provider)?.adapter : void 0);
+  }
+  entryContainment(entry2) {
+    return entry2.containment ?? this.declaredContainment(entry2.provider);
+  }
+  recordContainment(record2) {
+    return record2.processCleanup?.containment ?? this.declaredContainment(record2.execution?.provider ?? this.executor.identity.provider);
+  }
+  recordBlocksCleanup(record2) {
+    return Boolean(record2.processCleanup && !record2.processCleanup.verified && this.recordContainment(record2) !== "tracked");
   }
   hasUnverifiedCleanup(task2) {
     if (!task2.project || task2.record.discardedAt)
@@ -60857,12 +61223,15 @@ var TaskManager = class {
     } catch {
       return true;
     }
-    if (marker?.entries.some((entry2) => entry2.provider !== "agy"))
+    if (marker?.entries.some((entry2) => this.entryContainment(entry2) !== "tracked"))
       return true;
-    const copyHasOpenCode = this.copyHasOpenCodeTask(task2.project.copyDirectory);
-    if (!copyHasOpenCode)
-      return false;
-    return Boolean(task2.record.processCleanup && !task2.record.processCleanup.verified || marker?.entries.length);
+    const copyDirectory = task2.project.copyDirectory;
+    for (const candidate of this.tasks.values()) {
+      if (candidate.project?.copyDirectory === copyDirectory && this.recordBlocksCleanup(candidate.record)) {
+        return true;
+      }
+    }
+    return false;
   }
   retentionLimitError(unverifiedCandidate) {
     if (unverifiedCandidate) {
@@ -61864,7 +62233,9 @@ var TaskManager = class {
       controller.abort(task2.termination);
     let spawnedPid;
     let agyLaunchId;
+    let agyLaunch;
     let stepTimer;
+    let stepDeadlineAt;
     let hookResultSeen = false;
     const executor = this.taskExecutor(record2);
     const isAgyExecutor = executor instanceof AgyExecutionAdapter;
@@ -61881,10 +62252,12 @@ var TaskManager = class {
     };
     const startStepTimer = () => {
       if (!task2.timer) {
+        const timeoutMs = (options.timeoutSeconds ?? this.config.defaultTimeoutSeconds) * 1e3;
+        stepDeadlineAt = Date.now() + timeoutMs;
         stepTimer = setTimeout(() => {
           task2.termination ??= "timeout";
           controller.abort("timeout");
-        }, (options.timeoutSeconds ?? this.config.defaultTimeoutSeconds) * 1e3);
+        }, timeoutMs);
         stepTimer.unref();
         task2.timer = stepTimer;
       }
@@ -61904,25 +62277,40 @@ var TaskManager = class {
           runOptions: options,
           spawnWorkingDirectory: project.copyDirectory,
           signal: controller.signal,
+          deadlineAt: () => stepDeadlineAt,
           getTerminationReason: () => task2.termination,
           repair: config2.repair,
           onProcessStarted: (pid, isRepair) => {
             spawnedPid = pid;
             agyLaunchId = randomUUID15();
+            const start = typeof pid === "number" ? recordedProcessStart(pid) : void 0;
+            agyLaunch = {
+              containment: declaredProcessContainment(executor),
+              ...start ? { start } : {}
+            };
             record2.pid = pid;
             record2.status = "running";
             this.events.append(record2.taskId, "process.started", isRepair ? { pid, repair: true } : { pid });
             startStepTimer();
           },
           onProcessCleanup: (cleanup) => {
-            record2.processCleanup = cleanup;
-            if (!cleanup.verified) {
+            const containment = cleanup.containment ?? agyLaunch?.containment ?? declaredProcessContainment(executor);
+            const start = cleanup.start ?? agyLaunch?.start;
+            const mergedCleanup = {
+              ...cleanup,
+              containment,
+              ...start ? { start } : {}
+            };
+            record2.processCleanup = mergedCleanup;
+            if (!mergedCleanup.verified) {
               upsertProcessCleanupMarkerEntrySync(project, {
                 launchId: agyLaunchId ?? randomUUID15(),
                 taskId: record2.taskId,
-                provider: "agy",
+                provider: executor.identity.provider,
                 ...typeof spawnedPid === "number" ? { pid: spawnedPid } : {},
-                spawnedAt: cleanup.spawnedAt
+                spawnedAt: mergedCleanup.spawnedAt,
+                containment,
+                ...start ? { start } : {}
               });
             }
           },
@@ -62086,17 +62474,33 @@ var TaskManager = class {
     if (isCapabilitySupported(adapter.capabilities, "cancel")) {
       let processStartedAtMs;
       let currentLaunch;
+      let pendingLaunch;
       let fallbackSettled = false;
       const execPromise2 = Promise.resolve().then(() => adapter.execute(request, {
         signal,
+        onProcessLaunch: (launch) => {
+          if (fallbackSettled)
+            return;
+          pendingLaunch = launch;
+        },
         onProcessStarted: (pid) => {
           if (fallbackSettled)
             return;
+          const launch = pendingLaunch;
+          pendingLaunch = void 0;
           const nowMs = Date.now();
           processStartedAtMs = nowMs;
           const nowIso = new Date(nowMs).toISOString();
           const launchId = randomUUID15();
-          currentLaunch = { launchId, pid, spawnedAt: nowIso };
+          const containment = launch?.containment ?? declaredProcessContainment(adapter);
+          const start = launch?.start ?? (typeof pid === "number" ? recordedProcessStart(pid) : void 0);
+          currentLaunch = {
+            launchId,
+            pid,
+            spawnedAt: nowIso,
+            containment,
+            ...start ? { start } : {}
+          };
           if (typeof pid === "number")
             task2.record.pid = pid;
           task2.record.status = "running";
@@ -62104,7 +62508,9 @@ var TaskManager = class {
             verified: false,
             spawnedAt: nowIso,
             checkedAt: nowIso,
-            remaining: 0
+            remaining: 0,
+            containment,
+            ...start ? { start } : {}
           };
           if (task2.project) {
             upsertProcessCleanupMarkerEntrySync(task2.project, {
@@ -62112,7 +62518,9 @@ var TaskManager = class {
               taskId: task2.record.taskId,
               provider: adapter.identity.provider,
               ...typeof pid === "number" ? { pid } : {},
-              spawnedAt: nowIso
+              spawnedAt: nowIso,
+              containment,
+              ...start ? { start } : {}
             });
           }
           this.events.append(task2.record.taskId, "process.started", { pid });
@@ -62121,9 +62529,16 @@ var TaskManager = class {
         onProcessCleanup: (cleanup) => {
           if (fallbackSettled)
             return;
-          task2.record.processCleanup = cleanup;
+          const containment = cleanup.containment ?? currentLaunch?.containment ?? declaredProcessContainment(adapter);
+          const start = cleanup.start ?? currentLaunch?.start;
+          const mergedCleanup = {
+            ...cleanup,
+            containment,
+            ...start ? { start } : {}
+          };
+          task2.record.processCleanup = mergedCleanup;
           if (task2.project) {
-            if (cleanup.verified) {
+            if (mergedCleanup.verified) {
               if (currentLaunch) {
                 removeProcessCleanupMarkerEntrySync(task2.project, currentLaunch.launchId);
               }
@@ -62131,7 +62546,9 @@ var TaskManager = class {
               const launch = currentLaunch ?? {
                 launchId: randomUUID15(),
                 pid: typeof task2.record.pid === "number" ? task2.record.pid : void 0,
-                spawnedAt: cleanup.spawnedAt
+                spawnedAt: mergedCleanup.spawnedAt,
+                containment,
+                ...start ? { start } : {}
               };
               currentLaunch = launch;
               upsertProcessCleanupMarkerEntrySync(task2.project, {
@@ -62139,13 +62556,15 @@ var TaskManager = class {
                 taskId: task2.record.taskId,
                 provider: adapter.identity.provider,
                 ...typeof launch.pid === "number" ? { pid: launch.pid } : {},
-                spawnedAt: cleanup.spawnedAt
+                spawnedAt: mergedCleanup.spawnedAt,
+                containment,
+                ...start ? { start } : {}
               });
             }
           }
           this.events.append(task2.record.taskId, "process.cleanup", {
-            verified: cleanup.verified,
-            remaining: cleanup.remaining
+            verified: mergedCleanup.verified,
+            remaining: mergedCleanup.remaining
           });
         }
       }));
@@ -62173,14 +62592,17 @@ var TaskManager = class {
             const launch = currentLaunch ?? {
               launchId: randomUUID15(),
               pid: void 0,
-              spawnedAt: new Date(processStartedAtMs ?? Date.now()).toISOString()
+              spawnedAt: new Date(processStartedAtMs ?? Date.now()).toISOString(),
+              containment: declaredProcessContainment(adapter)
             };
             currentLaunch = launch;
             task2.record.processCleanup = {
               verified: false,
               spawnedAt: launch.spawnedAt,
               checkedAt: nowIso,
-              remaining: 0
+              remaining: 0,
+              containment: launch.containment,
+              ...launch.start ? { start: launch.start } : {}
             };
             if (task2.project) {
               upsertProcessCleanupMarkerEntrySync(task2.project, {
@@ -62188,7 +62610,9 @@ var TaskManager = class {
                 taskId: task2.record.taskId,
                 provider: adapter.identity.provider,
                 ...typeof launch.pid === "number" ? { pid: launch.pid } : {},
-                spawnedAt: launch.spawnedAt
+                spawnedAt: launch.spawnedAt,
+                containment: launch.containment,
+                ...launch.start ? { start: launch.start } : {}
               });
             }
             this.events.append(task2.record.taskId, "process.cleanup", {
@@ -62474,28 +62898,29 @@ var TaskManager = class {
     const unique = [...new Set(taskIds)];
     return new BridgeError("PROCESS_CLEANUP_UNVERIFIED", `Processes started by task ${unique.join(", ")} may still be running; discard the task (black_gravity_discard) to release this copy`);
   }
-  assertNoLegacyOpenCodeUnverified(copyDirectory) {
-    const legacyTaskIds = [];
+  assertNoUnconfirmedUntrackedLaunch(copyDirectory) {
+    const blockingTaskIds = [];
     for (const candidate of this.tasks.values()) {
-      if (candidate.project?.copyDirectory === copyDirectory && candidate.record.execution?.provider === "opencode" && candidate.record.processCleanup && !candidate.record.processCleanup.verified) {
-        legacyTaskIds.push(candidate.record.taskId);
+      if (candidate.project?.copyDirectory === copyDirectory && this.recordBlocksCleanup(candidate.record)) {
+        blockingTaskIds.push(candidate.record.taskId);
       }
     }
-    if (legacyTaskIds.length > 0) {
-      throw this.unverifiedCleanupError(legacyTaskIds);
+    if (blockingTaskIds.length > 0) {
+      throw this.unverifiedCleanupError(blockingTaskIds);
     }
   }
-  async reconcileAndRemoveAgyCleanupEntries(project, marker) {
-    const nonAgyEntries = marker.entries.filter((entry2) => entry2.provider !== "agy");
-    if (nonAgyEntries.length > 0) {
-      throw this.unverifiedCleanupError(nonAgyEntries.map((entry2) => entry2.taskId));
+  async reconcileAndRemoveTrackedCleanupEntries(project, marker) {
+    const untrackedEntries = marker.entries.filter((entry2) => this.entryContainment(entry2) !== "tracked");
+    if (untrackedEntries.length > 0) {
+      throw this.unverifiedCleanupError(untrackedEntries.map((entry2) => entry2.taskId));
     }
     const reconciledLaunchIds = [];
     const reconciledTaskIds = /* @__PURE__ */ new Set();
     const failedTaskIds = [];
     for (const entry2 of marker.entries) {
-      const retry = await reconcileOwnedProcesses({
+      const retry = await reconcileLaunchIdentity({
         pid: entry2.pid,
+        start: entry2.start,
         spawnedAt: Date.parse(entry2.spawnedAt),
         processGroup: process.platform !== "win32"
       });
@@ -62523,20 +62948,20 @@ var TaskManager = class {
     if (this.hasQuarantinedCopySibling(project)) {
       throw new BridgeError("TASK_NOT_READY", "Another snapshot of this copy is quarantined");
     }
-    this.assertNoLegacyOpenCodeUnverified(project.copyDirectory);
+    this.assertNoUnconfirmedUntrackedLaunch(project.copyDirectory);
     const marker = readProcessCleanupMarkerSync(project);
     if (!marker || marker.entries.length === 0)
       return;
-    const nonAgyEntries = marker.entries.filter((entry2) => entry2.provider !== "agy");
-    if (nonAgyEntries.length > 0) {
-      throw this.unverifiedCleanupError(nonAgyEntries.map((entry2) => entry2.taskId));
+    const untrackedEntries = marker.entries.filter((entry2) => this.entryContainment(entry2) !== "tracked");
+    if (untrackedEntries.length > 0) {
+      throw this.unverifiedCleanupError(untrackedEntries.map((entry2) => entry2.taskId));
     }
     const hasNonTerminal = [...this.tasks.values()].some((task2) => task2.project?.copyDirectory === project.copyDirectory && task2.record.taskId !== options?.excludeTaskId && !terminal3.has(task2.record.status));
     if (!options?.lockHeld && this.busyProjects.has(project) || hasNonTerminal) {
       throw new BridgeError("TASK_NOT_READY", "Wait for all operations on this copy to finish");
     }
     if (options?.lockHeld) {
-      await this.reconcileAndRemoveAgyCleanupEntries(project, marker);
+      await this.reconcileAndRemoveTrackedCleanupEntries(project, marker);
       return;
     }
     this.busyProjects.add(project);
@@ -62546,7 +62971,7 @@ var TaskManager = class {
       const freshMarker = readProcessCleanupMarkerSync(project);
       if (!freshMarker || freshMarker.entries.length === 0)
         return;
-      await this.reconcileAndRemoveAgyCleanupEntries(project, freshMarker);
+      await this.reconcileAndRemoveTrackedCleanupEntries(project, freshMarker);
     } finally {
       release?.();
       this.busyProjects.delete(project);
@@ -62558,16 +62983,21 @@ var TaskManager = class {
     if (existing?.project) {
       await this.assertCopyCleanupConfirmed(existing.project);
     } else if (record2.copyDirectory) {
-      this.assertNoLegacyOpenCodeUnverified(record2.copyDirectory);
+      this.assertNoUnconfirmedUntrackedLaunch(record2.copyDirectory);
     }
     const cleanup = record2.processCleanup;
     if (!cleanup)
       return;
     if (!cleanup.verified) {
-      if (record2.execution?.provider === "opencode") {
+      if (this.recordContainment(record2) !== "tracked") {
         throw this.unverifiedCleanupError([record2.taskId]);
       }
-      const retry = await reconcileOwnedProcesses({ pid: record2.pid, spawnedAt: Date.parse(cleanup.spawnedAt), processGroup: process.platform !== "win32" });
+      const retry = await reconcileLaunchIdentity({
+        pid: record2.pid,
+        start: cleanup.start,
+        spawnedAt: Date.parse(cleanup.spawnedAt),
+        processGroup: process.platform !== "win32"
+      });
       record2.processCleanup = { ...cleanup, verified: retry.verified, checkedAt: (/* @__PURE__ */ new Date()).toISOString(), remaining: retry.remaining.length };
       if (!retry.verified)
         throw this.unverifiedCleanupError([record2.taskId]);

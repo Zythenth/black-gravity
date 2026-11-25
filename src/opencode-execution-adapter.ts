@@ -25,6 +25,7 @@ import {
   type ExecutionModel,
   type ExecutionRequest,
   type ExecutionResult,
+  type ProcessContainment,
 } from './execution-contract.js';
 import { detectBubblewrap, resolveTrustedBwrap } from './linux-executor.js';
 import {
@@ -562,6 +563,10 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
     provider: 'opencode',
     version: OPENCODE_ADAPTER_VERSION,
   };
+
+  // Launches inside the PID namespace report 'contained' per launch, while launches without it stay 'none'
+  // because the server child started with setsid escapes identity tracking.
+  readonly processContainment: ProcessContainment = 'none';
 
   readonly capabilities: ExecutionCapabilities = Object.freeze({
     read: 'supported',
@@ -1518,9 +1523,10 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
 
     let startHookError: unknown;
     let hasStartHookError = false;
-    if (child.pid !== undefined && context?.onProcessStarted) {
+    if (child.pid !== undefined && (context?.onProcessLaunch || context?.onProcessStarted)) {
       try {
-        context.onProcessStarted(child.pid);
+        context?.onProcessLaunch?.({ containment: usePidNamespace ? 'contained' : 'none' });
+        context.onProcessStarted?.(child.pid);
       } catch (error) {
         startHookError = error;
         hasStartHookError = true;
@@ -1634,6 +1640,7 @@ export class OpenCodeExecutionAdapter implements ExecutionAdapter {
       spawnedAt: new Date(spawnedAt).toISOString(),
       checkedAt: new Date().toISOString(),
       remaining: cleanupRemaining,
+      containment: usePidNamespace ? 'contained' : 'none',
     };
     try {
       context?.onProcessCleanup?.(processCleanup);

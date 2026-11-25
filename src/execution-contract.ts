@@ -8,6 +8,13 @@ export type ExecutionCapability =
   | 'structuredOutput' | 'cancel' | 'resume' | 'observableUsage' | 'modelList';
 export type ExecutionCapabilities = Readonly<Partial<Record<ExecutionCapability, CapabilitySupport>>>;
 
+// contained: the kernel proves every process of the launch ended (PID namespace).
+// tracked: every process of the executor stays within reach of identity reconciliation (PID plus start time).
+// none: the executor may leave processes outside tracking, or records no identity.
+export type ProcessContainment = 'contained' | 'tracked' | 'none';
+export const PROCESS_CONTAINMENT_LEVELS: readonly ProcessContainment[] = ['contained', 'tracked', 'none'];
+export interface ProcessLaunch { readonly containment: ProcessContainment; readonly start?: string }
+
 export function isCapabilitySupported(capabilities: ExecutionCapabilities, key: ExecutionCapability): boolean {
   return Object.hasOwn(capabilities, key) && capabilities[key] === 'supported';
 }
@@ -69,6 +76,8 @@ export interface ExecutionModel {
 
 export interface ExecutionContext {
   readonly signal?: AbortSignal;
+  // Adapters call it right before onProcessStarted to report the containment level (and start identity when known) of that launch.
+  readonly onProcessLaunch?: (launch: ProcessLaunch) => void;
   readonly onProcessStarted?: (pid: number | undefined) => void;
   readonly onProcessCleanup?: (cleanup: NonNullable<TaskRecord['processCleanup']>) => void;
 }
@@ -76,12 +85,17 @@ export interface ExecutionContext {
 export interface ExecutionAdapter {
   readonly identity: ExecutionAdapterIdentity;
   readonly capabilities: ExecutionCapabilities;
+  readonly processContainment?: ProcessContainment;
   execute(request: ExecutionRequest, context?: ExecutionContext): Promise<ExecutionResult>;
   // Declares the model-listing capability for the new-model notice.
   listModels?(): Promise<readonly ExecutionModel[]>;
   // Checks synchronously whether the executor is locally available without starting a process.
   availability?(): { available: true } | { available: false; reason: string };
   version?(): Promise<string>;
+}
+
+export function declaredProcessContainment(adapter: Pick<ExecutionAdapter, 'processContainment'> | undefined): ProcessContainment {
+  return adapter?.processContainment ?? 'none';
 }
 
 // This checks advertised support only. It grants no permissions and does not validate provider output.

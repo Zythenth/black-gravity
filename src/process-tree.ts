@@ -17,12 +17,34 @@ export interface ProcessIdentity {
 
 export interface ProcessCleanup {
   verified: boolean;
-  method: 'process-group' | 'windows-snapshot' | 'process-tree';
+  method: 'process-group' | 'windows-snapshot' | 'process-tree' | 'process-identity';
   remaining: ObservedProcess[];
 }
 
-function runBoundedCommand(executable: string, args: readonly string[]): Promise<string> {
+export interface RecordedLaunch {
+  pid?: number;
+  start?: string;
+  spawnedAt: number;
+  processGroup: boolean;
+}
+
+export const PROCESS_LISTING_TIMEOUT_MS = 15_000;
+
+function abortListingError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new Error('Process listing aborted');
+}
+
+function runBoundedCommand(
+  executable: string,
+  args: readonly string[],
+  signal?: AbortSignal,
+): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(abortListingError(signal));
+      return;
+    }
+
     let child: ChildProcess;
     try {
       child = spawn(executable, [...args], {
@@ -38,16 +60,23 @@ function runBoundedCommand(executable: string, args: readonly string[]): Promise
     let settled = false;
     const timer = setTimeout(() => {
       fail(new Error('Process listing timed out after 15s'));
-    }, 15000);
+    }, PROCESS_LISTING_TIMEOUT_MS);
     timer.unref();
+
+    const onAbort = () => {
+      fail(abortListingError(signal!));
+    };
 
     function fail(err: Error): void {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       try { child.kill(); } catch { /* ignore */ }
       reject(err);
     }
+
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     const chunks: Buffer[] = [];
     let totalBytes = 0;
@@ -74,6 +103,7 @@ function runBoundedCommand(executable: string, args: readonly string[]): Promise
 
     child.on('close', (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       if (settled) return;
       settled = true;
       if (code !== 0) {
@@ -85,12 +115,12 @@ function runBoundedCommand(executable: string, args: readonly string[]): Promise
   });
 }
 
-export async function listWindowsProcesses(): Promise<ObservedProcess[]> {
+export async function listWindowsProcesses(options?: { signal?: AbortSignal }): Promise<ObservedProcess[]> {
   const systemRoot = process.env.SystemRoot || 'C:\\Windows';
   const powershell = path.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
   const script = 'Get-CimInstance Win32_Process | ForEach-Object { if ($_.CreationDate) { "$($_.ProcessId) $($_.ParentProcessId) $($_.CreationDate.ToFileTimeUtc())" } }';
 
-  const output = await runBoundedCommand(powershell, ['-NoProfile', '-NonInteractive', '-Command', script]);
+  const output = await runBoundedCommand(powershell, ['-NoProfile', '-NonInteractive', '-Command', script], options?.signal);
   const lines = output.split(/\r?\n/);
   const processes: ObservedProcess[] = [];
   for (const line of lines) {
@@ -153,6 +183,54 @@ export function countPidNamespaceMembers(link: string): number {
   return count;
 }
 
+const BOOT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const LINUX_START_RE = /^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}):(\d+)$/;
+// Recorded on Linux when the boot id cannot be read, deliberately outside `<boot_id>:<ticks>` so reconciliation treats the launch as unconfirmed without signalling.
+export const BOOT_UNAVAILABLE_START = 'boot-unavailable';
+
+export function readBootId(): string | undefined {
+  try {
+    const boot = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+    return BOOT_ID_RE.test(boot) ? boot : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function readProcessStart(pid: number, platform: NodeJS.Platform = process.platform): string | undefined {
+  if (platform !== 'linux') return undefined;
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  try {
+    return parseLinuxProcStat(readFileSync(`/proc/${pid}/stat`, 'utf8'))?.start;
+  } catch {
+    return undefined;
+  }
+}
+
+export function recordedProcessStart(
+  pid: number,
+  platform: NodeJS.Platform = process.platform,
+  bootId: () => string | undefined = readBootId,
+): string | undefined {
+  if (platform !== 'linux') return undefined;
+  const boot = bootId();
+  if (!boot) return BOOT_UNAVAILABLE_START;
+  const ticks = readProcessStart(pid, platform);
+  return ticks !== undefined ? `${boot}:${ticks}` : undefined;
+}
+
+export function launchHasIdentity(launch: RecordedLaunch, _platform: NodeJS.Platform = process.platform): boolean {
+  return typeof launch.start === 'string' && launch.start.length > 0;
+}
+
+export function launchIdentityMatches(
+  current: ProcessIdentity,
+  launch: RecordedLaunch,
+  _platform: NodeJS.Platform = process.platform,
+): boolean {
+  return typeof launch.start === 'string' && launch.start.length > 0 && current.start === launch.start;
+}
+
 export function verifyProcessIdentity(identity: ProcessIdentity): boolean {
   if (process.platform !== 'linux') return true;
   if (!Number.isInteger(identity.pid) || identity.pid <= 1) return false;
@@ -165,10 +243,10 @@ export function verifyProcessIdentity(identity: ProcessIdentity): boolean {
   }
 }
 
-export function startOrder(identity: ProcessIdentity): number {
+export function startOrder(identity: ProcessIdentity, platform: NodeJS.Platform = process.platform): number {
   const trimmed = identity.start.trim();
   if (!trimmed) return Number.NaN;
-  if (process.platform === 'linux' || process.platform === 'win32') {
+  if (platform === 'linux' || platform === 'win32') {
     const value = Number(trimmed);
     return Number.isFinite(value) ? value : Number.NaN;
   }
@@ -176,16 +254,22 @@ export function startOrder(identity: ProcessIdentity): number {
   return Number.isFinite(parsed) ? parsed : Number.NaN;
 }
 
-export async function listProcessIdentities(): Promise<ProcessIdentity[]> {
+export async function listProcessIdentities(options?: { signal?: AbortSignal }): Promise<ProcessIdentity[]> {
   if (process.platform === 'win32') {
-    const processes = await listWindowsProcesses();
+    const processes = await listWindowsProcesses(options);
     return processes.map(p => ({ pid: p.pid, parentPid: p.parentPid, start: String(p.createdAt) }));
   }
 
   if (process.platform === 'linux') {
+    if (options?.signal?.aborted) {
+      throw abortListingError(options.signal);
+    }
     const entries = await readdir('/proc');
     const identities: ProcessIdentity[] = [];
     for (const entry of entries) {
+      if (options?.signal?.aborted) {
+        throw abortListingError(options.signal);
+      }
       if (!/^\d+$/.test(entry)) continue;
       const pid = Number(entry);
       if (!Number.isInteger(pid) || pid <= 0) continue;
@@ -204,7 +288,7 @@ export async function listProcessIdentities(): Promise<ProcessIdentity[]> {
     return identities;
   }
 
-  const output = await runBoundedCommand('ps', ['-A', '-o', 'pid=', '-o', 'ppid=', '-o', 'lstart=']);
+  const output = await runBoundedCommand('ps', ['-A', '-o', 'pid=', '-o', 'ppid=', '-o', 'lstart='], options?.signal);
   const identities: ProcessIdentity[] = [];
   for (const line of output.split(/\r?\n/)) {
     const match = /^\s*(\d+)\s+(\d+)\s+(.+?)\s*$/.exec(line);
@@ -224,6 +308,7 @@ function collectDescendantEdges(
   list: readonly ProcessIdentity[],
   initialParents: readonly ProcessIdentity[],
   visitedPids: Set<number>,
+  platform: NodeJS.Platform = process.platform,
 ): ProcessIdentity[] {
   const descendants: ProcessIdentity[] = [];
   const queue: ProcessIdentity[] = [...initialParents];
@@ -231,11 +316,11 @@ function collectDescendantEdges(
   while (head < queue.length) {
     const parent = queue[head++];
     if (!parent) break;
-    const parentOrder = startOrder(parent);
+    const parentOrder = startOrder(parent, platform);
     if (!Number.isFinite(parentOrder)) continue;
     for (const proc of list) {
       if (proc.parentPid === parent.pid && !visitedPids.has(proc.pid)) {
-        const childOrder = startOrder(proc);
+        const childOrder = startOrder(proc, platform);
         if (!Number.isFinite(childOrder) || childOrder < parentOrder) continue;
         visitedPids.add(proc.pid);
         descendants.push(proc);
@@ -249,6 +334,7 @@ function collectDescendantEdges(
 export function expandMatchedTargets(
   list: readonly ProcessIdentity[],
   seeds: ReadonlyArray<{ pid: number; start?: string }>,
+  platform: NodeJS.Platform = process.platform,
 ): ProcessIdentity[] {
   const matchedRoots: ProcessIdentity[] = [];
   const visitedPids = new Set<number>();
@@ -262,7 +348,7 @@ export function expandMatchedTargets(
     }
   }
 
-  return [...matchedRoots, ...collectDescendantEdges(list, matchedRoots, visitedPids)];
+  return [...matchedRoots, ...collectDescendantEdges(list, matchedRoots, visitedPids, platform)];
 }
 
 export function descendantIdentities(list: readonly ProcessIdentity[], rootPid: number): ProcessIdentity[] {
@@ -532,4 +618,253 @@ export async function reconcileTrackedProcesses(
   } while (Date.now() < deadline);
 
   return { verified: false, method: 'process-tree', remaining: remaining.map(toObservedProcess) };
+}
+
+function parseNumericStart(start: string): number | undefined {
+  const trimmed = start.trim();
+  if (!trimmed) return undefined;
+  const value = Number(trimmed);
+  return Number.isFinite(value) ? value : undefined;
+}
+
+function windowsLeftovers(
+  list: readonly ProcessIdentity[],
+  rootPid: number,
+  minCreatedAt: number,
+  maxCreatedAt?: number,
+): ProcessIdentity[] {
+  const seeds = list.filter(proc => {
+    if (proc.parentPid !== rootPid) return false;
+    const createdAt = parseNumericStart(proc.start);
+    if (createdAt === undefined || createdAt < minCreatedAt) return false;
+    return maxCreatedAt === undefined || createdAt < maxCreatedAt;
+  });
+  return expandMatchedTargets(list, seeds, 'win32');
+}
+
+/**
+ * Reconciles a recorded launch using process identity (PID plus start time) so reused PIDs are never signalled.
+ */
+export async function reconcileLaunchIdentity(
+  launch: RecordedLaunch,
+  options?: {
+    graceMs?: number;
+    platform?: NodeJS.Platform;
+    list?: () => Promise<ProcessIdentity[]>;
+    signal?: (target: number, signal: NodeJS.Signals | 0) => void;
+    killWindows?: (pid: number) => Promise<void>;
+    currentStart?: (pid: number) => string | undefined;
+    bootId?: () => string | undefined;
+  },
+): Promise<ProcessCleanup> {
+  const pid = launch.pid;
+  if (typeof pid !== 'number' || !Number.isInteger(pid) || pid <= 1) {
+    return { verified: false, method: 'process-identity', remaining: [] };
+  }
+
+  const graceMs = options?.graceMs ?? 3000;
+  const platform = options?.platform ?? process.platform;
+  const list = options?.list ?? listProcessIdentities;
+  const signal = options?.signal ?? ((target: number, sig: NodeJS.Signals | 0) => {
+    process.kill(target, sig);
+  });
+  const killWindows = options?.killWindows ?? killProcess;
+  const currentStart = options?.currentStart ?? ((targetPid: number) => readProcessStart(targetPid, platform));
+  const bootId = options?.bootId ?? readBootId;
+
+  if (platform !== 'linux' && !Number.isFinite(launch.spawnedAt)) {
+    return { verified: false, method: 'process-identity', remaining: [] };
+  }
+
+  let matchLaunch = launch;
+  if (platform === 'linux' && launch.start !== undefined) {
+    // Bare ticks repeat after reboot and BOOT_UNAVAILABLE_START marks an unreadable boot at recording time, so neither can be trusted across restarts;
+    // conversely, a different boot ID proves every process from that launch already ended.
+    const parsed = LINUX_START_RE.exec(launch.start);
+    if (!parsed) {
+      return { verified: false, method: 'process-identity', remaining: [] };
+    }
+    const currentBoot = bootId();
+    if (!currentBoot) {
+      return { verified: false, method: 'process-identity', remaining: [] };
+    }
+    if (parsed[1] !== currentBoot) {
+      return { verified: true, method: 'process-identity', remaining: [] };
+    }
+    matchLaunch = { ...launch, start: parsed[2] };
+  }
+
+  let initial: ProcessIdentity[];
+  try {
+    initial = await list();
+  } catch {
+    return { verified: false, method: 'process-identity', remaining: [] };
+  }
+
+  const isPosixGroupAlive = (): boolean => {
+    try {
+      signal(-pid, 0);
+      return true;
+    } catch (err: unknown) {
+      return (err as NodeJS.ErrnoException | undefined)?.code === 'EPERM';
+    }
+  };
+
+  const root = initial.find(proc => proc.pid === pid);
+
+  if (root) {
+    if (launchIdentityMatches(root, matchLaunch, platform)) {
+      const identityKey = (identity: ProcessIdentity): string => `${identity.pid}\0${identity.start}`;
+      const signalTarget = (target: ProcessIdentity): Promise<void> | void => {
+        if (target.pid <= 1 || currentStart(target.pid) !== target.start) {
+          return;
+        }
+        if (platform === 'win32') {
+          return killWindows(target.pid);
+        }
+        try {
+          signal(target.pid, 'SIGKILL');
+        } catch {
+          // Ignore ESRCH or already terminated process.
+        }
+      };
+      const signalTargets = async (listToSignal: readonly ProcessIdentity[]): Promise<void> => {
+        for (const target of listToSignal) {
+          const pending = signalTarget(target);
+          if (pending) {
+            await pending;
+          }
+        }
+      };
+
+      const targets = expandMatchedTargets(initial, [{ pid, start: root.start }], platform);
+      if (platform !== 'win32' && matchLaunch.processGroup && currentStart(pid) === matchLaunch.start) {
+        try {
+          signal(-pid, 'SIGKILL');
+        } catch {
+          // Ignore ESRCH or permission errors.
+        }
+      }
+      await signalTargets(targets);
+
+      const known = new Map<string, ProcessIdentity>();
+      const confirmedKeys = new Set<string>();
+      for (const target of targets) {
+        const key = identityKey(target);
+        known.set(key, target);
+        confirmedKeys.add(key);
+      }
+
+      let remaining = targets;
+      const deadline = Date.now() + graceMs;
+      do {
+        if (graceMs > 0) {
+          const waitMs = Math.min(100, Math.max(1, deadline - Date.now()));
+          await sleep(waitMs);
+        }
+        let currentList: ProcessIdentity[];
+        try {
+          currentList = await list();
+        } catch {
+          return { verified: false, method: 'process-identity', remaining: remaining.map(toObservedProcess) };
+        }
+
+        const currentByKey = new Map<string, ProcessIdentity>();
+        for (const proc of currentList) {
+          currentByKey.set(identityKey(proc), proc);
+        }
+
+        const alive: ProcessIdentity[] = [];
+        const aliveKeys = new Set<string>();
+        for (const key of known.keys()) {
+          const current = currentByKey.get(key);
+          if (current) {
+            alive.push(current);
+            aliveKeys.add(key);
+          }
+        }
+
+        const queue: Array<{ parent: ProcessIdentity; signalable: boolean }> = [];
+        for (const proc of alive) {
+          queue.push({ parent: proc, signalable: confirmedKeys.has(identityKey(proc)) });
+        }
+        if (platform === 'win32') {
+          for (const [key, identity] of known) {
+            if (!aliveKeys.has(key)) {
+              queue.push({ parent: identity, signalable: false });
+            }
+          }
+        }
+
+        const newlyAttributed: ProcessIdentity[] = [];
+        const toSignal: ProcessIdentity[] = [];
+        let head = 0;
+        while (head < queue.length) {
+          const entry = queue[head++];
+          if (!entry) break;
+          const parentOrder = startOrder(entry.parent, platform);
+          if (!Number.isFinite(parentOrder)) continue;
+          for (const proc of currentList) {
+            if (proc.parentPid !== entry.parent.pid) continue;
+            const key = identityKey(proc);
+            if (known.has(key)) continue;
+            const childOrder = startOrder(proc, platform);
+            if (!Number.isFinite(childOrder) || childOrder < parentOrder) continue;
+            known.set(key, proc);
+            if (entry.signalable) {
+              confirmedKeys.add(key);
+              toSignal.push(proc);
+            }
+            newlyAttributed.push(proc);
+            queue.push({ parent: proc, signalable: entry.signalable });
+          }
+        }
+
+        await signalTargets(toSignal);
+        remaining = [...alive, ...newlyAttributed];
+        if (remaining.length === 0 && (platform === 'win32' || !launch.processGroup || !isPosixGroupAlive())) {
+          return { verified: true, method: 'process-identity', remaining: [] };
+        }
+      } while (Date.now() < deadline);
+
+      return { verified: false, method: 'process-identity', remaining: remaining.map(toObservedProcess) };
+    }
+
+    if (!launchHasIdentity(matchLaunch, platform)) {
+      return { verified: false, method: 'process-identity', remaining: [] };
+    }
+
+    // Identity mismatch means the PID was reused; never signal the new process.
+    if (platform !== 'win32') {
+      return { verified: launch.processGroup, method: 'process-identity', remaining: [] };
+    }
+
+    const rootCreatedAt = parseNumericStart(root.start);
+    if (rootCreatedAt === undefined) {
+      return { verified: false, method: 'process-identity', remaining: [] };
+    }
+    const leftovers = windowsLeftovers(initial, pid, launch.spawnedAt - 2000, rootCreatedAt);
+    return {
+      verified: leftovers.length === 0,
+      method: 'process-identity',
+      remaining: leftovers.map(toObservedProcess),
+    };
+  }
+
+  // Root is absent from the process list.
+  if (platform === 'win32') {
+    const leftovers = windowsLeftovers(initial, pid, launch.spawnedAt - 2000);
+    return {
+      verified: leftovers.length === 0,
+      method: 'process-identity',
+      remaining: leftovers.map(toObservedProcess),
+    };
+  }
+
+  // A later process may have reused the PID, created its own group, and exited; unattributed group members stay unconfirmed.
+  if (!launch.processGroup || !isPosixGroupAlive()) {
+    return { verified: true, method: 'process-identity', remaining: [] };
+  }
+
+  return { verified: false, method: 'process-identity', remaining: [] };
 }

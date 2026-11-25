@@ -15,7 +15,7 @@ import type { SandboxSelection } from './sandbox-policy.js';
 import type { PortableNodeIdentity } from './portable-node.js';
 import type { ArtifactReference } from './artifacts.js';
 import type { AgentPolicySelection, ResolvedAgentPolicy } from './agent-policy.js';
-import type { ExecutionIdentity } from './execution-contract.js';
+import type { ExecutionIdentity, ProcessContainment } from './execution-contract.js';
 
 export type { ArtifactReference } from './artifacts.js';
 
@@ -97,7 +97,7 @@ export interface TaskRecord {
   agentPolicyReceipt?: { sha256: string; decisionCount: number; deniedCount: number; deniedReadCount?: number };
   deniedReads?: DeniedReads;
   toolErrors?: DeniedReads;
-  processCleanup?: { verified: boolean; spawnedAt: string; checkedAt: string; remaining: number };
+  processCleanup?: { verified: boolean; spawnedAt: string; checkedAt: string; remaining: number; containment?: ProcessContainment; start?: string };
   craft?: { revision: string; manifestSha256: string; permanent: string[]; catalog: string[] };
   craftLoad?: {
     delivered: Array<{ name: string; sha256: string }>;

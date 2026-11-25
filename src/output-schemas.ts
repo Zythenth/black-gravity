@@ -112,7 +112,7 @@ export const taskRecordSchema = z.object({
   agentPolicyReceipt: z.object({ sha256: hash, decisionCount: count, deniedCount: count, deniedReadCount: count.optional() }).strict().optional(),
   deniedReads: deniedReadsSchema.optional(),
   toolErrors: deniedReadsSchema.optional(),
-  processCleanup: z.object({ verified: z.boolean(), spawnedAt: timestamp, checkedAt: timestamp, remaining: count }).strict().optional(),
+  processCleanup: z.object({ verified: z.boolean(), spawnedAt: timestamp, checkedAt: timestamp, remaining: count, containment: z.enum(['contained', 'tracked', 'none']).optional(), start: z.string().min(1).max(64).optional() }).strict().optional(),
   craft: z.object({ revision: z.string(), manifestSha256: hash, permanent: z.array(z.string()), catalog: z.array(z.string()) }).strict().optional(),
   craftLoad: z.object({
     delivered: z.array(z.object({ name: z.string(), sha256: hash }).strict()),

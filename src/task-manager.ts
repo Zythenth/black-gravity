@@ -17,16 +17,16 @@ import { type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { appendMessage, deliveryModeSchema, extractAgentMessages, readMessages, resultReference, type DeliveryMode } from './messages.js';
 import { CliAdapter, handoffContext, taskPrompt, type Model } from './cli-adapter.js';
 import { AgyExecutionAdapter, MAX_DENIED_READS, type AgyExecutionHooks, type AgyExecutionResult } from './agy-execution-adapter.js';
-import { isCapabilitySupported, type ExecutionAdapter, type ExecutionAdapterIdentity, type ExecutionCapabilities, type ExecutionIdentity, type ExecutionRequest, type ExecutionResult } from './execution-contract.js';
+import { declaredProcessContainment, isCapabilitySupported, type ExecutionAdapter, type ExecutionAdapterIdentity, type ExecutionCapabilities, type ExecutionIdentity, type ExecutionRequest, type ExecutionResult, type ProcessContainment, type ProcessLaunch } from './execution-contract.js';
 import { terminateSubprocess, redactDiagnostic, redactionContextDigest, containsCredential } from './subprocess.js';
-import { reconcileOwnedProcesses } from './process-tree.js';
+import { reconcileLaunchIdentity, recordedProcessStart } from './process-tree.js';
 import { sanitizePayload } from './payload-safety.js';
 import { providedSkillsSchema, MAX_TOTAL_BUNDLES_BYTES, verifyProvidedSkills, type StagedSkill } from './skills.js';
 import { prepareCraft, mergePermanentSkills, verifyCraftSelection, craftStatus, assertPermanentDelivery, CRAFT_REQUIRED_MESSAGE, PERMANENT_SKILLS, type CraftStatus } from './craft.js';
 import { convertCrlfToLf, listCopyFiles, normalizeEditedLineEndings, planLineEndings, restoreByteOrderMarks, restoreCrlfLineEndings, type LineEndingStyle } from './line-endings.js';
 import { assertForbiddenDirectoriesUsable, assertSecretExclusionsUsable, assertAgyPathUsable, assertWindowsNodeCacheDirectoryUsable, assertAntiAiCraftDirectoryUsable, type Config, type ApprovalMode, type ConfigurationIssue, type ConfigurationIssueReason, type TestExecutor } from './config.js';
 import { EventStore } from './event-store.js';
-import { assertManagedCopyPresent, assertTextIsUtf8, createProjectCopy, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, forkProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, clearLineEndingConversions, readProcessCleanupMarkerSync, upsertProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntriesSync, type ChangePreview, type ProcessCleanupMarker, type ProjectCopy } from './isolation.js';
+import { assertManagedCopyPresent, assertTextIsUtf8, createProjectCopy, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, forkProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, clearLineEndingConversions, readProcessCleanupMarkerSync, upsertProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntriesSync, type ChangePreview, type ProcessCleanupMarker, type ProcessCleanupMarkerEntry, type ProjectCopy } from './isolation.js';
 import { assertNoAgentConfigInCopy, ensureAgentGuard } from './agent-config.js';
 import { BridgeError, type DeniedReads, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt, type TestEvidence } from './types.js';
 import { validatePrompt, validateRuntimeCacheSeparation, validateWorkingDirectory, validateStateSeparation } from './validation.js';
@@ -1610,11 +1610,16 @@ export class TaskManager {
           } catch {
             return false;
           }
-          if (marker && marker.entries.length > 0) {
-            if (marker.entries.some(entry => entry.provider !== 'agy')) return false;
-            if (this.copyHasOpenCodeTask(project.copyDirectory)) return false;
-            // Agy-only copies are discarded without process reconciliation or termination, as before OpenCode support, because a stale PID may have been reused by an unrelated process.
+          if (marker && marker.entries.some(entry => this.entryContainment(entry) !== 'tracked')) {
+            return false;
           }
+          for (const candidate of this.tasks.values()) {
+            if (candidate.project?.copyDirectory === project.copyDirectory && this.recordBlocksCleanup(candidate.record)) {
+              return false;
+            }
+          }
+          // Tracked entries alone do not block automatic discard and are never reconciled or signalled here,
+          // because an expired copy's stale PID may already have been reused by an unrelated process.
         }
         this.failPendingInbox(project.copyDirectory, task, 'cancelled', 'COPY_DISCARDED');
         await discardProjectCopy(project);
@@ -1714,13 +1719,20 @@ export class TaskManager {
     });
   }
 
-  private copyHasOpenCodeTask(copyDirectory: string): boolean {
-    for (const candidate of this.tasks.values()) {
-      if (candidate.project?.copyDirectory === copyDirectory && candidate.record.execution?.provider === 'opencode') {
-        return true;
-      }
-    }
-    return false;
+  private declaredContainment(provider: string | undefined): ProcessContainment {
+    return declaredProcessContainment(provider ? this.executors.get(provider)?.adapter : undefined);
+  }
+
+  private entryContainment(entry: ProcessCleanupMarkerEntry): ProcessContainment {
+    return entry.containment ?? this.declaredContainment(entry.provider);
+  }
+
+  private recordContainment(record: TaskRecord): ProcessContainment {
+    return record.processCleanup?.containment ?? this.declaredContainment(record.execution?.provider ?? this.executor.identity.provider);
+  }
+
+  private recordBlocksCleanup(record: TaskRecord): boolean {
+    return Boolean(record.processCleanup && !record.processCleanup.verified && this.recordContainment(record) !== 'tracked');
   }
 
   private hasUnverifiedCleanup(task: InternalTask): boolean {
@@ -1731,11 +1743,14 @@ export class TaskManager {
     } catch {
       return true;
     }
-    if (marker?.entries.some(entry => entry.provider !== 'agy')) return true;
-    const copyHasOpenCode = this.copyHasOpenCodeTask(task.project.copyDirectory);
-    // Agy-only copies keep the pre-OpenCode behaviour where unconfirmed cleanup does not block automatic discard.
-    if (!copyHasOpenCode) return false;
-    return Boolean((task.record.processCleanup && !task.record.processCleanup.verified) || marker?.entries.length);
+    if (marker?.entries.some(entry => this.entryContainment(entry) !== 'tracked')) return true;
+    const copyDirectory = task.project.copyDirectory;
+    for (const candidate of this.tasks.values()) {
+      if (candidate.project?.copyDirectory === copyDirectory && this.recordBlocksCleanup(candidate.record)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private retentionLimitError(unverifiedCandidate: InternalTask | undefined): BridgeError {
@@ -2572,7 +2587,9 @@ export class TaskManager {
     if (task.termination) controller.abort(task.termination);
     let spawnedPid: number | undefined;
     let agyLaunchId: string | undefined;
+    let agyLaunch: ProcessLaunch | undefined;
     let stepTimer: NodeJS.Timeout | undefined;
+    let stepDeadlineAt: number | undefined;
     let hookResultSeen = false;
     const executor = this.taskExecutor(record);
     const isAgyExecutor = executor instanceof AgyExecutionAdapter;
@@ -2591,10 +2608,12 @@ export class TaskManager {
     };
     const startStepTimer = () => {
       if (!task.timer) {
+        const timeoutMs = (options.timeoutSeconds ?? this.config.defaultTimeoutSeconds) * 1000;
+        stepDeadlineAt = Date.now() + timeoutMs;
         stepTimer = setTimeout(() => {
           task.termination ??= 'timeout';
           controller.abort('timeout');
-        }, (options.timeoutSeconds ?? this.config.defaultTimeoutSeconds) * 1000);
+        }, timeoutMs);
         stepTimer.unref();
         task.timer = stepTimer;
       }
@@ -2613,25 +2632,40 @@ export class TaskManager {
           runOptions: options,
           spawnWorkingDirectory: project.copyDirectory,
           signal: controller.signal,
+          deadlineAt: () => stepDeadlineAt,
           getTerminationReason: () => task.termination,
           repair: config.repair,
           onProcessStarted: (pid, isRepair) => {
             spawnedPid = pid;
             agyLaunchId = randomUUID();
+            const start = typeof pid === 'number' ? recordedProcessStart(pid) : undefined;
+            agyLaunch = {
+              containment: declaredProcessContainment(executor),
+              ...(start ? { start } : {}),
+            };
             record.pid = pid;
             record.status = 'running';
             this.events.append(record.taskId, 'process.started', isRepair ? { pid, repair: true } : { pid });
             startStepTimer();
           },
           onProcessCleanup: cleanup => {
-            record.processCleanup = cleanup;
-            if (!cleanup.verified) {
+            const containment = cleanup.containment ?? agyLaunch?.containment ?? declaredProcessContainment(executor);
+            const start = cleanup.start ?? agyLaunch?.start;
+            const mergedCleanup: NonNullable<TaskRecord['processCleanup']> = {
+              ...cleanup,
+              containment,
+              ...(start ? { start } : {}),
+            };
+            record.processCleanup = mergedCleanup;
+            if (!mergedCleanup.verified) {
               upsertProcessCleanupMarkerEntrySync(project, {
                 launchId: agyLaunchId ?? randomUUID(),
                 taskId: record.taskId,
-                provider: 'agy',
+                provider: executor.identity.provider,
                 ...(typeof spawnedPid === 'number' ? { pid: spawnedPid } : {}),
-                spawnedAt: cleanup.spawnedAt,
+                spawnedAt: mergedCleanup.spawnedAt,
+                containment,
+                ...(start ? { start } : {}),
               });
             }
           },
@@ -2792,17 +2826,32 @@ export class TaskManager {
     }
     if (isCapabilitySupported(adapter.capabilities, 'cancel')) {
       let processStartedAtMs: number | undefined;
-      let currentLaunch: { launchId: string; pid: number | undefined; spawnedAt: string } | undefined;
+      let currentLaunch: { launchId: string; pid: number | undefined; spawnedAt: string; containment: ProcessContainment; start?: string } | undefined;
+      let pendingLaunch: ProcessLaunch | undefined;
       let fallbackSettled = false;
       const execPromise = Promise.resolve().then(() => adapter.execute(request, {
         signal,
+        onProcessLaunch: launch => {
+          if (fallbackSettled) return;
+          pendingLaunch = launch;
+        },
         onProcessStarted: pid => {
           if (fallbackSettled) return;
+          const launch = pendingLaunch;
+          pendingLaunch = undefined;
           const nowMs = Date.now();
           processStartedAtMs = nowMs;
           const nowIso = new Date(nowMs).toISOString();
           const launchId = randomUUID();
-          currentLaunch = { launchId, pid, spawnedAt: nowIso };
+          const containment = launch?.containment ?? declaredProcessContainment(adapter);
+          const start = launch?.start ?? (typeof pid === 'number' ? recordedProcessStart(pid) : undefined);
+          currentLaunch = {
+            launchId,
+            pid,
+            spawnedAt: nowIso,
+            containment,
+            ...(start ? { start } : {}),
+          };
           if (typeof pid === 'number') task.record.pid = pid;
           task.record.status = 'running';
           task.record.processCleanup = {
@@ -2810,6 +2859,8 @@ export class TaskManager {
             spawnedAt: nowIso,
             checkedAt: nowIso,
             remaining: 0,
+            containment,
+            ...(start ? { start } : {}),
           };
           if (task.project) {
             upsertProcessCleanupMarkerEntrySync(task.project, {
@@ -2818,6 +2869,8 @@ export class TaskManager {
               provider: adapter.identity.provider,
               ...(typeof pid === 'number' ? { pid } : {}),
               spawnedAt: nowIso,
+              containment,
+              ...(start ? { start } : {}),
             });
           }
           this.events.append(task.record.taskId, 'process.started', { pid });
@@ -2825,9 +2878,16 @@ export class TaskManager {
         },
         onProcessCleanup: cleanup => {
           if (fallbackSettled) return;
-          task.record.processCleanup = cleanup;
+          const containment = cleanup.containment ?? currentLaunch?.containment ?? declaredProcessContainment(adapter);
+          const start = cleanup.start ?? currentLaunch?.start;
+          const mergedCleanup: NonNullable<TaskRecord['processCleanup']> = {
+            ...cleanup,
+            containment,
+            ...(start ? { start } : {}),
+          };
+          task.record.processCleanup = mergedCleanup;
           if (task.project) {
-            if (cleanup.verified) {
+            if (mergedCleanup.verified) {
               if (currentLaunch) {
                 removeProcessCleanupMarkerEntrySync(task.project, currentLaunch.launchId);
               }
@@ -2835,7 +2895,9 @@ export class TaskManager {
               const launch = currentLaunch ?? {
                 launchId: randomUUID(),
                 pid: typeof task.record.pid === 'number' ? task.record.pid : undefined,
-                spawnedAt: cleanup.spawnedAt,
+                spawnedAt: mergedCleanup.spawnedAt,
+                containment,
+                ...(start ? { start } : {}),
               };
               currentLaunch = launch;
               upsertProcessCleanupMarkerEntrySync(task.project, {
@@ -2843,13 +2905,15 @@ export class TaskManager {
                 taskId: task.record.taskId,
                 provider: adapter.identity.provider,
                 ...(typeof launch.pid === 'number' ? { pid: launch.pid } : {}),
-                spawnedAt: cleanup.spawnedAt,
+                spawnedAt: mergedCleanup.spawnedAt,
+                containment,
+                ...(start ? { start } : {}),
               });
             }
           }
           this.events.append(task.record.taskId, 'process.cleanup', {
-            verified: cleanup.verified,
-            remaining: cleanup.remaining,
+            verified: mergedCleanup.verified,
+            remaining: mergedCleanup.remaining,
           });
         },
       }));
@@ -2876,6 +2940,7 @@ export class TaskManager {
               launchId: randomUUID(),
               pid: undefined,
               spawnedAt: new Date(processStartedAtMs ?? Date.now()).toISOString(),
+              containment: declaredProcessContainment(adapter),
             };
             currentLaunch = launch;
             task.record.processCleanup = {
@@ -2883,6 +2948,8 @@ export class TaskManager {
               spawnedAt: launch.spawnedAt,
               checkedAt: nowIso,
               remaining: 0,
+              containment: launch.containment,
+              ...(launch.start ? { start: launch.start } : {}),
             };
             if (task.project) {
               upsertProcessCleanupMarkerEntrySync(task.project, {
@@ -2891,6 +2958,8 @@ export class TaskManager {
                 provider: adapter.identity.provider,
                 ...(typeof launch.pid === 'number' ? { pid: launch.pid } : {}),
                 spawnedAt: launch.spawnedAt,
+                containment: launch.containment,
+                ...(launch.start ? { start: launch.start } : {}),
               });
             }
             this.events.append(task.record.taskId, 'process.cleanup', {
@@ -3200,37 +3269,33 @@ export class TaskManager {
     );
   }
 
-  private assertNoLegacyOpenCodeUnverified(copyDirectory: string): void {
-    const legacyTaskIds: string[] = [];
+  private assertNoUnconfirmedUntrackedLaunch(copyDirectory: string): void {
+    const blockingTaskIds: string[] = [];
     for (const candidate of this.tasks.values()) {
-      if (
-        candidate.project?.copyDirectory === copyDirectory &&
-        candidate.record.execution?.provider === 'opencode' &&
-        candidate.record.processCleanup &&
-        !candidate.record.processCleanup.verified
-      ) {
-        legacyTaskIds.push(candidate.record.taskId);
+      if (candidate.project?.copyDirectory === copyDirectory && this.recordBlocksCleanup(candidate.record)) {
+        blockingTaskIds.push(candidate.record.taskId);
       }
     }
-    if (legacyTaskIds.length > 0) {
-      throw this.unverifiedCleanupError(legacyTaskIds);
+    if (blockingTaskIds.length > 0) {
+      throw this.unverifiedCleanupError(blockingTaskIds);
     }
   }
 
-  private async reconcileAndRemoveAgyCleanupEntries(
+  private async reconcileAndRemoveTrackedCleanupEntries(
     project: ProjectCopy,
     marker: ProcessCleanupMarker,
   ): Promise<void> {
-    const nonAgyEntries = marker.entries.filter(entry => entry.provider !== 'agy');
-    if (nonAgyEntries.length > 0) {
-      throw this.unverifiedCleanupError(nonAgyEntries.map(entry => entry.taskId));
+    const untrackedEntries = marker.entries.filter(entry => this.entryContainment(entry) !== 'tracked');
+    if (untrackedEntries.length > 0) {
+      throw this.unverifiedCleanupError(untrackedEntries.map(entry => entry.taskId));
     }
     const reconciledLaunchIds: string[] = [];
     const reconciledTaskIds = new Set<string>();
     const failedTaskIds: string[] = [];
     for (const entry of marker.entries) {
-      const retry = await reconcileOwnedProcesses({
+      const retry = await reconcileLaunchIdentity({
         pid: entry.pid,
+        start: entry.start,
         spawnedAt: Date.parse(entry.spawnedAt),
         processGroup: process.platform !== 'win32',
       });
@@ -3263,13 +3328,13 @@ export class TaskManager {
     if (this.hasQuarantinedCopySibling(project)) {
       throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
     }
-    this.assertNoLegacyOpenCodeUnverified(project.copyDirectory);
+    this.assertNoUnconfirmedUntrackedLaunch(project.copyDirectory);
     const marker = readProcessCleanupMarkerSync(project);
     if (!marker || marker.entries.length === 0) return;
 
-    const nonAgyEntries = marker.entries.filter(entry => entry.provider !== 'agy');
-    if (nonAgyEntries.length > 0) {
-      throw this.unverifiedCleanupError(nonAgyEntries.map(entry => entry.taskId));
+    const untrackedEntries = marker.entries.filter(entry => this.entryContainment(entry) !== 'tracked');
+    if (untrackedEntries.length > 0) {
+      throw this.unverifiedCleanupError(untrackedEntries.map(entry => entry.taskId));
     }
 
     const hasNonTerminal = [...this.tasks.values()].some(
@@ -3283,7 +3348,7 @@ export class TaskManager {
     }
 
     if (options?.lockHeld) {
-      await this.reconcileAndRemoveAgyCleanupEntries(project, marker);
+      await this.reconcileAndRemoveTrackedCleanupEntries(project, marker);
       return;
     }
 
@@ -3293,7 +3358,7 @@ export class TaskManager {
       release = this.state.acquire(this.projectLock(project));
       const freshMarker = readProcessCleanupMarkerSync(project);
       if (!freshMarker || freshMarker.entries.length === 0) return;
-      await this.reconcileAndRemoveAgyCleanupEntries(project, freshMarker);
+      await this.reconcileAndRemoveTrackedCleanupEntries(project, freshMarker);
     } finally {
       release?.();
       this.busyProjects.delete(project);
@@ -3306,15 +3371,20 @@ export class TaskManager {
     if (existing?.project) {
       await this.assertCopyCleanupConfirmed(existing.project);
     } else if (record.copyDirectory) {
-      this.assertNoLegacyOpenCodeUnverified(record.copyDirectory);
+      this.assertNoUnconfirmedUntrackedLaunch(record.copyDirectory);
     }
     const cleanup = record.processCleanup;
     if (!cleanup) return;
     if (!cleanup.verified) {
-      if (record.execution?.provider === 'opencode') {
+      if (this.recordContainment(record) !== 'tracked') {
         throw this.unverifiedCleanupError([record.taskId]);
       }
-      const retry = await reconcileOwnedProcesses({ pid: record.pid, spawnedAt: Date.parse(cleanup.spawnedAt), processGroup: process.platform !== 'win32' });
+      const retry = await reconcileLaunchIdentity({
+        pid: record.pid,
+        start: cleanup.start,
+        spawnedAt: Date.parse(cleanup.spawnedAt),
+        processGroup: process.platform !== 'win32',
+      });
       record.processCleanup = { ...cleanup, verified: retry.verified, checkedAt: new Date().toISOString(), remaining: retry.remaining.length };
       if (!retry.verified) throw this.unverifiedCleanupError([record.taskId]);
     }

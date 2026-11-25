@@ -22,6 +22,7 @@ import {
   type SecretScanState,
 } from './secret-preflight.js';
 import { normalizeSecretExceptionsPolicy } from './hardening-policy.js';
+import { PROCESS_CONTAINMENT_LEVELS, type ProcessContainment } from './execution-contract.js';
 import { hasOwnedPrefix } from './state-migration.js';
 import {
   AGENT_GUARD_PATHS,
@@ -148,6 +149,8 @@ export interface ProcessCleanupMarkerEntry {
   provider: string;
   pid?: number;
   spawnedAt: string;
+  containment?: ProcessContainment;
+  start?: string;
 }
 
 export interface ProcessCleanupMarker {
@@ -206,7 +209,9 @@ export function readProcessCleanupMarkerSync(project: { gitDirectory: string }):
       typeof item.taskId !== 'string' || !item.taskId ||
       typeof item.provider !== 'string' || !item.provider ||
       typeof item.spawnedAt !== 'string' || !Number.isFinite(Date.parse(item.spawnedAt)) ||
-      (item.pid !== undefined && (typeof item.pid !== 'number' || !Number.isInteger(item.pid) || item.pid <= 0))
+      (item.pid !== undefined && (typeof item.pid !== 'number' || !Number.isInteger(item.pid) || item.pid <= 0)) ||
+      (item.containment !== undefined && (typeof item.containment !== 'string' || !(PROCESS_CONTAINMENT_LEVELS as readonly string[]).includes(item.containment))) ||
+      (item.start !== undefined && (typeof item.start !== 'string' || item.start.length < 1 || item.start.length > 64))
     ) {
       throw new BridgeError('PROCESS_CLEANUP_UNVERIFIED', 'The unverified process cleanup record is unreadable; discard this copy');
     }
@@ -216,6 +221,8 @@ export function readProcessCleanupMarkerSync(project: { gitDirectory: string }):
       provider: item.provider,
       ...(typeof item.pid === 'number' ? { pid: item.pid } : {}),
       spawnedAt: item.spawnedAt,
+      ...(item.containment !== undefined ? { containment: item.containment as ProcessContainment } : {}),
+      ...(item.start !== undefined ? { start: item.start } : {}),
     });
   }
   return { version: 1, entries };
@@ -229,6 +236,8 @@ export function upsertProcessCleanupMarkerEntrySync(project: { gitDirectory: str
     provider: entry.provider,
     ...(typeof entry.pid === 'number' && Number.isInteger(entry.pid) && entry.pid > 0 ? { pid: entry.pid } : {}),
     spawnedAt: entry.spawnedAt,
+    ...(entry.containment !== undefined ? { containment: entry.containment } : {}),
+    ...(typeof entry.start === 'string' && entry.start.length >= 1 && entry.start.length <= 64 ? { start: entry.start } : {}),
   };
   const entries = existing ? [...existing.entries] : [];
   const index = entries.findIndex(item => item.launchId === normalized.launchId);

@@ -9,6 +9,7 @@ import {
   type ExecutionContext,
   type ExecutionRequest,
   type ExecutionResult,
+  type ProcessContainment,
 } from './execution-contract.js';
 import { classifySandboxDenial } from './native-tests.js';
 import {
@@ -16,7 +17,17 @@ import {
   DEFAULT_MAX_PAYLOAD_NODES,
   sanitizePayload,
 } from './payload-safety.js';
-import { reconcileOwnedProcesses } from './process-tree.js';
+import {
+  listProcessIdentities,
+  PROCESS_LISTING_TIMEOUT_MS,
+  reconcileLaunchIdentity,
+  reconcileOwnedProcesses,
+  recordedProcessStart,
+  type ObservedProcess,
+  type ProcessCleanup,
+  type ProcessIdentity,
+  type RecordedLaunch,
+} from './process-tree.js';
 import { LineParser } from './stream-parser.js';
 import {
   isOwnedProcessGroup,
@@ -58,6 +69,7 @@ export interface AgyExecutionHooks {
   readonly runOptions?: RunOptions;
   readonly spawnWorkingDirectory?: string;
   readonly signal?: AbortSignal;
+  readonly deadlineAt?: () => number | undefined;
   readonly getTerminationReason?: () => 'cancelled' | 'timeout' | undefined;
   readonly repair?: boolean;
   readonly onProcessStarted?: (pid: number | undefined, repair: boolean) => void;
@@ -310,14 +322,81 @@ function explicitNonEmptyString(value: unknown): string | undefined {
 // Bump when the adapter's persisted identity semantics change.
 export const AGY_ADAPTER_VERSION = '1';
 
+function unconfirmedIdentityCleanup(): ProcessCleanup {
+  return { verified: false, method: 'process-identity', remaining: [] };
+}
+
+export async function confirmCleanupByIdentity(
+  launch: RecordedLaunch,
+  options?: {
+    graceMs?: number;
+    platform?: NodeJS.Platform;
+    list?: (signal?: AbortSignal) => Promise<ProcessIdentity[]>;
+    deadlineAt?: number;
+    now?: () => number;
+  },
+): Promise<ProcessCleanup> {
+  const now = options?.now ?? Date.now;
+  const deadlineAt = options?.deadlineAt;
+  if (deadlineAt === undefined || !Number.isFinite(deadlineAt) || deadlineAt - now() < PROCESS_LISTING_TIMEOUT_MS + 1000) {
+    return unconfirmedIdentityCleanup();
+  }
+
+  const controller = new AbortController();
+  const abortDelayMs = Math.min(2_147_483_647, Math.max(0, deadlineAt - 500 - now()));
+  const abortTimer = setTimeout(() => {
+    controller.abort();
+  }, abortDelayMs);
+  abortTimer.unref();
+
+  let onAbortPromise: (() => void) | undefined;
+  const abortPromise = new Promise<ProcessCleanup>(resolve => {
+    if (controller.signal.aborted) {
+      resolve(unconfirmedIdentityCleanup());
+      return;
+    }
+    onAbortPromise = () => resolve(unconfirmedIdentityCleanup());
+    controller.signal.addEventListener('abort', onAbortPromise, { once: true });
+  });
+
+  const baseList = options?.list;
+  const graceMs = Math.max(0, Math.min(options?.graceMs ?? 3000, deadlineAt - 1000 - now()));
+  try {
+    const cleanup = await Promise.race([
+      reconcileLaunchIdentity(launch, {
+        graceMs,
+        ...(options?.platform !== undefined ? { platform: options.platform } : {}),
+        list: async () => {
+          if (controller.signal.aborted) {
+            throw new Error('Process listing aborted');
+          }
+          return baseList
+            ? await baseList(controller.signal)
+            : await listProcessIdentities({ signal: controller.signal });
+        },
+      }).catch(unconfirmedIdentityCleanup),
+      abortPromise,
+    ]);
+    return controller.signal.aborted ? unconfirmedIdentityCleanup() : cleanup;
+  } finally {
+    clearTimeout(abortTimer);
+    if (onAbortPromise) {
+      controller.signal.removeEventListener('abort', onAbortPromise);
+    }
+  }
+}
+
 export class AgyExecutionAdapter implements ExecutionAdapter {
   readonly identity: ExecutionAdapterIdentity = { id: 'agy', provider: 'agy', version: AGY_ADAPTER_VERSION };
+  // Measured: agy's terminal sandbox fails inside bwrap --unshare-pid on the reference host, so agy is tracked rather than contained.
+  readonly processContainment: ProcessContainment = 'tracked';
   private observedDiscovery?: Discovery;
 
   constructor(
     private readonly cli: CliAdapter,
     private readonly config: Config,
     private readonly explicitCapabilities?: ExecutionCapabilities,
+    private readonly options?: { listProcesses?: (signal?: AbortSignal) => Promise<ProcessIdentity[]> },
   ) {}
 
   get capabilities(): ExecutionCapabilities {
@@ -427,6 +506,7 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
     }
 
     const spawnedPid = child.pid;
+    const spawnedStart = typeof spawnedPid === 'number' ? recordedProcessStart(spawnedPid) : undefined;
 
     let standaloneTermination: 'timeout' | undefined;
     let standaloneTimer: NodeJS.Timeout | undefined;
@@ -623,6 +703,7 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
 
     let exitCode: number | null = null;
     let processCleanup: TaskRecord['processCleanup'] | undefined;
+    let standaloneDeadlineAt: number | undefined;
     try {
       safeInvoke(() => hooks?.onProcessStarted?.(spawnedPid, Boolean(hooks.repair)));
       if (hookFailure === undefined) {
@@ -631,6 +712,7 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
           else hooks.signal.addEventListener('abort', onAbort, { once: true });
         } else {
           const timeoutSeconds = options.timeoutSeconds ?? this.config.defaultTimeoutSeconds;
+          standaloneDeadlineAt = spawnedAt + timeoutSeconds * 1000;
           standaloneTimer = setTimeout(() => {
             standaloneTermination = 'timeout';
             terminateSubprocess(child);
@@ -641,16 +723,53 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
 
       exitCode = await closePromise;
       if (child.pid !== undefined) {
-        const cleanup = await reconcileOwnedProcesses({
-          pid: child.pid,
-          spawnedAt,
-          processGroup: isOwnedProcessGroup(child),
-        });
+        const listObserved = process.platform === 'win32' && this.options?.listProcesses
+          ? async (): Promise<ObservedProcess[]> => {
+              const identities = await this.options!.listProcesses!();
+              return identities.map(identity => ({
+                pid: identity.pid,
+                parentPid: identity.parentPid,
+                createdAt: Number(identity.start),
+              }));
+            }
+          : undefined;
+        let cleanup = await reconcileOwnedProcesses(
+          {
+            pid: child.pid,
+            spawnedAt,
+            processGroup: isOwnedProcessGroup(child),
+          },
+          listObserved ? { list: listObserved } : undefined,
+        );
+        let confirmedLater = false;
+        const terminating = Boolean(this.terminationFromSignal(hooks) ?? standaloneTermination);
+        const deadlineAt = hooks?.signal ? hooks.deadlineAt?.() : standaloneDeadlineAt;
+        // When the snapshot already observed processes, their identities must not be forgotten, so the result stays unverified.
+        if (!terminating && !cleanup.verified && cleanup.remaining.length === 0) {
+          const later = await confirmCleanupByIdentity(
+            {
+              pid: child.pid,
+              start: spawnedStart,
+              spawnedAt,
+              processGroup: isOwnedProcessGroup(child),
+            },
+            {
+              list: this.options?.listProcesses,
+              deadlineAt,
+            },
+          );
+          if (later.verified) {
+            cleanup = later;
+            confirmedLater = true;
+          }
+        }
         processCleanup = {
           verified: cleanup.verified,
           spawnedAt: new Date(spawnedAt).toISOString(),
           checkedAt: new Date().toISOString(),
           remaining: cleanup.remaining.length,
+          containment: this.processContainment,
+          ...(spawnedStart ? { start: spawnedStart } : {}),
         };
         safeInvoke(() => {
           hooks?.onProcessCleanup?.(processCleanup!);
@@ -658,6 +777,7 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
             verified: cleanup.verified,
             method: cleanup.method,
             remaining: cleanup.remaining.length,
+            ...(confirmedLater ? { confirmedLater: true } : {}),
           });
         });
       }
