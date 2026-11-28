@@ -2,7 +2,7 @@ import * as crypto from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as path from 'node:path';
-import { closeSync, fstatSync, openSync, readSync } from 'node:fs';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import * as os from 'node:os';
 import { z } from 'zod';
@@ -18,6 +18,7 @@ import {
 } from './agent-policy.js';
 import type { ProjectLimits } from './config.js';
 import { hasOwnedPrefix } from './state-migration.js';
+import { isOwnedWorkspacePath } from './workspace-paths.js';
 
 export const EXECUTION_POLICY_PATHS = [
   '.agents/hooks.json',
@@ -48,6 +49,146 @@ export interface ReceiptEdit {
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const SHA256_HEX_REGEX = /^[0-9a-f]{64}$/i;
 const MCP_PERMISSION_REGEX = /^mcp\([A-Za-z0-9][A-Za-z0-9_-]{0,127}\/[A-Za-z0-9_.-]+\)$/;
+const UINT32_MAX = 0xffffffff;
+
+export const MCP_CONFIG_WITNESSES_DIR_NAME = 'execution-mcp-witnesses';
+
+export const mcpConfigStagingWitnessSchema = z
+  .object({
+    version: z.literal(1),
+    executionId: z.string().regex(UUID_REGEX),
+    copyDirectory: z.string().min(1).max(4000),
+    agentsDirectory: z.string().min(1).max(4000),
+    mcpConfigPath: z.string().min(1).max(4000),
+    copyVolume: z.number().int().min(0).max(UINT32_MAX),
+    copyFileIndexHigh: z.number().int().min(0).max(UINT32_MAX),
+    copyFileIndexLow: z.number().int().min(0).max(UINT32_MAX),
+    agentsVolume: z.number().int().min(0).max(UINT32_MAX),
+    agentsFileIndexHigh: z.number().int().min(0).max(UINT32_MAX),
+    agentsFileIndexLow: z.number().int().min(0).max(UINT32_MAX),
+    volume: z.number().int().min(0).max(UINT32_MAX),
+    fileIndexHigh: z.number().int().min(0).max(UINT32_MAX),
+    fileIndexLow: z.number().int().min(0).max(UINT32_MAX),
+    bytes: z.number().int().min(0).max(1024 * 1024),
+    sha256: z.string().regex(/^[0-9a-f]{64}$/),
+  })
+  .strict();
+
+export type McpConfigStagingWitness = z.infer<typeof mcpConfigStagingWitnessSchema>;
+
+function windowsObjectIdentityFromStat(
+  stat: { dev: bigint; ino: bigint },
+  label: string,
+): { volume: number; fileIndexHigh: number; fileIndexLow: number } {
+  if (
+    stat.dev < 0n ||
+    stat.dev > 0xffffffffn ||
+    stat.ino < 0n ||
+    stat.ino > 0xffffffffffffffffn
+  ) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Invalid Windows object identity for ${label}`);
+  }
+  return {
+    volume: Number(stat.dev),
+    fileIndexHigh: Number((stat.ino >> 32n) & 0xffffffffn),
+    fileIndexLow: Number(stat.ino & 0xffffffffn),
+  };
+}
+
+export function mcpConfigWitnessPath(stateDirectory: string, executionId: string): string {
+  if (typeof executionId !== 'string' || !UUID_REGEX.test(executionId)) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Invalid executionId for MCP config witness: ${String(executionId)}`);
+  }
+  return path.join(path.resolve(stateDirectory), MCP_CONFIG_WITNESSES_DIR_NAME, `${executionId.toLowerCase()}.json`);
+}
+
+export async function readMcpConfigWitness(
+  stateDirectory: string,
+  executionId: string,
+): Promise<McpConfigStagingWitness | undefined> {
+  if (typeof executionId !== 'string' || !UUID_REGEX.test(executionId)) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Invalid executionId for MCP config witness: ${String(executionId)}`);
+  }
+  await assertNoLinkAncestry(stateDirectory, 'stateDirectory');
+  const resolvedState = path.resolve(stateDirectory);
+  const stateInfo = await fsp.lstat(resolvedState).catch(() => undefined);
+  if (!stateInfo || !stateInfo.isDirectory() || stateInfo.isSymbolicLink()) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'stateDirectory must be an existing non-link directory');
+  }
+  const canonicalState = await fsp.realpath(resolvedState);
+  const expectedPath = path.join(canonicalState, MCP_CONFIG_WITNESSES_DIR_NAME, `${executionId.toLowerCase()}.json`);
+  const authorizedPath = path.join(resolvedState, MCP_CONFIG_WITNESSES_DIR_NAME, `${executionId.toLowerCase()}.json`);
+  await assertNoLinkAncestry(authorizedPath, 'mcpWitnessPath');
+  let stat;
+  try {
+    stat = await fsp.lstat(authorizedPath, { bigint: true });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1n || stat.size <= 0n || stat.size > 65536n) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config staging witness is unsafe or invalid');
+  }
+  const canonicalActual = await fsp.realpath(authorizedPath);
+  if (!pathsEqual(canonicalActual, expectedPath)) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config staging witness canonical path mismatch');
+  }
+  let raw: unknown;
+  let handle: Awaited<ReturnType<typeof fsp.open>> | undefined;
+  try {
+    handle = await fsp.open(authorizedPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const handleStat = await handle.stat({ bigint: true });
+    if (
+      !handleStat.isFile() ||
+      handleStat.isSymbolicLink() ||
+      handleStat.nlink !== 1n ||
+      handleStat.dev !== stat.dev ||
+      handleStat.ino !== stat.ino ||
+      handleStat.size <= 0n ||
+      handleStat.size > 65536n
+    ) {
+      throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config staging witness changed during handle verification');
+    }
+    raw = JSON.parse(await handle.readFile({ encoding: 'utf8' }));
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config staging witness is unreadable');
+  } finally {
+    await handle?.close();
+  }
+  const parsed = mcpConfigStagingWitnessSchema.safeParse(raw);
+  if (!parsed.success || parsed.data.executionId.toLowerCase() !== executionId.toLowerCase()) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config staging witness schema or identity mismatch');
+  }
+  return parsed.data;
+}
+
+export async function removeMcpConfigWitness(stateDirectory: string, executionId: string): Promise<void> {
+  if (typeof executionId !== 'string' || !UUID_REGEX.test(executionId)) return;
+  await assertNoLinkAncestry(stateDirectory, 'stateDirectory');
+  const resolvedState = path.resolve(stateDirectory);
+  const stateInfo = await fsp.lstat(resolvedState).catch(() => undefined);
+  if (!stateInfo || !stateInfo.isDirectory() || stateInfo.isSymbolicLink()) return;
+  const canonicalState = await fsp.realpath(resolvedState);
+  const expectedPath = path.join(canonicalState, MCP_CONFIG_WITNESSES_DIR_NAME, `${executionId.toLowerCase()}.json`);
+  const authorizedPath = path.join(resolvedState, MCP_CONFIG_WITNESSES_DIR_NAME, `${executionId.toLowerCase()}.json`);
+  await assertNoLinkAncestry(authorizedPath, 'mcpWitnessPath');
+  let stat;
+  try {
+    stat = await fsp.lstat(authorizedPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Refusing to delete an unsafe managed MCP config witness');
+  }
+  const canonicalActual = await fsp.realpath(authorizedPath);
+  if (!pathsEqual(canonicalActual, expectedPath)) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config witness cleanup canonical mismatch');
+  }
+  await fsp.unlink(authorizedPath);
+}
 
 export const stagedExecutionPolicyFileSchema = z
   .object({
@@ -747,6 +888,40 @@ export function generateHookSource(): string {
 });\n`;
 }
 
+interface ProvenMcpHandoffContext {
+  previousPolicy: StagedExecutionPolicy;
+  previousStateDirectory: string;
+}
+
+function buildMcpConfigContent(policy: ResolvedAgentPolicy, catalog: McpCatalogEntry[]): string {
+  const mcpConfig: Record<string, unknown> = {};
+  for (const server of policy.mcpServers) {
+    const entry = catalog.find((c) => c.id === server.serverId);
+    if (!entry) {
+      throw new BridgeError('POLICY_NOT_ALLOWED', `MCP server '${server.serverId}' not found in catalog`);
+    }
+    const serverConfig: Record<string, unknown> = {};
+    if (entry.command !== undefined) {
+      serverConfig.command = entry.command;
+      if (entry.args !== undefined) serverConfig.args = entry.args;
+      if (entry.env !== undefined) serverConfig.env = entry.env;
+      if (entry.cwd !== undefined) serverConfig.cwd = entry.cwd;
+    } else if (entry.serverUrl !== undefined) {
+      serverConfig.serverUrl = entry.serverUrl;
+      if (entry.headers !== undefined) serverConfig.headers = entry.headers;
+    }
+    const selectedToolSet = new Set(server.tools);
+    const disabledTools = entry.tools
+      .map((t) => t.name)
+      .filter((t) => !selectedToolSet.has(t));
+    if (disabledTools.length > 0) {
+      serverConfig.disabledTools = disabledTools;
+    }
+    mcpConfig[server.serverName] = serverConfig;
+  }
+  return JSON.stringify({ mcpServers: mcpConfig }, null, 2) + '\n';
+}
+
 export async function stageExecutionPolicy(
   copyDirectory: string,
   setup: {
@@ -759,31 +934,44 @@ export async function stageExecutionPolicy(
   },
   remaining: ProjectLimits
 ): Promise<StagedExecutionPolicy> {
+  return stageExecutionPolicyInternal(copyDirectory, setup, remaining);
+}
+
+export async function handoffExecutionPolicyWithProvenMcpConfig(
+  copyDirectory: string,
+  setup: {
+    policy: ResolvedAgentPolicy;
+    catalog: McpCatalogEntry[];
+    stateDirectory: string;
+    executionId: string;
+    skillFiles?: readonly string[];
+    readOnlyRoots?: readonly string[];
+  },
+  remaining: ProjectLimits,
+  previousPolicy: StagedExecutionPolicy,
+  previousStateDirectory: string,
+): Promise<StagedExecutionPolicy> {
+  return stageExecutionPolicyInternal(copyDirectory, setup, remaining, { previousPolicy, previousStateDirectory });
+}
+
+async function stageExecutionPolicyInternal(
+  copyDirectory: string,
+  setup: {
+    policy: ResolvedAgentPolicy;
+    catalog: McpCatalogEntry[];
+    stateDirectory: string;
+    executionId: string;
+    skillFiles?: readonly string[];
+    readOnlyRoots?: readonly string[];
+  },
+  remaining: ProjectLimits,
+  handoff?: ProvenMcpHandoffContext,
+): Promise<StagedExecutionPolicy> {
   resolvedAgentPolicySchema.parse(setup.policy);
   mcpCatalogSchema.parse(setup.catalog);
   const selectedDefinitions = setup.policy.mcpServers.map(server => setup.catalog.find(entry => entry.id === server.serverId));
   if (selectedDefinitions.some(entry => !entry) || crypto.createHash('sha256').update(JSON.stringify(selectedDefinitions)).digest('hex') !== setup.policy.catalogSha256) throw new BridgeError('AGENT_POLICY_CHANGED', 'Trusted MCP catalog changed after task admission');
-  // Validate owned copy root: canonical parent equals os.tmpdir and basename starts black-gravity-copy-, root nonlink
-  const canonicalTmp = await fsp.realpath(os.tmpdir());
-  const absoluteCopy = path.resolve(copyDirectory);
-  const copyParent = path.dirname(absoluteCopy);
-  const canonicalParent = await fsp.realpath(copyParent);
-
-  if (!pathsEqual(canonicalTmp, canonicalParent) || !hasOwnedPrefix(path.basename(absoluteCopy), 'copy')) {
-    throw new BridgeError('UNSAFE_PROJECT_PATH', 'copyDirectory must be an owned temporary copy directly under os.tmpdir()');
-  }
-
-  const copyInfo = await fsp.lstat(absoluteCopy).catch(() => undefined);
-  if (!copyInfo || !copyInfo.isDirectory() || copyInfo.isSymbolicLink()) {
-    throw new BridgeError('UNSAFE_PROJECT_PATH', 'copyDirectory must be an existing non-link directory');
-  }
-
-  const canonicalCopy = await fsp.realpath(absoluteCopy);
-  if (!hasOwnedPrefix(path.basename(canonicalCopy), 'copy')) {
-    throw new BridgeError('UNSAFE_PROJECT_PATH', 'canonical copyDirectory basename must start with black-gravity-copy-');
-  }
-
-  // Validate stateDirectory: absolute, nonroot, nonlink, outside copy
+  // Validate stateDirectory: absolute, nonroot, nonlink
   await assertNoLinkAncestry(setup.stateDirectory, 'stateDirectory');
   const resolvedState = path.resolve(setup.stateDirectory);
   const stateParsed = path.parse(resolvedState);
@@ -801,13 +989,33 @@ export async function stageExecutionPolicy(
     throw new BridgeError('UNSAFE_PROJECT_PATH', 'canonical stateDirectory cannot be a root directory');
   }
 
+  // Validate owned copy root: either canonical fixed workspace under stateDirectory/workspaces/<rootKey>/copy,
+  // or legacy temporary copy directly under os.tmpdir() with owned prefix.
+  const canonicalTmp = await fsp.realpath(os.tmpdir());
+  const absoluteCopy = path.resolve(copyDirectory);
+  const copyInfo = await fsp.lstat(absoluteCopy).catch(() => undefined);
+  if (!copyInfo || !copyInfo.isDirectory() || copyInfo.isSymbolicLink()) {
+    throw new BridgeError('UNSAFE_PROJECT_PATH', 'copyDirectory must be an existing non-link directory');
+  }
+  const canonicalCopy = await fsp.realpath(absoluteCopy);
+  const isFixedWorkspace = isOwnedWorkspacePath(canonicalCopy, 'copy', [canonicalState]);
+  if (isFixedWorkspace) {
+    await assertNoLinkAncestry(absoluteCopy, 'copyDirectory');
+  } else {
+    const copyParent = path.dirname(absoluteCopy);
+    const canonicalParent = await fsp.realpath(copyParent);
+    if (!pathsEqual(canonicalTmp, canonicalParent) || !hasOwnedPrefix(path.basename(absoluteCopy), 'copy') || !hasOwnedPrefix(path.basename(canonicalCopy), 'copy')) {
+      throw new BridgeError('UNSAFE_PROJECT_PATH', 'copyDirectory must be an owned workspace or temporary copy');
+    }
+    const relStateCopy = path.relative(canonicalState, canonicalCopy);
+    if (relStateCopy === '' || (!relStateCopy.startsWith('..') && !path.isAbsolute(relStateCopy))) {
+      throw new BridgeError('UNSAFE_PROJECT_PATH', 'copyDirectory cannot be inside stateDirectory');
+    }
+  }
+
   const relCopyState = path.relative(canonicalCopy, canonicalState);
   if (relCopyState === '' || (!relCopyState.startsWith('..') && !path.isAbsolute(relCopyState))) {
     throw new BridgeError('UNSAFE_PROJECT_PATH', 'stateDirectory cannot be inside copyDirectory');
-  }
-  const relStateCopy = path.relative(canonicalState, canonicalCopy);
-  if (relStateCopy === '' || (!relStateCopy.startsWith('..') && !path.isAbsolute(relStateCopy))) {
-    throw new BridgeError('UNSAFE_PROJECT_PATH', 'copyDirectory cannot be inside stateDirectory');
   }
 
   // Validate executionId UUID
@@ -822,20 +1030,22 @@ export async function stageExecutionPolicy(
       if (await fsp.lstat(path.join(directory, name)).then(() => true, error => { if (error.code === 'ENOENT') return false; throw error; })) throw new BridgeError('CONFLICTING_EXECUTION_POLICY', 'Project cannot shadow the trusted hook runtime');
     }
   }
-  // Reject conflicting existing 4 managed paths before writing anything
-  for (const managedPath of EXECUTION_POLICY_PATHS) {
-    const target = path.join(copyDirectory, managedPath);
-    let stat;
-    try {
-      stat = await fsp.lstat(target);
-    } catch (err: unknown) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        continue;
+  // Reject conflicting existing 4 managed paths before writing anything (fresh stage only)
+  if (!handoff) {
+    for (const managedPath of EXECUTION_POLICY_PATHS) {
+      const target = path.join(copyDirectory, managedPath);
+      let stat;
+      try {
+        stat = await fsp.lstat(target);
+      } catch (err: unknown) {
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          continue;
+        }
+        throw err;
       }
-      throw err;
-    }
-    if (stat) {
-      throw new BridgeError('CONFLICTING_EXECUTION_POLICY', `Conflicting managed path exists: ${managedPath}`);
+      if (stat) {
+        throw new BridgeError('CONFLICTING_EXECUTION_POLICY', `Conflicting managed path exists: ${managedPath}`);
+      }
     }
   }
 
@@ -881,6 +1091,10 @@ export async function stageExecutionPolicy(
   const canonicalReceiptPath = path.join(canonicalReceiptsDir, `${setup.executionId}.jsonl`);
   const authorizedReceiptsDir = path.join(resolvedState, 'execution-receipts');
   const authorizedReceiptPath = path.join(authorizedReceiptsDir, `${setup.executionId}.jsonl`);
+  const canonicalWitnessesDir = path.join(canonicalState, MCP_CONFIG_WITNESSES_DIR_NAME);
+  const canonicalWitnessPath = path.join(canonicalWitnessesDir, `${setup.executionId.toLowerCase()}.json`);
+  const authorizedWitnessesDir = path.join(resolvedState, MCP_CONFIG_WITNESSES_DIR_NAME);
+  const authorizedWitnessPath = path.join(authorizedWitnessesDir, `${setup.executionId.toLowerCase()}.json`);
 
   await fsp.mkdir(authorizedReceiptsDir, { recursive: true, mode: 0o700 });
   await assertNoLinkAncestry(authorizedReceiptPath, 'receiptPath');
@@ -967,32 +1181,9 @@ export async function stageExecutionPolicy(
     const manifestContent = JSON.stringify(manifestPayload, null, 2) + '\n';
 
     // Build MCP config
-    const mcpConfig: Record<string, unknown> = {};
-    for (const server of setup.policy.mcpServers) {
-      const entry = setup.catalog.find((c) => c.id === server.serverId);
-      if (!entry) {
-        throw new BridgeError('POLICY_NOT_ALLOWED', `MCP server '${server.serverId}' not found in catalog`);
-      }
-      const serverConfig: Record<string, unknown> = {};
-      if (entry.command !== undefined) {
-        serverConfig.command = entry.command;
-        if (entry.args !== undefined) serverConfig.args = entry.args;
-        if (entry.env !== undefined) serverConfig.env = entry.env;
-        if (entry.cwd !== undefined) serverConfig.cwd = entry.cwd;
-      } else if (entry.serverUrl !== undefined) {
-        serverConfig.serverUrl = entry.serverUrl;
-        if (entry.headers !== undefined) serverConfig.headers = entry.headers;
-      }
-      const selectedToolSet = new Set(server.tools);
-      const disabledTools = entry.tools
-        .map((t) => t.name)
-        .filter((t) => !selectedToolSet.has(t));
-      if (disabledTools.length > 0) {
-        serverConfig.disabledTools = disabledTools;
-      }
-      mcpConfig[server.serverName] = serverConfig;
-    }
-    const mcpConfigContent = JSON.stringify({ mcpServers: mcpConfig }, null, 2) + '\n';
+    const mcpConfigContent = buildMcpConfigContent(setup.policy, setup.catalog);
+    const mcpConfigBuffer = Buffer.from(mcpConfigContent, 'utf8');
+    const mcpConfigSha256 = crypto.createHash('sha256').update(mcpConfigBuffer).digest('hex');
 
     // Sum exact UTF8 helper bytes/file count against remaining limits
     const fileCount = 4;
@@ -1010,6 +1201,130 @@ export async function stageExecutionPolicy(
       throw new BridgeError('COPY_LIMIT_EXCEEDED', `Staging requires ${totalBytes} bytes, but remaining limit is ${remaining.maxCopyBytes}`);
     }
 
+    const mcpConfigPath = path.join(copyDirectory, '.agents', 'mcp_config.json');
+    let provenHandoffMcpStat: Awaited<ReturnType<Awaited<ReturnType<typeof fsp.open>>['stat']>> | undefined;
+    if (handoff) {
+      const resolvedPrevState = await fsp.realpath(path.resolve(handoff.previousStateDirectory)).catch(() => undefined);
+      if (!resolvedPrevState || !pathsEqual(resolvedPrevState, canonicalState)) {
+        throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config handoff state boundary mismatch');
+      }
+      const prevMcpEntry = handoff.previousPolicy.files.find(entry => entry.path === '.agents/mcp_config.json');
+      if (!prevMcpEntry || prevMcpEntry.bytes !== mcpConfigBytes || prevMcpEntry.sha256 !== mcpConfigSha256) {
+        throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config policy or digest changed across handoff');
+      }
+      const previousWitness = await readMcpConfigWitness(handoff.previousStateDirectory, handoff.previousPolicy.executionId);
+      if (!previousWitness) {
+        throw new BridgeError(
+          'EXECUTION_POLICY_VERIFICATION_FAILED',
+          'Managed MCP config staging witness is missing; refusing Windows LPAC transition without verified custody proof',
+        );
+      }
+      const expectedAgentsCanonical = path.join(canonicalCopy, '.agents');
+      const expectedMcpCanonical = path.join(expectedAgentsCanonical, 'mcp_config.json');
+      if (
+        !pathsEqual(previousWitness.copyDirectory, canonicalCopy) ||
+        !pathsEqual(previousWitness.agentsDirectory, expectedAgentsCanonical) ||
+        !pathsEqual(previousWitness.mcpConfigPath, expectedMcpCanonical) ||
+        previousWitness.bytes !== mcpConfigBytes ||
+        previousWitness.sha256 !== mcpConfigSha256
+      ) {
+        throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config staging witness does not match copy or digest');
+      }
+      const [copyStat, agentsStat, mcpLstat] = await Promise.all([
+        fsp.lstat(copyDirectory, { bigint: true }),
+        fsp.lstat(agentsDir, { bigint: true }),
+        fsp.lstat(mcpConfigPath, { bigint: true }),
+      ]);
+      if (
+        copyStat.isSymbolicLink() || !copyStat.isDirectory() ||
+        agentsStat.isSymbolicLink() || !agentsStat.isDirectory() ||
+        mcpLstat.isSymbolicLink() || !mcpLstat.isFile() || mcpLstat.nlink !== 1n || mcpLstat.size !== BigInt(mcpConfigBytes)
+      ) {
+        throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config object identity does not match staging witness');
+      }
+      const [canonicalAgentsActual, canonicalMcpActual] = await Promise.all([
+        fsp.realpath(agentsDir),
+        fsp.realpath(mcpConfigPath),
+      ]);
+      if (!pathsEqual(canonicalAgentsActual, expectedAgentsCanonical) || !pathsEqual(canonicalMcpActual, expectedMcpCanonical)) {
+        throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config canonical path mismatch');
+      }
+      const copyId = windowsObjectIdentityFromStat(copyStat, 'copyDirectory');
+      const agentsId = windowsObjectIdentityFromStat(agentsStat, '.agents');
+      if (
+        copyId.volume !== previousWitness.copyVolume ||
+        copyId.fileIndexHigh !== previousWitness.copyFileIndexHigh ||
+        copyId.fileIndexLow !== previousWitness.copyFileIndexLow ||
+        agentsId.volume !== previousWitness.agentsVolume ||
+        agentsId.fileIndexHigh !== previousWitness.agentsFileIndexHigh ||
+        agentsId.fileIndexLow !== previousWitness.agentsFileIndexLow
+      ) {
+        throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config parent identity does not match staging witness');
+      }
+      const mcpHandle = await fsp.open(mcpConfigPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+      try {
+        const handleStat = await mcpHandle.stat({ bigint: true });
+        const mcpId = windowsObjectIdentityFromStat(handleStat, '.agents/mcp_config.json');
+        if (
+          !handleStat.isFile() ||
+          handleStat.isSymbolicLink() ||
+          handleStat.nlink !== 1n ||
+          handleStat.dev !== mcpLstat.dev ||
+          handleStat.ino !== mcpLstat.ino ||
+          handleStat.size !== BigInt(mcpConfigBytes) ||
+          mcpId.volume !== previousWitness.volume ||
+          mcpId.fileIndexHigh !== previousWitness.fileIndexHigh ||
+          mcpId.fileIndexLow !== previousWitness.fileIndexLow
+        ) {
+          throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config object identity does not match staging witness');
+        }
+        const liveBytes = await mcpHandle.readFile();
+        if (
+          liveBytes.length !== mcpConfigBytes ||
+          crypto.createHash('sha256').update(liveBytes).digest('hex') !== mcpConfigSha256
+        ) {
+          throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config content hash does not match staging witness');
+        }
+        provenHandoffMcpStat = handleStat;
+      } finally {
+        await mcpHandle.close();
+      }
+      // Verify the 3 non-MCP helpers against the previous policy manifest by open handle before rotating only those 3.
+      const nonMcpPaths = EXECUTION_POLICY_PATHS.filter(p => p !== '.agents/mcp_config.json');
+      const verifiedNonMcpToUnlink: string[] = [];
+      for (const managedPath of nonMcpPaths) {
+        const expected = handoff.previousPolicy.files.find(entry => entry.path === managedPath);
+        if (!expected) {
+          throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Previous policy manifest missing helper: ${managedPath}`);
+        }
+        const fullPath = path.join(copyDirectory, managedPath);
+        const helperLstat = await fsp.lstat(fullPath, { bigint: true });
+        if (helperLstat.isSymbolicLink() || !helperLstat.isFile() || helperLstat.nlink !== 1n || helperLstat.size !== BigInt(expected.bytes)) {
+          throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Refusing to rotate unverified managed helper: ${managedPath}`);
+        }
+        if (!pathsEqual(await fsp.realpath(path.dirname(fullPath)), expectedAgentsCanonical)) {
+          throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Managed helper parent escaped copy: ${managedPath}`);
+        }
+        const helperHandle = await fsp.open(fullPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+        try {
+          const hStat = await helperHandle.stat({ bigint: true });
+          if (!hStat.isFile() || hStat.isSymbolicLink() || hStat.nlink !== 1n || hStat.dev !== helperLstat.dev || hStat.ino !== helperLstat.ino || hStat.size !== BigInt(expected.bytes)) {
+            throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Managed helper changed during verification: ${managedPath}`);
+          }
+          const content = await helperHandle.readFile();
+          if (content.length !== expected.bytes || crypto.createHash('sha256').update(content).digest('hex') !== expected.sha256) {
+            throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Managed helper digest mismatch: ${managedPath}`);
+          }
+        } finally {
+          await helperHandle.close();
+        }
+        verifiedNonMcpToUnlink.push(fullPath);
+      }
+      for (const fullPath of verifiedNonMcpToUnlink) {
+        await fsp.unlink(fullPath);
+      }
+    }
+
     // Write helper files
     await fsp.mkdir(agentsDir, { recursive: true, mode: 0o700 });
 
@@ -1025,18 +1340,88 @@ export async function stageExecutionPolicy(
     await fsp.writeFile(manifestPath, manifestContent, { flag: 'wx', mode: 0o600 });
     createdFiles.push(manifestPath);
 
-    const mcpConfigPath = path.join(copyDirectory, '.agents', 'mcp_config.json');
-    await fsp.writeFile(mcpConfigPath, mcpConfigContent, { flag: 'wx', mode: 0o600 });
-    createdFiles.push(mcpConfigPath);
+    let mcpHandleStat: Awaited<ReturnType<Awaited<ReturnType<typeof fsp.open>>['stat']>> | undefined = provenHandoffMcpStat;
+    if (!handoff) {
+      const mcpHandle = await fsp.open(mcpConfigPath, 'wx', 0o600);
+      createdFiles.push(mcpConfigPath);
+      try {
+        let written = 0;
+        while (written < mcpConfigBuffer.length) {
+          const part = await mcpHandle.write(mcpConfigBuffer, written, mcpConfigBuffer.length - written, null);
+          if (part.bytesWritten <= 0) {
+            throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Zero progress writing managed MCP config');
+          }
+          written += part.bytesWritten;
+        }
+        await mcpHandle.sync();
+        mcpHandleStat = await mcpHandle.stat({ bigint: true });
+      } finally {
+        await mcpHandle.close();
+      }
+    }
     if (process.platform === 'win32') {
-      // The LPAC controller skips existing children with protected DACLs.
-      // Preserve the host user's ACL while keeping helper credentials out of tests.
-      await promisify(execFile)(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'icacls.exe'), [mcpConfigPath, '/inheritance:d'], { windowsHide: true, timeout: 10000, maxBuffer: 8192 });
+      if (!handoff) {
+        // The LPAC controller skips existing children with protected DACLs.
+        // Preserve the host user's ACL while keeping helper credentials out of tests.
+        await promisify(execFile)(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'icacls.exe'), [mcpConfigPath, '/inheritance:d'], { windowsHide: true, timeout: 10000, maxBuffer: 8192 });
+      }
+      const [copyWinStat, agentsWinStat, mcpWinStat] = await Promise.all([
+        fsp.lstat(copyDirectory, { bigint: true }),
+        fsp.lstat(agentsDir, { bigint: true }),
+        fsp.lstat(mcpConfigPath, { bigint: true }),
+      ]);
+      if (
+        copyWinStat.isSymbolicLink() || !copyWinStat.isDirectory() ||
+        agentsWinStat.isSymbolicLink() || !agentsWinStat.isDirectory() ||
+        mcpWinStat.isSymbolicLink() || !mcpWinStat.isFile() || mcpWinStat.nlink !== 1n ||
+        !mcpHandleStat ||
+        mcpWinStat.dev !== mcpHandleStat.dev ||
+        mcpWinStat.ino !== mcpHandleStat.ino ||
+        mcpWinStat.size !== BigInt(mcpConfigBytes)
+      ) {
+        throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Managed MCP config identity verification failed during staging');
+      }
+      const canonicalAgentsDir = await fsp.realpath(agentsDir);
+      const canonicalMcpPath = await fsp.realpath(mcpConfigPath);
+      if (
+        !pathsEqual(canonicalAgentsDir, path.join(canonicalCopy, '.agents')) ||
+        !pathsEqual(canonicalMcpPath, path.join(canonicalCopy, '.agents', 'mcp_config.json'))
+      ) {
+        throw new BridgeError('UNSAFE_PROJECT_PATH', 'Managed MCP config canonical path mismatch during staging');
+      }
+      const copyId = windowsObjectIdentityFromStat(copyWinStat, 'copyDirectory');
+      const agentsId = windowsObjectIdentityFromStat(agentsWinStat, '.agents');
+      const mcpId = windowsObjectIdentityFromStat(mcpWinStat, '.agents/mcp_config.json');
+      const witnessPayload: McpConfigStagingWitness = mcpConfigStagingWitnessSchema.parse({
+        version: 1,
+        executionId: setup.executionId.toLowerCase(),
+        copyDirectory: canonicalCopy,
+        agentsDirectory: canonicalAgentsDir,
+        mcpConfigPath: canonicalMcpPath,
+        copyVolume: copyId.volume,
+        copyFileIndexHigh: copyId.fileIndexHigh,
+        copyFileIndexLow: copyId.fileIndexLow,
+        agentsVolume: agentsId.volume,
+        agentsFileIndexHigh: agentsId.fileIndexHigh,
+        agentsFileIndexLow: agentsId.fileIndexLow,
+        volume: mcpId.volume,
+        fileIndexHigh: mcpId.fileIndexHigh,
+        fileIndexLow: mcpId.fileIndexLow,
+        bytes: mcpConfigBytes,
+        sha256: mcpConfigSha256,
+      });
+      await fsp.mkdir(authorizedWitnessesDir, { recursive: true, mode: 0o700 });
+      await assertNoLinkAncestry(authorizedWitnessPath, 'mcpWitnessPath');
+      await fsp.writeFile(authorizedWitnessPath, JSON.stringify(witnessPayload) + '\n', { flag: 'wx', mode: 0o600 });
+      createdFiles.push(authorizedWitnessPath);
+      const canonicalWitnessActual = await fsp.realpath(authorizedWitnessPath);
+      if (!pathsEqual(canonicalWitnessActual, canonicalWitnessPath)) {
+        throw new BridgeError('UNSAFE_PROJECT_PATH', 'MCP config witness canonical identity mismatch');
+      }
     }
 
     const hooksSha256 = crypto.createHash('sha256').update(hooksJsonContent, 'utf8').digest('hex');
     const manifestSha256 = crypto.createHash('sha256').update(manifestContent, 'utf8').digest('hex');
-    const mcpConfigSha256 = crypto.createHash('sha256').update(mcpConfigContent, 'utf8').digest('hex');
 
     const files = [
       { path: '.agents/hooks.json', sha256: hooksSha256, bytes: hooksBytes },
@@ -1069,10 +1454,15 @@ export async function stageExecutionPolicy(
       try {
         await assertNoLinkAncestry(created, 'created helper');
         const isReceipt = pathsEqual(created, authorizedReceiptPath);
-        if (!isReceipt && !EXECUTION_POLICY_PATHS.some(file => pathsEqual(created, path.join(absoluteCopy, file)))) {
+        const isWitness = pathsEqual(created, authorizedWitnessPath);
+        if (!isReceipt && !isWitness && !EXECUTION_POLICY_PATHS.some(file => pathsEqual(created, path.join(absoluteCopy, file)))) {
           throw new Error('Unsafe helper cleanup');
         }
-        const expectedParent = isReceipt ? canonicalReceiptsDir : path.join(canonicalCopy, '.agents');
+        const expectedParent = isReceipt
+          ? canonicalReceiptsDir
+          : isWitness
+            ? canonicalWitnessesDir
+            : path.join(canonicalCopy, '.agents');
         if (!pathsEqual(await fsp.realpath(path.dirname(created)), expectedParent)) throw new Error('Helper cleanup parent changed');
         const current = await fsp.lstat(created, { bigint: true }).catch(error => {
           if (error.code === 'ENOENT') return undefined;
@@ -1459,4 +1849,31 @@ export async function discardExecutionPolicy(staged: StagedExecutionPolicy, stat
   if (!identity.isFile() || identity.isSymbolicLink() || identity.nlink !== 1n || identity.dev.toString() !== staged.receiptIdentity.dev || identity.ino.toString() !== staged.receiptIdentity.ino) throw new BridgeError('INVALID_RECEIPT', 'Refusing to delete a replaced private receipt');
   if (!canonicalActual) throw new BridgeError('INVALID_RECEIPT', 'Cannot verify the canonical identity of an existing receipt');
   await fsp.unlink(authorizedReceiptPath);
+  await removeMcpConfigWitness(stateDirectory, staged.executionId);
+}
+
+/**
+ * Removes only the 4 managed execution-policy helper files from .agents/ so a resumed turn
+ * can stage a fresh per-turn receipt while preserving the previous turn's receipt immutably.
+ */
+export async function removeStagedExecutionPolicyHelpers(copyDirectory: string): Promise<void> {
+  await assertNoLinkAncestry(copyDirectory, 'copyDirectory');
+  const canonicalCopy = await fsp.realpath(copyDirectory);
+  const expectedAgentsDir = path.join(canonicalCopy, '.agents');
+  for (const managedPath of EXECUTION_POLICY_PATHS) {
+    const fullPath = path.join(copyDirectory, managedPath);
+    const stat = await fsp.lstat(fullPath).catch(err => {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw err;
+    });
+    if (!stat) continue;
+    if (!stat.isFile() || stat.isSymbolicLink()) {
+      throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Refusing to replace non-regular managed helper: ${managedPath}`);
+    }
+    const parentReal = await fsp.realpath(path.dirname(fullPath));
+    if (!pathsEqual(parentReal, expectedAgentsDir)) {
+      throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', `Managed helper parent escaped copy: ${managedPath}`);
+    }
+    await fsp.unlink(fullPath);
+  }
 }

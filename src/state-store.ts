@@ -5,7 +5,6 @@ import { computeProjectId, memorySummarySchema } from './project-memory.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { closeSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { z } from 'zod';
 import { stagedExecutionPolicySchema } from './execution-policy.js';
 import { resolvedAgentPolicySchema, nativeToolsSchema, mcpSelectionSchema } from './agent-policy.js';
@@ -19,7 +18,10 @@ import { roleDefinitionSchema, effortSchema } from './roles.js';
 import { parseSandboxPolicySnapshot, sandboxPolicyDigest, sandboxPolicySchema, type SandboxPolicySnapshot } from './sandbox-policy.js';
 import { preauthorizedIntegrationRoots, mapFsError } from './integration-policy.js';
 import { validateStateDirectory, type ConfigurationIssue } from './config.js';
-import { hasOwnedPrefix, readMigrationMarker, samePath } from './state-migration.js';
+import { readMigrationMarker, samePath } from './state-migration.js';
+import { copyIdentity, isLegacyTempCopyPath, isOwnedWorkspacePath } from './workspace-paths.js';
+
+export { copyIdentity };
 
 const uuid = /^[a-f0-9-]{36}$/;
 const canonicalUuidSchema = z.string().uuid();
@@ -101,7 +103,10 @@ const snapshotSchema = z.object({
     outputSchema: z.record(z.string(), z.unknown()).optional(),
     artifactPaths: z.array(z.string().min(1).max(1000)).min(1).max(100).optional(),
   }).passthrough(),
-  project: z.object({ executionPolicy: stagedExecutionPolicySchema.optional(), executionStateDirectory: z.string().optional(), sourceDirectory: z.string(), copyDirectory: z.string(), gitDirectory: z.string(),
+  project: z.object({ executionPolicy: stagedExecutionPolicySchema.optional(), executionStateDirectory: z.string().optional(),
+    workspaceStateDirectory: z.string().optional(), lineageId: z.string().uuid().optional(),
+    archivedAt: z.string().datetime().optional(), archiveSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+    sourceDirectory: z.string(), copyDirectory: z.string(), gitDirectory: z.string(),
     baseline: z.array(z.tuple([z.string(), z.string().regex(/^[a-f0-9]{64}$/)])), includedFiles: z.array(z.string()), providedSkills: stagedSkillsSchema.optional(),
     blockedFiles: z.array(blockedMetadataSchema).optional(),
     modelProofFailure: z.string().max(2000).optional(),
@@ -165,17 +170,6 @@ function extractCopyHints(raw: unknown): string[] {
     }
   }
   return hints;
-}
-
-export function copyIdentity(directory: string, platform: NodeJS.Platform = process.platform): string {
-  if (platform === 'win32') {
-    const backslash = directory.replaceAll('/', '\\');
-    const stripped = backslash
-      .replace(/^(?:\\\\[?.]|\\\?\?)\\UNC\\/i, '\\\\')
-      .replace(/^(?:\\\\[?.]|\\\?\?)\\(?=[A-Za-z]:)/, '');
-    return path.win32.resolve(stripped).toLowerCase();
-  }
-  return path.posix.resolve(directory);
 }
 
 export function copyLockName(copyDirectory: string, platform: NodeJS.Platform = process.platform): string {
@@ -588,13 +582,32 @@ export class StateStore {
       throw new SnapshotRejection('tool-policy-mismatch', 'Persisted task tool policies disagree', fingerprint, copyHints);
     }
     if (data.project) {
-      for (const [directory, kind] of [[data.project.copyDirectory, 'copy'], [data.project.gitDirectory, 'baseline']] as const) {
-        if (!path.isAbsolute(directory) || path.relative(os.tmpdir(), path.dirname(directory)) !== '' || !hasOwnedPrefix(path.basename(directory), kind)) {
+      const ownedStateRoots = [selfRealpath, ...(migrationOrigin ? [migrationOrigin] : [])];
+      if (data.project.workspaceStateDirectory !== undefined) {
+        if (!this.tryOwnsExecutionState(data.project.workspaceStateDirectory, selfRealpath, migrationOrigin)) {
           throw new SnapshotRejection('copy-outside-temporary-directory', 'Persisted copy is outside bridge temporary storage', fingerprint, copyHints);
+        }
+        for (const [directory, kind] of [[data.project.copyDirectory, 'copy'], [data.project.gitDirectory, 'baseline']] as const) {
+          if (!isOwnedWorkspacePath(directory, kind, ownedStateRoots)) {
+            throw new SnapshotRejection('copy-outside-temporary-directory', 'Persisted copy is outside bridge temporary storage', fingerprint, copyHints);
+          }
+        }
+      } else {
+        for (const [directory, kind] of [[data.project.copyDirectory, 'copy'], [data.project.gitDirectory, 'baseline']] as const) {
+          if (!isLegacyTempCopyPath(directory, kind)) {
+            throw new SnapshotRejection('copy-outside-temporary-directory', 'Persisted copy is outside bridge temporary storage', fingerprint, copyHints);
+          }
         }
       }
       if (data.project.sourceDirectory !== data.record.workingDirectory) {
         throw new SnapshotRejection('source-mismatch', 'Persisted source differs from task', fingerprint, copyHints);
+      }
+      if (data.project.workspaceStateDirectory !== undefined) {
+        for (const [directory, kind] of [[data.project.copyDirectory, 'copy'], [data.project.gitDirectory, 'baseline']] as const) {
+          if (!isOwnedWorkspacePath(directory, kind, ownedStateRoots, data.project.sourceDirectory)) {
+            throw new SnapshotRejection('copy-outside-temporary-directory', 'Persisted copy is outside bridge temporary storage', fingerprint, copyHints);
+          }
+        }
       }
       if (Boolean(data.project.executionPolicy) !== Boolean(data.project.executionStateDirectory) ||
           (data.project.executionPolicy && data.project.executionPolicy.policy.sha256 !== data.record.agentPolicy?.sha256) ||

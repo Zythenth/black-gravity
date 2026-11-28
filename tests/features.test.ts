@@ -183,8 +183,21 @@ test('role handoff transfers plans, criteria and decisions to independent copies
     assert.deepEqual(implementation.acceptanceCriteria, criteria);
     assert.deepEqual(implementation.handoff.reports[0].data, planContext.report.data);
     assert.ok(implementation.result.response.includes('Keep the existing source file'));
-    assert.notEqual(implementation.copyDirectory, (await f.call('black_gravity_status', { taskId: plan.task.taskId })).task.copyDirectory);
+    assert.equal(implementation.copyDirectory, (await f.call('black_gravity_status', { taskId: plan.task.taskId })).task.copyDirectory);
     const context = await f.call('black_gravity_context', { taskId: run.task.taskId });
+    await writeFile(path.join(implementation.copyDirectory, 'source.txt'), 'changed');
+    const stale = await f.client.callTool({ name: 'black_gravity_handoff', arguments: { sourceTaskId: run.task.taskId,
+      expectedContextSha256: context.treeSha256, role: 'reviewer', prompt: 'review:test' } });
+    assert.equal((stale.structuredContent as any).error.code, 'CONTEXT_CHANGED');
+    await writeFile(path.join(implementation.copyDirectory, '.gitignore'), 'source.txt\n');
+    const changedSelection = await f.client.callTool({ name: 'black_gravity_context', arguments: { taskId: run.task.taskId } });
+    assert.equal((changedSelection.structuredContent as any).error.code, 'CONTEXT_CHANGED');
+    const excluded = await f.client.callTool({ name: 'black_gravity_handoff', arguments: { sourceTaskId: run.task.taskId, expectedContextSha256: context.treeSha256,
+      role: 'reviewer', prompt: 'review:test' } });
+    assert.equal((excluded.structuredContent as any).error.code, 'CONTEXT_CHANGED');
+    assert.equal(await readFile(path.join(implementation.copyDirectory, 'source.txt'), 'utf8'), 'changed');
+    await writeFile(path.join(implementation.copyDirectory, 'source.txt'), 'source');
+    await rm(path.join(implementation.copyDirectory, '.gitignore'), { force: true });
     const review = await f.call('black_gravity_handoff', { sourceTaskId: run.task.taskId, expectedContextSha256: context.treeSha256,
       role: 'reviewer', prompt: 'review:test' });
     assert.equal((await waitUntilReady(f.client, review.task.taskId)).status, 'completed');
@@ -200,17 +213,6 @@ test('role handoff transfers plans, criteria and decisions to independent copies
     assert.equal(violation.status, 'failed');
     assert.equal((await f.call('black_gravity_result', { taskId: malicious.task.taskId })).task.error.code, 'READ_ONLY_VIOLATION');
     assert.equal((await f.call('black_gravity_preview', { taskId: run.task.taskId })).summary.added, 1);
-    await writeFile(path.join(implementation.copyDirectory, 'source.txt'), 'changed');
-    const stale = await f.client.callTool({ name: 'black_gravity_handoff', arguments: { sourceTaskId: run.task.taskId,
-      expectedContextSha256: context.treeSha256, role: 'reviewer', prompt: 'review:test' } });
-    assert.equal((stale.structuredContent as any).error.code, 'CONTEXT_CHANGED');
-    await writeFile(path.join(implementation.copyDirectory, '.gitignore'), 'source.txt\n');
-    const changedSelection = await f.client.callTool({ name: 'black_gravity_context', arguments: { taskId: run.task.taskId } });
-    assert.equal((changedSelection.structuredContent as any).error.code, 'CONTEXT_CHANGED');
-    const excluded = await f.client.callTool({ name: 'black_gravity_handoff', arguments: { sourceTaskId: run.task.taskId, expectedContextSha256: context.treeSha256,
-      role: 'reviewer', prompt: 'review:test' } });
-    assert.equal((excluded.structuredContent as any).error.code, 'CONTEXT_CHANGED');
-    assert.equal(await readFile(path.join(implementation.copyDirectory, 'source.txt'), 'utf8'), 'changed');
     const reviewContext = await f.call('black_gravity_context', { taskId: review.task.taskId });
     const fixed = await f.call('black_gravity_handoff', { sourceTaskId: review.task.taskId, expectedContextSha256: reviewContext.treeSha256,
       role: 'implementer', prompt: 'split:test' });

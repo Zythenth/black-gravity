@@ -53,9 +53,15 @@ async function fixture(body: (f: { root: string; source: string; config: Config;
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   }
 }
-async function until(predicate: () => boolean) {
+async function until(predicate: () => boolean, describeFailure?: () => string) {
   const deadline = Date.now() + 60000;
-  while (!predicate()) { if (Date.now() > deadline) throw Error('Fixture condition timed out'); await delay(20); }
+  while (!predicate()) {
+    if (Date.now() > deadline) {
+      const detail = describeFailure ? `: ${describeFailure()}` : '';
+      throw Error(`Fixture condition timed out${detail}`);
+    }
+    await delay(20);
+  }
 }
 import { clientTask, readMessages } from '../src/messages.js';
 import { taskPrompt } from '../src/cli-adapter.js';
@@ -139,14 +145,17 @@ function peerDefinition(source: string, routes: Array<{ from: string; to: string
 test('routed continuation finishes before a dependent starts and compact receipts exclude bodies', async () => {
   await fixture(async ({ source, tasks, adapter }) => {
     const input = peerDefinition(source);
+    input.jobs.reverse();
     input.jobs.push({ key: 'join', owner: 'implementer', dependsOn: ['a','b'], task: { prompt: 'Read joined result', mode: 'read-only' } });
     const group = await tasks.groups.create(randomUUID(), input); tasks.groups.start(group.groupId, group.definitionSha256);
-    await until(() => adapter.calls.length === 2);
-    adapter.calls.find(call => call.key === 'b')!.finish();
-    await until(() => tasks.list().some(task => task.group?.nodeKey === 'b' && task.status === 'completed'));
+    await until(() => adapter.calls.length === 1);
+    assert.equal(adapter.calls[0]!.key, 'b');
+    adapter.calls[0]!.finish();
+    await until(() => tasks.list().some(task => task.group?.nodeKey === 'b' && task.status === 'completed') && adapter.calls.length === 2);
+    assert.equal(adapter.calls[1]!.key, 'a');
     const message = { messageId: randomUUID(), toNode: 'b', text: 'PRIVATE_ROUTED_BODY' };
-    adapter.calls.find(call => call.key === 'a')!.finish('JSON final response', { summary: envelope(message) });
-    await until(() => adapter.calls.length === 3);
+    adapter.calls[1]!.finish('JSON final response', { summary: envelope(message) });
+    await until(() => adapter.calls.length === 3 && tasks.groups.peerReceipts(group.groupId).receipts[0]?.state === 'sent');
     assert.equal(adapter.calls[2]!.key, 'b'); assert.equal(adapter.calls[2]!.options.prompt, message.text);
     assert.equal(adapter.calls[2]!.options.peerOrigin?.messageId, message.messageId);
     assert.deepEqual(adapter.calls[2]!.options.peerContext?.targets, []);
@@ -170,7 +179,73 @@ test('a peer input waits for dependent admission, queues during its turn and is 
     await until(() => adapter.calls.length === 1);
     const message = { messageId: randomUUID(), toNode: 'b', text: 'exact peer data' };
     adapter.calls[0]!.finish(envelope(message) + envelope(message));
-    await until(() => adapter.calls.length === 2 && tasks.groups.peerReceipts(group.groupId).receipts[0]?.state === 'queued');
+    const waitStartedAt = Date.now();
+    const transitions: Array<{
+      elapsedMs: number;
+      callsLength: number;
+      callKeys: string[];
+      admissionMet: boolean;
+      receiptCount: number;
+      receiptState: string;
+      receiptError: string | null;
+      receiptQueued: boolean;
+    }> = [];
+    let lastSignature = '';
+    const recordObservation = () => {
+      const callsLength = adapter.calls.length;
+      const callKeys = adapter.calls.map(call => call.key);
+      const receipts = tasks.groups.peerReceipts(group.groupId).receipts;
+      const receipt = receipts[0];
+      const receiptState = receipt?.state ?? 'none';
+      const receiptError = receipt?.error?.code ?? null;
+      const admissionMet = callsLength === 2;
+      const receiptQueued = receiptState === 'queued';
+      const signature = `${callsLength}|${callKeys.join(',')}|${receipts.length}|${receiptState}|${receiptError ?? ''}`;
+      if (signature !== lastSignature) {
+        lastSignature = signature;
+        if (transitions.length < 40) {
+          transitions.push({
+            elapsedMs: Date.now() - waitStartedAt,
+            callsLength,
+            callKeys,
+            admissionMet,
+            receiptCount: receipts.length,
+            receiptState,
+            receiptError,
+            receiptQueued,
+          });
+        }
+      }
+      return { admissionMet, receiptQueued };
+    };
+    await until(
+      () => {
+        const observed = recordObservation();
+        return observed.admissionMet && observed.receiptQueued;
+      },
+      () => {
+        const finalObservation = recordObservation();
+        const groupStatus = tasks.groups.status(group.groupId);
+        const taskSummaries = tasks.list()
+          .filter(item => item.group?.groupId === group.groupId)
+          .map(item => ({
+            nodeKey: item.group!.nodeKey,
+            status: item.status,
+            errorCode: item.error?.code ?? null,
+            peerRequestCount: item.peerRequests?.length ?? 0,
+            inboxStates: (item.inbox ?? []).map(entry => ({ state: entry.receipt.state, errorCode: entry.receipt.error?.code ?? null })),
+            dispatching: Boolean(item.dispatching),
+          }));
+        return JSON.stringify({
+          conditions: finalObservation,
+          groupState: groupStatus.state,
+          groupError: groupStatus.error?.code ?? null,
+          nodes: groupStatus.nodes.map(node => ({ key: node.key, state: node.state, hasTask: Boolean(node.taskId), errorCode: node.error?.code ?? null })),
+          tasks: taskSummaries,
+          transitions,
+        });
+      },
+    );
     assert.equal(adapter.calls[1]!.key, 'b');
     adapter.calls[1]!.finish();
     await until(() => adapter.calls.length === 3); adapter.calls[2]!.finish();
@@ -182,9 +257,14 @@ test('a peer input waits for dependent admission, queues during its turn and is 
 test('default and reverse routes fail explicitly without admitting an extra native turn', async () => {
   for (const routes of [[], [{ from: 'a', to: 'b' }]]) await fixture(async ({ source, tasks, adapter }) => {
     const group = await tasks.groups.create(randomUUID(), peerDefinition(source, routes)); tasks.groups.start(group.groupId, group.definitionSha256);
+    await until(() => adapter.calls.length === 1);
+    const first = adapter.calls[0]!;
+    if (first.key === 'b') first.finish(envelope({ messageId: randomUUID(), toNode: 'a', text: 'denied reverse' }));
+    else first.finish();
     await until(() => adapter.calls.length === 2);
-    adapter.calls.find(call => call.key === 'b')!.finish(envelope({ messageId: randomUUID(), toNode: 'a', text: 'denied reverse' }));
-    adapter.calls.find(call => call.key === 'a')!.finish();
+    const second = adapter.calls[1]!;
+    if (second.key === 'b') second.finish(envelope({ messageId: randomUUID(), toNode: 'a', text: 'denied reverse' }));
+    else second.finish();
     await until(() => tasks.groups.status(group.groupId).state === 'failed');
     const receipt = tasks.groups.peerReceipts(group.groupId).receipts[0]!;
     assert.equal(receipt.state, 'failed'); assert.equal(receipt.error!.code, 'PEER_ROUTE_DENIED'); assert.equal(adapter.calls.length, 2);
@@ -192,11 +272,16 @@ test('default and reverse routes fail explicitly without admitting an extra nati
 });
 test('conflicting public IDs and truncated requests stop coordination before dispatch', async () => {
   for (const overflow of [false, true]) await fixture(async ({ source, tasks, adapter }) => {
-    const group = await tasks.groups.create(randomUUID(), peerDefinition(source)); tasks.groups.start(group.groupId, group.definitionSha256);
+    const input = peerDefinition(source); input.jobs.reverse();
+    const group = await tasks.groups.create(randomUUID(), input); tasks.groups.start(group.groupId, group.definitionSha256);
+    await until(() => adapter.calls.length === 1);
+    assert.equal(adapter.calls[0]!.key, 'b');
+    adapter.calls[0]!.finish();
     await until(() => adapter.calls.length === 2);
+    assert.equal(adapter.calls[1]!.key, 'a');
     const id = randomUUID(), inputs = overflow ? Array.from({ length: 21 }, (_, index) => ({ messageId: randomUUID(), toNode: 'b', text: 'input' + index }))
       : [{ messageId: id, toNode: 'b', text: 'original' }, { messageId: id, toNode: 'b', text: 'changed' }];
-    adapter.calls.find(call => call.key === 'a')!.finish(inputs.map(envelope).join('\n'));
+    adapter.calls[1]!.finish(inputs.map(envelope).join('\n'));
     await until(() => tasks.groups.status(group.groupId).state === 'paused');
     assert.equal(tasks.groups.status(group.groupId).error!.code, overflow ? 'PEER_LIMIT_EXCEEDED' : 'PEER_MESSAGE_CONFLICT');
     assert.equal(adapter.calls.length, 2);
@@ -204,13 +289,17 @@ test('conflicting public IDs and truncated requests stop coordination before dis
 });
 test('ambiguous acknowledgment recovers the same persisted input without duplicating the continuation', async () => {
   await fixture(async ({ source, tasks, adapter, config }) => {
-    const group = await tasks.groups.create(randomUUID(), peerDefinition(source)); tasks.groups.start(group.groupId, group.definitionSha256);
-    await until(() => adapter.calls.length === 2); adapter.calls.find(call => call.key === 'b')!.finish();
-    await until(() => tasks.list().some(task => task.group?.nodeKey === 'b' && task.status === 'completed'));
+    const input = peerDefinition(source); input.jobs.reverse();
+    const group = await tasks.groups.create(randomUUID(), input); tasks.groups.start(group.groupId, group.definitionSha256);
+    await until(() => adapter.calls.length === 1);
+    assert.equal(adapter.calls[0]!.key, 'b');
+    adapter.calls[0]!.finish();
+    await until(() => tasks.list().some(task => task.group?.nodeKey === 'b' && task.status === 'completed') && adapter.calls.length === 2);
+    assert.equal(adapter.calls[1]!.key, 'a');
     const original = tasks.sendMessage.bind(tasks); let accepted = false;
     tasks.sendMessage = async (...args) => { const result = await original(...args); if (!accepted) { accepted = true; throw Error('Acknowledgment lost after acceptance'); } return result; };
     try {
-      adapter.calls.find(call => call.key === 'a')!.finish(envelope({ messageId: randomUUID(), toNode: 'b', text: 'once only' }));
+      adapter.calls[1]!.finish(envelope({ messageId: randomUUID(), toNode: 'b', text: 'once only' }));
       await until(() => tasks.groups.status(group.groupId).state === 'paused' && adapter.calls.length === 3);
       assert.equal(tasks.groups.status(group.groupId).error!.code, 'PEER_DISPATCH_UNVERIFIED');
       const store = new GroupStore(config.stateDirectory), transportId = store.read(group.groupId).peerDeliveries![0]!.transportId;
@@ -225,11 +314,15 @@ test('ambiguous acknowledgment recovers the same persisted input without duplica
 test('cancellation stops an active peer continuation and leaves pending dependents unstarted', async () => {
   await fixture(async ({ source, tasks, adapter }) => {
     const input = peerDefinition(source);
+    input.jobs.reverse();
     input.jobs.push({ key: 'join', owner: 'implementer', dependsOn: ['a','b'], task: { prompt: 'join', mode: 'read-only' } });
     const group = await tasks.groups.create(randomUUID(), input); tasks.groups.start(group.groupId, group.definitionSha256);
-    await until(() => adapter.calls.length === 2); adapter.calls.find(call => call.key === 'b')!.finish();
-    await until(() => tasks.list().some(task => task.group?.nodeKey === 'b' && task.status === 'completed'));
-    adapter.calls.find(call => call.key === 'a')!.finish(envelope({ messageId: randomUUID(), toNode: 'b', text: 'cancel pending work' }));
+    await until(() => adapter.calls.length === 1);
+    assert.equal(adapter.calls[0]!.key, 'b');
+    adapter.calls[0]!.finish();
+    await until(() => tasks.list().some(task => task.group?.nodeKey === 'b' && task.status === 'completed') && adapter.calls.length === 2);
+    assert.equal(adapter.calls[1]!.key, 'a');
+    adapter.calls[1]!.finish(envelope({ messageId: randomUUID(), toNode: 'b', text: 'cancel pending work' }));
     await until(() => adapter.calls.length === 3);
     await tasks.groups.cancel(group.groupId);
     await until(() => tasks.list().find(task => task.sourceMessage)?.status === 'cancelled');

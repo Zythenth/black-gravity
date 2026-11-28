@@ -11,6 +11,7 @@ import type { SandboxSelection } from './sandbox-policy.js';
 import { registerOwnedProcessGroup } from './subprocess.js';
 import { BridgeError } from './types.js';
 import { redactExecutionDiagnostic } from './windows-executor.js';
+import { assertNoLinkAncestryAsync, isOwnedWorkspacePath } from './workspace-paths.js';
 
 export interface BubblewrapDetection {
   available: boolean;
@@ -607,12 +608,19 @@ function validateLinuxCommand(command: TestCommand): void {
   }
 }
 
-async function ownedDirectory(directory: string, temp: string, prefix: string): Promise<string> {
+async function ownedDirectory(directory: string, temp: string, prefix: string, stateDirectory?: string): Promise<string> {
   const stat = await lstat(directory);
   if (stat.isSymbolicLink() || !stat.isDirectory()) {
     throw new BridgeError('UNSAFE_RUNTIME_PATH', 'Linux executor temporary storage was replaced or linked');
   }
   const canonical = await realpath(directory);
+  if (stateDirectory) {
+    const canonicalState = await realpath(stateDirectory).catch(() => undefined);
+    if (canonicalState && isOwnedWorkspacePath(canonical, 'copy', [canonicalState])) {
+      await assertNoLinkAncestryAsync(directory, canonicalState);
+      return canonical;
+    }
+  }
   if (path.dirname(canonical) !== temp || !path.basename(canonical).startsWith(prefix)) {
     throw new BridgeError('UNSAFE_RUNTIME_PATH', 'Linux executor temporary storage was replaced or linked');
   }
@@ -785,16 +793,18 @@ export async function executeLinuxTest(
     throw new BridgeError('LINUX_BWRAP_MISSING', 'bwrap path must be outside the task copy');
   }
 
+  const effectiveStateDir = options.stateDirectory ? path.resolve(options.stateDirectory) : defaultStateDirectory();
   const temp = await realpath(os.tmpdir());
   const cwd = await ownedDirectory(
     copyDirectory,
     temp,
     path.basename(copyDirectory).startsWith('agy-mcp-copy-') ? 'agy-mcp-copy-' : 'black-gravity-copy-',
+    effectiveStateDir,
   );
 
   const candidateProtected = [
     ...(options.protectedPaths ?? []),
-    options.stateDirectory ? path.resolve(options.stateDirectory) : defaultStateDirectory(),
+    effectiveStateDir,
   ];
   const canonicalProtected: string[] = [];
   const protectedDirSet = new Set<string>();

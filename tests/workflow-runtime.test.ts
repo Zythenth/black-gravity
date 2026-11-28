@@ -1,15 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, rm, writeFile, realpath } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, readdir, readFile, rename, rm, writeFile, realpath } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import { setTimeout as delay } from 'node:timers/promises';
 import { ControlledCliAdapter } from './controlled-cli-adapter.js';
 import { loadConfig, type Config } from '../src/config.js';
+import { EXECUTION_POLICY_PATHS, mcpConfigWitnessPath } from '../src/execution-policy.js';
 import { TaskManager } from '../src/task-manager.js';
 import { StateStore } from '../src/state-store.js';
 import { discardProjectCopy } from '../src/isolation.js';
@@ -129,11 +130,223 @@ test('changed checkpoint files stop resume before a dependent model is admitted'
     assert.equal(adapter.calls.length, 1);
   });
 });
+type ProtectedDescendantCategory =
+  | 'verified-managed-mcp-config'
+  | 'unverified-managed-mcp-config'
+  | 'verified-managed-policy-helper'
+  | 'unverified-managed-policy-helper'
+  | 'verified-staged-skill'
+  | 'other-agents-descendant'
+  | 'workspace-descendant'
+  | 'unreadable-descendant';
+
+type ProtectedDescendantAuditResult = {
+  verdict: 'managed-mcp-config-only' | 'managed-helpers-only' | 'none-protected' | 'other-protected' | 'inconclusive';
+  auditError: string | null;
+  protectedDescendantCount: number | null;
+  truncated: boolean;
+  unreadableCount: number;
+  categories: Record<string, number>;
+  onlyVerifiedManagedMcpConfig: boolean;
+  allVerifiedManagedHelpers: boolean;
+};
+
+function listWindowsProtectedDescendantRelativePaths(copyDirectory: string): { hits: string[]; truncated: boolean; unreadableCount: number } {
+  const source = [
+    'using System;using System.Collections.Generic;using System.IO;using System.Runtime.InteropServices;using System.Security.AccessControl;',
+    'public sealed class ProtectedDescendantAuditResult { public string[] hits; public bool truncated; public int unreadableCount; }',
+    'public static class ProtectedDescendantAudit {',
+    '[DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)]static extern bool GetFileSecurity(string p,uint i,byte[] b,uint n,out uint needed);',
+    'static int CheckProtected(string p){uint n;GetFileSecurity(p,4,null,0,out n);if(n==0)return -1;byte[] b=new byte[n];if(!GetFileSecurity(p,4,b,n,out n))return -1;var sd=new RawSecurityDescriptor(b,0);return (sd.ControlFlags&ControlFlags.DiscretionaryAclProtected)!=0?1:0;}',
+    'static void Walk(string root,string dir,List<string> hits,int[] count,bool[] truncated,int[] unreadable){IEnumerable<string> entries;try{entries=Directory.EnumerateFileSystemEntries(dir);}catch{unreadable[0]++;return;}foreach(string entry in entries){if(++count[0]>5000){truncated[0]=true;return;}bool reparse=false;try{reparse=(File.GetAttributes(entry)&FileAttributes.ReparsePoint)!=0;}catch{unreadable[0]++;continue;}int state;try{state=CheckProtected(entry);}catch{state=-1;}if(state<0){unreadable[0]++;}else if(state==1){hits.Add(entry.Substring(root.Length).TrimStart(\'\\\\\',\'/\').Replace(\'\\\\\',\'/\'));}if(!reparse&&Directory.Exists(entry))Walk(root,entry,hits,count,truncated,unreadable);}}',
+    'public static ProtectedDescendantAuditResult Find(string root){string full=Path.GetFullPath(root).TrimEnd(\'\\\\\',\'/\');var hits=new List<string>();var truncated=new bool[]{false};var unreadable=new int[]{0};Walk(full,full,hits,new int[]{0},truncated,unreadable);return new ProtectedDescendantAuditResult{hits=hits.ToArray(),truncated=truncated[0],unreadableCount=unreadable[0]};}}',
+  ].join('\n');
+  const script = "$ErrorActionPreference='Stop'; Add-Type -TypeDefinition $env:BRIDGE_LPAC_AUDIT_SOURCE; $res = [ProtectedDescendantAudit]::Find($env:BRIDGE_LPAC_AUDIT_ROOT); ConvertTo-Json -InputObject $res -Depth 3 -Compress";
+  const output = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    windowsHide: true,
+    encoding: 'utf8',
+    timeout: 15_000,
+    maxBuffer: 1024 * 1024,
+    env: { ...process.env, BRIDGE_LPAC_AUDIT_SOURCE: source, BRIDGE_LPAC_AUDIT_ROOT: copyDirectory },
+  });
+  const parsed: unknown = JSON.parse(output.trim() || '{}');
+  if (!parsed || typeof parsed !== 'object') {
+    throw new Error('audit-malformed-output');
+  }
+  const record = parsed as { hits?: unknown; truncated?: unknown; unreadableCount?: unknown };
+  if (record.hits !== undefined && record.hits !== null && !Array.isArray(record.hits) && typeof record.hits !== 'string') {
+    throw new Error('audit-malformed-hits');
+  }
+  const rawHits = Array.isArray(record.hits) ? record.hits : typeof record.hits === 'string' ? [record.hits] : [];
+  if (rawHits.some(item => typeof item !== 'string')) {
+    throw new Error('audit-malformed-hits');
+  }
+  return {
+    hits: rawHits as string[],
+    truncated: record.truncated === true,
+    unreadableCount: typeof record.unreadableCount === 'number' && Number.isInteger(record.unreadableCount) && record.unreadableCount >= 0
+      ? record.unreadableCount
+      : 1,
+  };
+}
+
+async function auditProtectedDescendantCategories(
+  copyDirectory: string,
+  stateDirectory: string,
+  taskId: string,
+  fallbackTaskId?: string,
+): Promise<ProtectedDescendantAuditResult> {
+  const loaded = new StateStore(stateDirectory).load();
+  const primary = loaded.find(item => item.record.taskId === taskId);
+  const stored = primary?.project?.executionPolicy ? primary : (fallbackTaskId ? loaded.find(item => item.record.taskId === fallbackTaskId) : primary);
+  const missingPolicyContext = !stored?.project?.executionPolicy;
+  const policyFiles = new Map((stored?.project?.executionPolicy?.files ?? []).map(file => [file.path, file]));
+  const skillFiles = new Map(
+    (stored?.project?.providedSkills ?? []).flatMap(skill => skill.files.map(file => [file.path, file] as const)),
+  );
+  const managedSet = new Set<string>(EXECUTION_POLICY_PATHS);
+  const counts: Partial<Record<ProtectedDescendantCategory, number>> = {};
+  const addCategory = (category: ProtectedDescendantCategory) => {
+    counts[category] = (counts[category] ?? 0) + 1;
+  };
+  const walk = listWindowsProtectedDescendantRelativePaths(copyDirectory);
+  let unreadableCount = walk.unreadableCount;
+  for (const rel of walk.hits) {
+    const normalized = rel.replaceAll('\\', '/');
+    const full = path.join(copyDirectory, ...normalized.split('/'));
+    const stat = await lstat(full).catch(() => undefined);
+    if (!stat) {
+      unreadableCount += 1;
+      addCategory('unreadable-descendant');
+      continue;
+    }
+    const regularSingleLink = !stat.isSymbolicLink() && stat.isFile() && stat.nlink === 1;
+    let sha256: string | undefined;
+    if (regularSingleLink) {
+      try {
+        sha256 = createHash('sha256').update(await readFile(full)).digest('hex');
+      } catch {
+        unreadableCount += 1;
+        addCategory('unreadable-descendant');
+        continue;
+      }
+    }
+    if (normalized === '.agents/mcp_config.json') {
+      const expected = policyFiles.get(normalized);
+      addCategory(
+        expected && regularSingleLink && stat.size === expected.bytes && sha256 === expected.sha256
+          ? 'verified-managed-mcp-config'
+          : 'unverified-managed-mcp-config',
+      );
+    } else if (managedSet.has(normalized)) {
+      const expected = policyFiles.get(normalized as (typeof EXECUTION_POLICY_PATHS)[number]);
+      addCategory(
+        expected && regularSingleLink && stat.size === expected.bytes && sha256 === expected.sha256
+          ? 'verified-managed-policy-helper'
+          : 'unverified-managed-policy-helper',
+      );
+    } else if (skillFiles.has(normalized)) {
+      const expected = skillFiles.get(normalized)!;
+      addCategory(regularSingleLink && sha256 === expected.sha256 ? 'verified-staged-skill' : 'other-agents-descendant');
+    } else if (normalized.toLowerCase().startsWith('.agents/')) {
+      addCategory('other-agents-descendant');
+    } else {
+      addCategory('workspace-descendant');
+    }
+  }
+  const categories = Object.fromEntries(Object.entries(counts).sort(([a], [b]) => a.localeCompare(b)));
+  const verifiedManagedTotal = (counts['verified-managed-mcp-config'] ?? 0) + (counts['verified-managed-policy-helper'] ?? 0);
+  const inconclusive = walk.truncated || unreadableCount > 0 || missingPolicyContext;
+  const onlyVerifiedManagedMcpConfig = !inconclusive && walk.hits.length === 1 && counts['verified-managed-mcp-config'] === 1;
+  const allVerifiedManagedHelpers = !inconclusive && walk.hits.length > 0 && verifiedManagedTotal === walk.hits.length;
+  const verdict: ProtectedDescendantAuditResult['verdict'] = inconclusive
+    ? 'inconclusive'
+    : onlyVerifiedManagedMcpConfig
+      ? 'managed-mcp-config-only'
+      : allVerifiedManagedHelpers
+        ? 'managed-helpers-only'
+        : walk.hits.length === 0
+          ? 'none-protected'
+          : 'other-protected';
+  return {
+    verdict,
+    auditError: null,
+    protectedDescendantCount: walk.hits.length,
+    truncated: walk.truncated,
+    unreadableCount,
+    categories,
+    onlyVerifiedManagedMcpConfig,
+    allVerifiedManagedHelpers,
+  };
+}
+
+async function safeAuditProtectedDescendantCategories(
+  copyDirectory: string,
+  stateDirectory: string,
+  taskId: string,
+  fallbackTaskId?: string,
+): Promise<ProtectedDescendantAuditResult> {
+  try {
+    return await auditProtectedDescendantCategories(copyDirectory, stateDirectory, taskId, fallbackTaskId);
+  } catch (error) {
+    const rawCode = (error as { code?: unknown })?.code;
+    const code = typeof rawCode === 'string' && /^[A-Z0-9_-]{1,40}$/i.test(rawCode) ? rawCode : 'AUDIT_FAILED';
+    return {
+      verdict: 'inconclusive',
+      auditError: code,
+      protectedDescendantCount: null,
+      truncated: false,
+      unreadableCount: 0,
+      categories: {},
+      onlyVerifiedManagedMcpConfig: false,
+      allVerifiedManagedHelpers: false,
+    };
+  }
+}
+
+function readWindowsDaclSddl(targetPath: string): string {
+  const source = [
+    'using System;using System.ComponentModel;using System.Runtime.InteropServices;using System.Security.AccessControl;',
+    'public static class DaclReader {',
+    '[DllImport("advapi32.dll",CharSet=CharSet.Unicode,SetLastError=true)]static extern bool GetFileSecurity(string p,uint i,byte[] b,uint n,out uint needed);',
+    'public static string Read(string p){uint n;GetFileSecurity(p,4,null,0,out n);byte[] b=new byte[n];if(!GetFileSecurity(p,4,b,n,out n))throw new Win32Exception();return new RawSecurityDescriptor(b,0).GetSddlForm(AccessControlSections.Access);}}',
+  ].join('\n');
+  const script = "$ErrorActionPreference='Stop'; Add-Type -TypeDefinition $env:BRIDGE_DACL_READER_SOURCE; [DaclReader]::Read($env:BRIDGE_DACL_READER_TARGET)";
+  return execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
+    windowsHide: true,
+    encoding: 'utf8',
+    timeout: 15_000,
+    env: { ...process.env, BRIDGE_DACL_READER_SOURCE: source, BRIDGE_DACL_READER_TARGET: targetPath },
+  }).trim();
+}
+
+function protectWindowsFileDacl(targetPath: string): void {
+  execFileSync(path.join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'icacls.exe'), [targetPath, '/inheritance:d'], {
+    windowsHide: true,
+    timeout: 15_000,
+  });
+}
+
+async function waitForTaskTerminal(tasks: TaskManager, taskId: string, timeoutMs = 180_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!['completed', 'failed', 'cancelled', 'timeout'].includes(tasks.status(taskId).status)) {
+    if (Date.now() > deadline) throw Error(`Native test ${taskId} did not finish`);
+    await delay(100);
+  }
+  return tasks.status(taskId);
+}
+
 test('test hook rejects client-reported evidence and accepts a real Windows LPAC execution', async t => {
   if (process.platform !== 'win32') { t.skip('Real Windows LPAC executor requires Windows'); return; }
-  await fixture(async ({ source, tasks, adapter, config }) => {
+  const runtime = loadConfig();
+  const configureLpac = (config: Config) => {
     config.testExecutor = 'windows-lpac';
-    const runtime = loadConfig(); config.windowsNodeRuntime = runtime.windowsNodeRuntime; config.windowsNodeCacheDirectory = runtime.windowsNodeCacheDirectory;
+    config.windowsNodeRuntime = runtime.windowsNodeRuntime;
+    config.windowsNodeCacheDirectory = runtime.windowsNodeCacheDirectory;
+  };
+
+  await fixture(async ({ source, tasks, adapter, config }) => {
+    configureLpac(config);
     const input = workflow(source); input.jobs[0]!.task.mode = 'write'; input.workflow!.hooks = { first: { requireTests: true } };
     const group = await tasks.groups.create(randomUUID(), input); tasks.groups.start(group.groupId, group.definitionSha256);
     await until(() => adapter.calls.length === 1); adapter.calls[0]!.finish('Public response', { summary: 'Ready for observed tests' });
@@ -145,28 +358,183 @@ test('test hook rejects client-reported evidence and accepts a real Windows LPAC
     await until(() => tasks.groups.status(group.groupId).state === 'paused');
     assert.equal(tasks.groups.status(group.groupId).error!.code, 'WORKFLOW_TEST_REQUIRED');
     assert.equal(adapter.calls.length, 1);
+    const firstCopy = tasks.list().find(task => task.taskId === firstId)!.copyDirectory!;
+    const mcpPath = path.join(firstCopy, '.agents', 'mcp_config.json');
+    const beforeMcpStat = await lstat(mcpPath, { bigint: true });
+    const beforeMcpBytes = await readFile(mcpPath);
+    const beforeMcpDacl = readWindowsDaclSddl(mcpPath);
+    const custodyRoot = path.join(config.stateDirectory, 'windows-lpac-custody');
+    const witnessFile = mcpConfigWitnessPath(config.stateDirectory, firstId);
+    const beforeStartTestsAudit = await safeAuditProtectedDescendantCategories(firstCopy, config.stateDirectory, firstId);
+    assert.equal(beforeStartTestsAudit.onlyVerifiedManagedMcpConfig, true, JSON.stringify(beforeStartTestsAudit));
+    const probeScript = [
+      "const fs=require('node:fs');",
+      "if(!fs.existsSync('source.txt'))process.exit(7);",
+      "if(fs.existsSync('.agents/mcp_config.json'))process.exit(11);",
+      "try{fs.readFileSync('.agents/mcp_config.json');process.exit(11);}catch(e){if(e.code!=='ENOENT')process.exit(11);}",
+      "try{fs.readdirSync(process.argv[1]);process.exit(12);}catch(e){if(e.code!=='EACCES'&&e.code!=='EPERM')process.exit(12);}",
+      "try{fs.readFileSync(process.argv[2]);process.exit(13);}catch(e){if(e.code!=='EACCES'&&e.code!=='EPERM')process.exit(13);}",
+      "console.log('copied source present');",
+    ].join('');
     const tested = await tasks.startTests(firstId, preview.sha256, { executable: process.execPath,
-      args: ['-e', "if(!require('node:fs').existsSync('source.txt'))process.exit(7);console.log('copied source present')"] }, 0, 120);
-    const deadline = Date.now() + 180000;
-    while (!['completed','failed','cancelled','timeout'].includes(tasks.status(tested.taskId).status)) {
-      if (Date.now() > deadline) throw Error('Native test did not finish'); await delay(100);
-    }
-    assert.equal(tasks.status(tested.taskId).status, 'completed', JSON.stringify(tasks.status(tested.taskId)));
+      args: ['-e', probeScript, custodyRoot, witnessFile] }, 0, 120);
+    const testedStatus = await waitForTaskTerminal(tasks, tested.taskId);
+    const failureDiagnostic = testedStatus.status === 'completed'
+      ? ''
+      : JSON.stringify({
+          status: testedStatus.status,
+          errorCode: testedStatus.error?.code ?? null,
+          errorMessage: testedStatus.error?.message ?? null,
+          protectedDescendantAudit: {
+            beforeStartTests: beforeStartTestsAudit,
+            afterTerminal: await safeAuditProtectedDescendantCategories(testedStatus.copyDirectory ?? firstCopy, config.stateDirectory, tested.taskId, firstId),
+          },
+        });
+    assert.equal(testedStatus.status, 'completed', failureDiagnostic);
     assert.equal(tasks.list().find(task => task.taskId === tested.taskId)!.tests!.at(-1)!.source, 'windows-executor');
+    const afterMcpStat = await lstat(mcpPath, { bigint: true });
+    assert.equal(afterMcpStat.dev, beforeMcpStat.dev, 'restored managed MCP config must keep exact volume');
+    assert.equal(afterMcpStat.ino, beforeMcpStat.ino, 'restored managed MCP config must keep exact NTFS file ID');
+    assert.equal(afterMcpStat.nlink, 1n);
+    assert.deepEqual(await readFile(mcpPath), beforeMcpBytes);
+    assert.equal(readWindowsDaclSddl(mcpPath), beforeMcpDacl, 'restored managed MCP config must preserve exact original DACL');
+    assert.equal((await lstat(mcpConfigWitnessPath(config.stateDirectory, firstId))).isFile(), true, 'parent staging witness must remain preserved');
+    assert.equal((await lstat(mcpConfigWitnessPath(config.stateDirectory, tested.taskId))).isFile(), true, 'test task must get its own per-task staging witness');
+    assert.deepEqual(await readdir(custodyRoot).catch(() => []), [], 'custody directory must be empty after clean restoration');
     tasks.groups.start(group.groupId, group.definitionSha256);
     await until(() => adapter.calls.length === 2); adapter.calls[1]!.finish('Public response', { summary: 'Observed test synthesis' });
     await until(() => tasks.groups.status(group.groupId).state === 'completed');
     assert.equal(adapter.calls.length, 2);
     const latestPreview = await tasks.preview(tested.taskId, false);
     const failed = await tasks.startTests(tested.taskId, latestPreview.sha256, { executable: process.execPath, args: ['-e','process.exit(7)'] }, 0, 120);
-    const failureDeadline = Date.now() + 180000;
-    while (!['completed','failed','cancelled','timeout'].includes(tasks.status(failed.taskId).status)) {
-      if (Date.now() > failureDeadline) throw Error('Negative native test did not finish'); await delay(100);
-    }
-    assert.equal(tasks.status(failed.taskId).error!.code, 'TEST_FAILED');
+    const failedStatus = await waitForTaskTerminal(tasks, failed.taskId);
+    assert.equal(failedStatus.error!.code, 'TEST_FAILED');
     await assert.rejects(tasks.groups.workflowResult(group.groupId), { code: 'WORKFLOW_TASK_UNAVAILABLE' });
     assert.equal(tasks.groups.status(group.groupId).state, 'paused');
+  });
 
+  // Unknown protected descendant must be refused before launching any LPAC command and left completely untouched.
+  await fixture(async ({ source, tasks, adapter, config }) => {
+    configureLpac(config);
+    const input = workflow(source); input.jobs[0]!.task.mode = 'write'; input.workflow!.hooks = { first: { requireTests: true } };
+    const group = await tasks.groups.create(randomUUID(), input); tasks.groups.start(group.groupId, group.definitionSha256);
+    await until(() => adapter.calls.length === 1); adapter.calls[0]!.finish('Public response', { summary: 'Ready for protected descendant refusal' });
+    await until(() => tasks.groups.status(group.groupId).state === 'paused');
+    const firstId = tasks.groups.status(group.groupId).nodes[0]!.taskId!;
+    const originalPreview = await tasks.preview(firstId, false);
+    assert.equal(tasks.groups.status(group.groupId).error!.code, 'WORKFLOW_TEST_REQUIRED');
+    await tasks.recordTest(firstId, originalPreview.sha256, 'reported command', 0, 'client-reported only');
+    tasks.groups.start(group.groupId, group.definitionSha256);
+    await until(() => tasks.groups.status(group.groupId).state === 'paused');
+    assert.equal(tasks.groups.status(group.groupId).error!.code, 'WORKFLOW_TEST_REQUIRED');
+    assert.equal(adapter.calls.length, 1);
+    const firstCopy = tasks.list().find(task => task.taskId === firstId)!.copyDirectory!;
+    const mcpPath = path.join(firstCopy, '.agents', 'mcp_config.json');
+    const beforeMcpStat = await lstat(mcpPath, { bigint: true });
+    const beforeMcpBytes = await readFile(mcpPath);
+    const beforeMcpDacl = readWindowsDaclSddl(mcpPath);
+    const unknownPath = path.join(firstCopy, 'unknown-protected.txt');
+    const unknownContent = Buffer.from('unknown-protected-must-stay-untouched\n', 'utf8');
+    await writeFile(unknownPath, unknownContent);
+    protectWindowsFileDacl(unknownPath);
+    const beforeUnknownStat = await lstat(unknownPath, { bigint: true });
+    const beforeUnknownDacl = readWindowsDaclSddl(unknownPath);
+    const preview = await tasks.preview(firstId, false);
+    const markerPath = path.join(firstCopy, 'command-launched.txt');
+    const refused = await tasks.startTests(firstId, preview.sha256, {
+      executable: process.execPath,
+      args: ['-e', "require('node:fs').writeFileSync('command-launched.txt','launched')"],
+    }, 0, 120);
+    const refusedStatus = await waitForTaskTerminal(tasks, refused.taskId);
+    assert.equal(refusedStatus.status, 'failed', JSON.stringify(refusedStatus));
+    assert.equal(refusedStatus.error?.code, 'WINDOWS_LPAC_PERMISSIONS_INVALID', JSON.stringify(refusedStatus.error));
+    assert.match(refusedStatus.error?.message ?? '', /protected DACL/i, JSON.stringify(refusedStatus.error));
+    assert.equal((refusedStatus.tests ?? []).filter(entry => entry.testTaskId === refused.taskId).length, 0, 'no command receipt may be recorded on refusal');
+    await assert.rejects(lstat(markerPath), { code: 'ENOENT' }, 'no LPAC payload may execute when unknown protected descendant exists');
+    const afterUnknownStat = await lstat(unknownPath, { bigint: true });
+    assert.equal(afterUnknownStat.dev, beforeUnknownStat.dev);
+    assert.equal(afterUnknownStat.ino, beforeUnknownStat.ino);
+    assert.deepEqual(await readFile(unknownPath), unknownContent);
+    assert.equal(readWindowsDaclSddl(unknownPath), beforeUnknownDacl);
+    const afterMcpStat = await lstat(mcpPath, { bigint: true });
+    assert.equal(afterMcpStat.dev, beforeMcpStat.dev);
+    assert.equal(afterMcpStat.ino, beforeMcpStat.ino);
+    assert.deepEqual(await readFile(mcpPath), beforeMcpBytes);
+    assert.equal(readWindowsDaclSddl(mcpPath), beforeMcpDacl, 'managed MCP config must retain exact original DACL after refusal rollback');
+    assert.equal(tasks.groups.status(group.groupId).state, 'paused');
+    assert.equal(adapter.calls.length, 1);
+  });
+
+  // Forged managed MCP config (identical bytes in a replaced object with distinct NTFS file ID) must be refused untouched with no command launched.
+  await fixture(async ({ source, tasks, adapter, config }) => {
+    configureLpac(config);
+    const input = workflow(source); input.jobs[0]!.task.mode = 'write'; input.workflow!.hooks = { first: { requireTests: true } };
+    const group = await tasks.groups.create(randomUUID(), input); tasks.groups.start(group.groupId, group.definitionSha256);
+    await until(() => adapter.calls.length === 1); adapter.calls[0]!.finish('Public response', { summary: 'Ready for forged config refusal' });
+    await until(() => tasks.groups.status(group.groupId).state === 'paused');
+    const firstId = tasks.groups.status(group.groupId).nodes[0]!.taskId!;
+    const firstCopy = tasks.list().find(task => task.taskId === firstId)!.copyDirectory!;
+    const mcpPath = path.join(firstCopy, '.agents', 'mcp_config.json');
+    const originalStat = await lstat(mcpPath, { bigint: true });
+    const originalBytes = await readFile(mcpPath);
+    const forgedTemp = mcpPath + '.forged-' + randomUUID();
+    await writeFile(forgedTemp, originalBytes);
+    await rm(mcpPath);
+    await rename(forgedTemp, mcpPath);
+    protectWindowsFileDacl(mcpPath);
+    const forgedStat = await lstat(mcpPath, { bigint: true });
+    assert.notEqual(forgedStat.ino, originalStat.ino, 'forged replacement must have a distinct NTFS file ID');
+    const forgedDacl = readWindowsDaclSddl(mcpPath);
+    const preview = await tasks.preview(firstId, false);
+    const markerPath = path.join(firstCopy, 'command-launched.txt');
+    const refused = await tasks.startTests(firstId, preview.sha256, {
+      executable: process.execPath,
+      args: ['-e', "require('node:fs').writeFileSync('command-launched.txt','launched')"],
+    }, 0, 120);
+    const refusedStatus = await waitForTaskTerminal(tasks, refused.taskId);
+    assert.equal(refusedStatus.status, 'failed', JSON.stringify(refusedStatus));
+    assert.equal(refusedStatus.error?.code, 'EXECUTION_POLICY_VERIFICATION_FAILED', JSON.stringify(refusedStatus.error));
+    assert.match(refusedStatus.error?.message ?? '', /object identity does not match staging witness/i, JSON.stringify(refusedStatus.error));
+    assert.equal((refusedStatus.tests ?? []).filter(entry => entry.testTaskId === refused.taskId).length, 0);
+    await assert.rejects(lstat(markerPath), { code: 'ENOENT' });
+    const afterForgedStat = await lstat(mcpPath, { bigint: true });
+    assert.equal(afterForgedStat.dev, forgedStat.dev);
+    assert.equal(afterForgedStat.ino, forgedStat.ino);
+    assert.deepEqual(await readFile(mcpPath), originalBytes);
+    assert.equal(readWindowsDaclSddl(mcpPath), forgedDacl);
+  });
+
+  // Legacy task missing bridge-private staging witness must be refused without touching live config or launching any command.
+  await fixture(async ({ source, tasks, adapter, config }) => {
+    configureLpac(config);
+    const input = workflow(source); input.jobs[0]!.task.mode = 'write'; input.workflow!.hooks = { first: { requireTests: true } };
+    const group = await tasks.groups.create(randomUUID(), input); tasks.groups.start(group.groupId, group.definitionSha256);
+    await until(() => adapter.calls.length === 1); adapter.calls[0]!.finish('Public response', { summary: 'Ready for legacy missing-witness refusal' });
+    await until(() => tasks.groups.status(group.groupId).state === 'paused');
+    const firstId = tasks.groups.status(group.groupId).nodes[0]!.taskId!;
+    const firstCopy = tasks.list().find(task => task.taskId === firstId)!.copyDirectory!;
+    const mcpPath = path.join(firstCopy, '.agents', 'mcp_config.json');
+    const beforeStat = await lstat(mcpPath, { bigint: true });
+    const beforeBytes = await readFile(mcpPath);
+    const beforeDacl = readWindowsDaclSddl(mcpPath);
+    await rm(mcpConfigWitnessPath(config.stateDirectory, firstId));
+    const preview = await tasks.preview(firstId, false);
+    const markerPath = path.join(firstCopy, 'command-launched.txt');
+    const refused = await tasks.startTests(firstId, preview.sha256, {
+      executable: process.execPath,
+      args: ['-e', "require('node:fs').writeFileSync('command-launched.txt','launched')"],
+    }, 0, 120);
+    const refusedStatus = await waitForTaskTerminal(tasks, refused.taskId);
+    assert.equal(refusedStatus.status, 'failed', JSON.stringify(refusedStatus));
+    assert.equal(refusedStatus.error?.code, 'EXECUTION_POLICY_VERIFICATION_FAILED', JSON.stringify(refusedStatus.error));
+    assert.match(refusedStatus.error?.message ?? '', /staging witness is missing/i, JSON.stringify(refusedStatus.error));
+    assert.equal((refusedStatus.tests ?? []).filter(entry => entry.testTaskId === refused.taskId).length, 0);
+    await assert.rejects(lstat(markerPath), { code: 'ENOENT' });
+    const afterStat = await lstat(mcpPath, { bigint: true });
+    assert.equal(afterStat.dev, beforeStat.dev);
+    assert.equal(afterStat.ino, beforeStat.ino);
+    assert.deepEqual(await readFile(mcpPath), beforeBytes);
+    assert.equal(readWindowsDaclSddl(mcpPath), beforeDacl);
   });
 });
 
@@ -195,7 +563,7 @@ test('a selected predecessor supplies its changed files to a separate readonly r
     );
     assert.equal(adapter.calls.length, 2, JSON.stringify(tasks.groups.status(group.groupId)));
     const final = tasks.list().find(task => task.group?.nodeKey === 'final')!;
-    assert.notEqual(first.copyDirectory, final.copyDirectory);
+    assert.equal(first.copyDirectory, final.copyDirectory);
     assert.equal(await (await import('node:fs/promises')).readFile(path.join(final.copyDirectory!, 'source.txt'), 'utf8'), 'changed source\n');
     assert.equal(adapter.calls[1]!.options.contextTaskId, first.taskId);
     adapter.calls[1]!.finish('Public response', { summary: 'Reviewed changed source' });

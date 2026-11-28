@@ -1409,7 +1409,7 @@ test('handoff fork inherits copy-level modelProofFailure even when forked task e
   });
   const settledFork = await waitForTask(tasks, forked.taskId);
   assert.equal(settledFork.status, 'completed');
-  assert.notEqual(settledFork.copyDirectory, settledSource.copyDirectory);
+  assert.equal(settledFork.copyDirectory, settledSource.copyDirectory);
   assert.deepEqual(settledFork.execution?.observed, { model: null, status: 'not-observable' });
 
   const forkPreview = await tasks.preview(settledFork.taskId, false);

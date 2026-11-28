@@ -9,8 +9,9 @@ import { ProjectMemoryStore, type MemorySnapshot } from './project-memory.js';
 import { memorySelectionSchema, memorySnapshotsSchema, summarizeMemory } from './memory-context.js';
 import { validateProjectRoot, listProjectFiles } from './isolation.js';
 import { createHash, randomUUID } from 'node:crypto';
+import { existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
-import { readExecutionPolicyReceipt, readReceiptEditsSync, type ReceiptEdit } from './execution-policy.js';
+import { readExecutionPolicyReceipt, readReceiptEditsSync, removeMcpConfigWitness, removeStagedExecutionPolicyHelpers, type ReceiptEdit } from './execution-policy.js';
 import { agentPolicySelectionSchema, resolveAgentPolicy, type ResolvedAgentPolicy } from './agent-policy.js';
 import { integrationPreauthorized, type IntegrationApproval } from './integration-policy.js';
 import { type ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -26,12 +27,14 @@ import { prepareCraft, mergePermanentSkills, verifyCraftSelection, craftStatus, 
 import { convertCrlfToLf, listCopyFiles, normalizeEditedLineEndings, planLineEndings, restoreByteOrderMarks, restoreCrlfLineEndings, type LineEndingStyle } from './line-endings.js';
 import { assertForbiddenDirectoriesUsable, assertSecretExclusionsUsable, assertAgyPathUsable, assertWindowsNodeCacheDirectoryUsable, assertAntiAiCraftDirectoryUsable, type Config, type ApprovalMode, type ConfigurationIssue, type ConfigurationIssueReason, type TestExecutor } from './config.js';
 import { EventStore } from './event-store.js';
-import { assertManagedCopyPresent, assertTextIsUtf8, createProjectCopy, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, forkProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, clearLineEndingConversions, readProcessCleanupMarkerSync, upsertProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntriesSync, type ChangePreview, type ProcessCleanupMarker, type ProcessCleanupMarkerEntry, type ProjectCopy } from './isolation.js';
+import { assertManagedCopyPresent, assertTextIsUtf8, checkFenceMarker, createProjectCopy, handoffProjectExecutionPolicyWithProvenMcpConfig, stageProjectExecutionPolicy, verifyManagedCopy, discardProjectCopy, fingerprintProjectCopy, snapshotCopyFiles, integrateProjectCopy, previewProjectCopy, readProjectPatch, verifyReadOnlyCopy, editableCopyFiles, writeLineEndingConversions, readLineEndingConversions, readLineEndingConversionsMarker, clearLineEndingConversions, readProcessCleanupMarkerSync, upsertProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntrySync, removeProcessCleanupMarkerEntriesSync, type ChangePreview, type ProcessCleanupMarker, type ProcessCleanupMarkerEntry, type ProjectCopy } from './isolation.js';
+import { canonicalWorkspacePaths, isOwnedWorkspacePath, readWorkspaceMetadata, workspaceKey, writeWorkspaceMetadata, WORKSPACE_META_FILE_NAME, type WorkspaceMetadata } from './workspace-paths.js';
+import { archiveDirectoryFor, archiveTaskCheckpoint, hasTaskArchive, loadVerifiedTaskArchive, previewFromArchive, readArtifactFromArchive, readPatchFromArchive, removeTaskArchive, restoreTaskCheckpointIntoWorkspace, verifyCriteriaFromArchive, type VerifiedTaskArchive } from './workspace-archive.js';
 import { assertNoAgentConfigInCopy, ensureAgentGuard } from './agent-config.js';
-import { BridgeError, type DeniedReads, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt, type TestEvidence } from './types.js';
+import { BridgeError, type DeniedReads, type ResumeContext, type RunOptions, type TaskRecord, type CallerInboxItem, type CallerMessageReceipt, type TestEvidence } from './types.js';
 import { validatePrompt, validateRuntimeCacheSeparation, validateWorkingDirectory, validateStateSeparation } from './validation.js';
 import { copyIdentity, copyLockName, processAlive, StateStore, StateStoreLinkError, stateDirectoryProblem, type QuarantineReason, type QuarantinedSnapshot } from './state-store.js';
-import { criteriaSchema, verifyCriteria, type ReviewEvidence } from './verification.js';
+import { criteriaSchema, verifyCriteria, type AcceptanceCriterion, type ReviewEvidence } from './verification.js';
 import { prepareNativeTest, readNativeReceipt, readNativeSandboxError, testCommandSchema, type LocalNativeTestRequest, type LocalTestBackend, type NativeTestReceipt, type TestCommand } from './native-tests.js';
 import { textChunk } from './chunks.js';
 import { roleSchema, validateRoleReport, resolveRole, listRoles, applyRoleDefaults, effortSchema, type Effort } from './roles.js';
@@ -44,7 +47,7 @@ import type { BridgeEvent } from './types.js';
 import { decisionsSchema, handoffSchema } from './handoff.js';
 import { comparisonModelsSchema, compareFindings, type Comparison } from './comparison.js';
 import { normalizeSandboxPolicy, resolveSandboxSelection, sandboxPolicyDigest, type SandboxPolicySnapshot } from './sandbox-policy.js';
-import { executeWindowsTest, recoverWindowsExecutions, type WindowsExecution } from './windows-executor.js';
+import { assertNoPendingMcpCustodyForCopy, executeWindowsTest, recoverWindowsExecutions, type WindowsExecution } from './windows-executor.js';
 import { detectBubblewrap, executeLinuxTest, type BubblewrapDetection, type LinuxExecution } from './linux-executor.js';
 import { portableNodeStatus, type PortableNodeStatus } from './portable-node.js';
 import { classifyInitModel, evaluateModelProof } from './model-resolution.js';
@@ -100,8 +103,26 @@ function maintenanceErrorCode(error: unknown): string {
   return typeof candidate === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(candidate) ? candidate : 'UNEXPECTED_ERROR';
 }
 
-interface InternalTask { publicResponses?: Map<number, string>; messageKeys?: Set<string>; responseChars?: number; messageBufferLimited?: boolean; messageLimitReported?: boolean; record: TaskRecord; options: RunOptions; ownerPid: number; owned?: boolean; project?: ProjectCopy; releaseProject?: () => void; completion?: Promise<void>; child?: ChildProcessWithoutNullStreams; nativeAbort?: AbortController; executionAbort?: AbortController; timer?: NodeJS.Timeout; termination?: 'cancelled' | 'timeout'; editReceipts?: { offset: number; pending: Map<string, ReceiptEdit[]>; ambiguous: Set<string> }; nativeTest?: { nonce: string; commandLine: string; attempts: Array<{ receipt: NativeTestReceipt; output: string }>; steps: Set<number>; failure?: BridgeError } }
+interface InternalTask { publicResponses?: Map<number, string>; messageKeys?: Set<string>; responseChars?: number; messageBufferLimited?: boolean; messageLimitReported?: boolean; record: TaskRecord; options: RunOptions; ownerPid: number; owned?: boolean; archiveAttempted?: boolean; workspacePrepared?: boolean; project?: ProjectCopy; releaseProject?: () => void; completion?: Promise<void>; child?: ChildProcessWithoutNullStreams; nativeAbort?: AbortController; executionAbort?: AbortController; timer?: NodeJS.Timeout; termination?: 'cancelled' | 'timeout'; editReceipts?: { offset: number; pending: Map<string, ReceiptEdit[]>; ambiguous: Set<string> }; nativeTest?: { nonce: string; commandLine: string; attempts: Array<{ receipt: NativeTestReceipt; output: string }>; steps: Set<number>; failure?: BridgeError } }
 const terminal = new Set(['completed', 'failed', 'cancelled', 'timeout']);
+const TAMPER_ERROR_CODES = new Set([
+  'AGENT_CONFIG_IN_COPY',
+  'EXECUTION_POLICY_VERIFICATION_FAILED',
+  'PROVIDED_SKILL_CHANGED',
+  'SKILL_VERIFICATION_FAILED',
+]);
+const NON_RESUMABLE_ERROR_CODES = new Set([
+  ...TAMPER_ERROR_CODES,
+  'AGENT_CONFIG_IN_PATCH',
+  'READ_ONLY_VIOLATION',
+  'CHANGE_LIMIT_EXCEEDED',
+  'BLOCKED_FILE_DETECTED',
+  'OPENCODE_SESSION_NOT_FOUND',
+  'OPENCODE_SESSION_MISMATCH',
+  'STATE_PERSISTENCE_FAILED',
+  'STATE_RESTORE_TRUNCATED',
+  'ORPHAN_PROCESS_RUNNING',
+]);
 const DISCARDABLE_QUARANTINE_REASONS = new Set<QuarantineReason>([
   'copy-outside-temporary-directory',
   'source-mismatch',
@@ -146,7 +167,7 @@ export class TaskManager {
   private readonly inboxOwnerId = randomUUID();
   private readonly flushingInboxes = new Set<string>();
   private readonly claimingMessages = new Set<string>();
-  private readonly busyProjects = new Set<ProjectCopy>();
+  private readonly busyProjects = new Set<string>();
   private stateStore?: StateStore;
   private quarantined = new Map<string, QuarantinedSnapshot>();
   private degraded = false;
@@ -430,8 +451,281 @@ export class TaskManager {
     }
   }
 
-  private projectLock(project: ProjectCopy): string {
+  private projectLock(project: Pick<ProjectCopy, 'copyDirectory'>): string {
     return copyLockName(project.copyDirectory);
+  }
+
+  private projectKey(project: Pick<ProjectCopy, 'copyDirectory'>): string {
+    return copyIdentity(project.copyDirectory);
+  }
+
+  private isProjectBusy(project: Pick<ProjectCopy, 'copyDirectory'>): boolean {
+    return this.busyProjects.has(this.projectKey(project));
+  }
+
+  private sameCanonicalCopy(a: Pick<ProjectCopy, 'copyDirectory'>, b: Pick<ProjectCopy, 'copyDirectory'>): boolean {
+    return copyIdentity(a.copyDirectory) === copyIdentity(b.copyDirectory);
+  }
+
+  private lineageKey(task: InternalTask): string {
+    if (task.project?.lineageId) return task.project.lineageId;
+    if (task.project) return copyIdentity(task.project.copyDirectory);
+    return task.record.taskId;
+  }
+
+  private sameLineage(a: InternalTask, b: InternalTask): boolean {
+    if (a === b) return true;
+    if (!a.project || !b.project) return false;
+    if (a.project.lineageId || b.project.lineageId) {
+      return a.project.lineageId !== undefined && a.project.lineageId === b.project.lineageId && this.sameCanonicalCopy(a.project, b.project);
+    }
+    return this.sameCanonicalCopy(a.project, b.project);
+  }
+
+  private cloneProject(project: ProjectCopy, overrides?: Partial<ProjectCopy>): ProjectCopy {
+    return {
+      ...project,
+      baseline: new Map(project.baseline),
+      includedFiles: [...project.includedFiles],
+      ...(project.providedSkills ? { providedSkills: structuredClone(project.providedSkills) } : {}),
+      ...(project.blockedFiles ? { blockedFiles: project.blockedFiles.map(entry => ({ ...entry })) } : {}),
+      ...(project.executionPolicy ? { executionPolicy: structuredClone(project.executionPolicy) } : {}),
+      ...overrides,
+    };
+  }
+
+  private isCurrentOccupant(task: InternalTask): boolean {
+    const project = task.project;
+    if (!project || task.record.discardedAt) return false;
+    if (!project.workspaceStateDirectory) return true;
+    const metaFile = path.join(path.dirname(project.copyDirectory), WORKSPACE_META_FILE_NAME);
+    const meta = readWorkspaceMetadata(metaFile);
+    if (!meta) return false;
+    return meta.currentTaskId === task.record.taskId;
+  }
+
+  private isPositiveLiveOccupant(
+    task: InternalTask | undefined,
+    meta: WorkspaceMetadata | undefined,
+    workingDirectory: string,
+  ): boolean {
+    if (!task?.project?.workspaceStateDirectory || !meta) return false;
+    if (task.record.discardedAt || task.record.status === 'cancelled') return false;
+    if (meta.currentTaskId !== task.record.taskId) return false;
+    if (copyIdentity(meta.sourceDirectory) !== copyIdentity(workingDirectory)) return false;
+    if (meta.currentLineageId && task.project.lineageId && meta.currentLineageId !== task.project.lineageId) return false;
+    return existsSync(task.project.copyDirectory);
+  }
+
+  private async detectTamperedSameLineageLiveOccupant(
+    target: InternalTask | undefined,
+    meta: WorkspaceMetadata | undefined,
+    workingDirectory: string,
+  ): Promise<{ occupant: InternalTask; error: BridgeError } | undefined> {
+    if (!target || !meta?.currentTaskId) return undefined;
+    const occupant = this.tasks.get(meta.currentTaskId);
+    if (!occupant?.project || occupant === target) return undefined;
+    if (!this.isPositiveLiveOccupant(occupant, meta, workingDirectory) || !this.sameLineage(occupant, target)) {
+      return undefined;
+    }
+    try {
+      await assertNoAgentConfigInCopy(occupant.project, occupant.record.mode ?? 'write');
+      return undefined;
+    } catch (error) {
+      if (error instanceof BridgeError && TAMPER_ERROR_CODES.has(error.code)) {
+        return { occupant, error };
+      }
+      return undefined;
+    }
+  }
+
+  private async hasVerifiedFencedFailedPrepArchive(task: InternalTask | undefined): Promise<boolean> {
+    const project = task?.project;
+    if (!task || !project?.workspaceStateDirectory || !project.archiveSha256 || task.record.discardedAt) {
+      return false;
+    }
+    if (
+      !isOwnedWorkspacePath(project.copyDirectory, 'copy', [this.config.stateDirectory], project.sourceDirectory) ||
+      !isOwnedWorkspacePath(project.gitDirectory, 'baseline', [this.config.stateDirectory], project.sourceDirectory)
+    ) {
+      return false;
+    }
+    const metaFile = path.join(path.dirname(project.copyDirectory), WORKSPACE_META_FILE_NAME);
+    const meta = readWorkspaceMetadata(metaFile);
+    if (
+      !meta ||
+      meta.currentTaskId !== undefined ||
+      meta.currentLineageId !== undefined ||
+      !meta.fencedAt ||
+      (meta.fencedReason !== 'prepare' && meta.fencedReason !== 'restore') ||
+      copyIdentity(meta.sourceDirectory) !== copyIdentity(project.sourceDirectory) ||
+      meta.rootKey !== workspaceKey(project.sourceDirectory)
+    ) {
+      return false;
+    }
+    if (existsSync(project.gitDirectory)) {
+      await checkFenceMarker(project);
+      if (await readLineEndingConversionsMarker(project)) {
+        throw new BridgeError('LINE_ENDINGS_UNRESTORED', 'Files converted to LF for the CLI have not regained their original line endings; this happens once its processes are confirmed to have ended');
+      }
+    }
+    this.assertArchivedTaskReadSafe(task);
+    await this.loadArchiveForTask(task, true);
+    return true;
+  }
+
+  private knownResumeCause(record: TaskRecord): string | undefined {
+    if (record.status === 'timeout') return 'a timeout';
+    if (record.error?.code === 'TEST_FAILED') return 'a failed test run';
+    if (record.error?.code === 'SERVER_RESTARTED') return 'a bridge restart';
+    if (record.error?.code) return record.error.code;
+    if (record.status === 'failed') return 'a previous failure';
+    return undefined;
+  }
+
+  private summarizeRemainingWork(
+    previous: InternalTask | undefined,
+    acceptanceCriteria: readonly AcceptanceCriterion[] | undefined,
+    mode: 'write' | 'read-only',
+  ): string {
+    const lastTest = previous?.record.tests?.at(-1);
+    if (lastTest && lastTest.exitCode !== 0) {
+      return 'fix the failing test and finish the requested changes';
+    }
+    const criteriaCount = acceptanceCriteria?.length ?? 0;
+    if (criteriaCount > 0) {
+      return `complete the ${criteriaCount} configured acceptance ${criteriaCount === 1 ? 'criterion' : 'criteria'}`;
+    }
+    if (mode === 'read-only') {
+      return 'inspect the restored files and answer the follow-up request';
+    }
+    return 'check the restored files and finish the follow-up work';
+  }
+
+  private isSecurityOrViolationFailure(record: TaskRecord): boolean {
+    return Boolean(record.error?.code && NON_RESUMABLE_ERROR_CODES.has(record.error.code));
+  }
+
+  private statusRequiresCheckpointArchive(
+    project: ProjectCopy | undefined,
+    record: TaskRecord,
+    status: TaskRecord['status'],
+    errorCode?: string,
+  ): boolean {
+    if (!project?.workspaceStateDirectory || record.discardedAt || record.integratedAt) return false;
+    if (status === 'completed') return true;
+    if (status === 'failed' || status === 'timeout') {
+      return !(errorCode && NON_RESUMABLE_ERROR_CODES.has(errorCode));
+    }
+    return false;
+  }
+
+  private requiresCheckpointArchive(task: InternalTask): boolean {
+    return this.statusRequiresCheckpointArchive(task.project, task.record, task.record.status, task.record.error?.code);
+  }
+
+  private isTaskResumableStatus(record: TaskRecord): boolean {
+    if (record.integratedAt || record.discardedAt) return false;
+    if (record.status === 'completed') return true;
+    if (record.status === 'failed' || record.status === 'timeout') {
+      return !this.isSecurityOrViolationFailure(record);
+    }
+    return false;
+  }
+
+  private hasUnrelatedActiveTaskOnRoot(task: InternalTask): boolean {
+    if (!task.project?.workspaceStateDirectory) return false;
+    const rootKey = copyIdentity(task.project.sourceDirectory);
+    return [...this.tasks.values()].some(other =>
+      other !== task &&
+      !terminal.has(other.record.status) &&
+      !this.sameLineage(other, task) &&
+      copyIdentity(other.record.workingDirectory) === rootKey,
+    );
+  }
+
+  private assertArchivedTaskReadSafe(task: InternalTask, excludeTaskId?: string): void {
+    const project = task.project!;
+    if (this.hasQuarantinedCopySibling(project)) {
+      throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+    }
+    const copyKey = copyIdentity(project.copyDirectory);
+    for (const other of this.tasks.values()) {
+      if (excludeTaskId && other.record.taskId === excludeTaskId) continue;
+      if (this.sameLineage(other, task)) {
+        if (!terminal.has(other.record.status)) {
+          throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
+        }
+        if (other.record.processCleanup?.verified === false) {
+          throw this.unverifiedCleanupError([other.record.taskId]);
+        }
+      } else if (
+        !other.record.discardedAt &&
+        other.project &&
+        copyIdentity(other.project.copyDirectory) === copyKey &&
+        terminal.has(other.record.status) &&
+        this.recordBlocksCleanup(other.record)
+      ) {
+        throw this.unverifiedCleanupError([other.record.taskId]);
+      }
+    }
+    const marker = readProcessCleanupMarkerSync(project);
+    if (marker && marker.entries.length > 0) {
+      const blocking = marker.entries.filter(entry => {
+        const owner = this.tasks.get(entry.taskId);
+        if (!owner) return true;
+        if (this.sameLineage(owner, task)) return true;
+        return terminal.has(owner.record.status);
+      });
+      if (blocking.length > 0) {
+        throw this.unverifiedCleanupError(blocking.map(entry => entry.taskId));
+      }
+    }
+  }
+
+  private async withTaskRead<T>(task: InternalTask, operation: (archive?: VerifiedTaskArchive) => Promise<T>): Promise<T> {
+    const project = task.project!;
+    if (
+      project.workspaceStateDirectory &&
+      project.archiveSha256 &&
+      (!this.isCurrentOccupant(task) || this.hasUnrelatedActiveTaskOnRoot(task))
+    ) {
+      this.assertArchivedTaskReadSafe(task);
+      const archive = await this.loadArchiveForTask(task);
+      return operation(archive);
+    }
+    return this.withProject(project, async () => {
+      if (!this.isCurrentOccupant(task)) {
+        const archive = await this.loadArchiveForTask(task);
+        return operation(archive);
+      }
+      return operation(undefined);
+    });
+  }
+
+  private async loadArchiveForTask(task: InternalTask, verifyAllBlobs = false): Promise<VerifiedTaskArchive> {
+    if (!task.project?.workspaceStateDirectory || !task.project.archiveSha256) {
+      throw new BridgeError('CHECKPOINT_UNAVAILABLE', `No verified checkpoint archive is recorded for task ${task.record.taskId}`);
+    }
+    const archive = await loadVerifiedTaskArchive(this.config.stateDirectory, task.record.taskId, {
+      expectedManifestSha256: task.project.archiveSha256,
+      verifyAllBlobs,
+    });
+    if (
+      archive.manifest.sourceDirectory !== task.project.sourceDirectory ||
+      copyIdentity(archive.manifest.copyDirectory) !== copyIdentity(task.project.copyDirectory)
+    ) {
+      throw new BridgeError('CHECKPOINT_INVALID', `Archived checkpoint workspace identity mismatch for task ${task.record.taskId}`);
+    }
+    return archive;
+  }
+
+  private async previewTaskUnderLock(task: InternalTask): Promise<{ preview: ChangePreview; archive?: VerifiedTaskArchive }> {
+    if (this.isCurrentOccupant(task)) {
+      return { preview: await previewProjectCopy(task.project!, this.config) };
+    }
+    const archive = await this.loadArchiveForTask(task);
+    return { preview: previewFromArchive(archive), archive };
   }
 
   private assertNotQuarantined(taskId: string): void {
@@ -474,9 +768,15 @@ export class TaskManager {
         .filter(entry => !ownedIds.has(entry.taskId))
         .map(entry => [entry.taskId, entry]),
     );
-    const projects = new Map([...this.tasks.values()].filter(task => task.project && (task.owned || this.busyProjects.has(task.project))).map(task => [task.project!.copyDirectory, task.project!]));
+    const lineageProofFailures = new Map<string, string>();
+    for (const task of this.tasks.values()) {
+      if (task.project && (task.owned || this.isProjectBusy(task.project))) {
+        const failure = task.project.modelProofFailure ?? this.modelProofFailure(task.record);
+        if (failure) lineageProofFailures.set(this.lineageKey(task), failure);
+      }
+    }
     const ids = new Set(stored.map(task => task.record.taskId));
-    for (const [id, task] of this.tasks) if (!ids.has(id) && !task.owned && !this.busyProjects.has(task.project!)) {
+    for (const [id, task] of this.tasks) if (!ids.has(id) && !task.owned && (!task.project || !this.isProjectBusy(task.project))) {
       this.tasks.delete(id); this.events.drop(id);
     }
     const interrupted = new Set<string>();
@@ -489,23 +789,23 @@ export class TaskManager {
       for (const item of stored) {
         item.record.usageIsResume ??= Boolean(item.options.sessionId);
         const existing = this.tasks.get(item.record.taskId);
-        if (existing?.owned || (existing?.project && this.busyProjects.has(existing.project))) continue;
+        if (existing?.owned || (existing?.project && this.isProjectBusy(existing.project))) continue;
         // A legacy snapshot is sanitized once per file version and redaction context; the key covers the source bytes and the environment secrets.
         // The cached copy is a complete snapshot validated by StateStore.load() like any other, so it replaces the source as a whole. Anyone able to
         // write the state directory could already mark a snapshot as redacted, so the cache only has to stay consistent and current.
         const legacy = item.redacted || !item.fingerprint ? undefined : createHash('sha256').update(item.fingerprint + ':' + redactionContextDigest()).digest('hex');
         const cached = legacy ? this.state.loadSanitized(item.record.taskId, legacy) : undefined;
         if (cached) Object.assign(item, cached);
-        // The cache keeps this snapshot's own project; sharing one object between snapshots of the same copy happens only in memory.
         const ownProject = item.project;
         let hadProjectProofMarker = false;
         if (item.project) {
           hadProjectProofMarker = Boolean(item.project.modelProofFailure);
-          const shared = projects.get(item.project.copyDirectory) ?? item.project;
-          if (!projects.has(item.project.copyDirectory)) projects.set(item.project.copyDirectory, shared);
-          shared.modelProofFailure ??= item.project.modelProofFailure ?? this.modelProofFailure(item.record);
-          if (ownProject && shared.modelProofFailure) ownProject.modelProofFailure ??= shared.modelProofFailure;
-          item.project = shared;
+          const lKey = item.project.lineageId ?? copyIdentity(item.project.copyDirectory);
+          const proof = lineageProofFailures.get(lKey) ?? item.project.modelProofFailure ?? this.modelProofFailure(item.record);
+          if (proof) {
+            lineageProofFailures.set(lKey, proof);
+            item.project.modelProofFailure ??= proof;
+          }
         }
         // State written by earlier versions may hold unredacted results, reports, messages or tests; every returned field derives from the record.
         const restored = item.redacted ? undefined : sanitizePayload(item.record, RESTORE_LIMITS);
@@ -542,6 +842,10 @@ export class TaskManager {
         }
       }
       for (const task of missingCopyProofTasks) {
+        if (task.project) {
+          const failure = lineageProofFailures.get(this.lineageKey(task));
+          if (failure) task.project.modelProofFailure ??= failure;
+        }
         if (task.project?.modelProofFailure && !this.pendingSnapshots.has(task.record.taskId)) {
           this.persist(task.record.taskId);
         }
@@ -812,9 +1116,7 @@ export class TaskManager {
       : /^[a-zA-Z0-9_-]{1,128}$/;
     if (options.sessionId && !preLockSessionPattern.test(options.sessionId)) throw new BridgeError('INVALID_SESSION', `Invalid conversation ID. ${RESUME_GUIDANCE}`);
     const releaseRegistry = this.state.acquire('registry');
-    let pendingProjectRelease: (() => void) | undefined;
-    let contextProject: ProjectCopy | undefined;
-    let accepted = false;
+    let transientProjectRelease: (() => void) | undefined;
     try {
       this.refresh();
       if (options.groupAdmission) {
@@ -827,26 +1129,53 @@ export class TaskManager {
           return this.status(existing.record.taskId);
         }
       }
+      const validateResumeLineage = (target: InternalTask): void => {
+        const lineageTasks = [...this.tasks.values()].filter(candidate =>
+          this.sameLineage(candidate, target) && !(candidate.record.error?.code === 'STATE_PERSISTENCE_FAILED' && !candidate.record.startedAt));
+        if (lineageTasks.some(candidate => !terminal.has(candidate.record.status) || candidate.record.integratedAt || candidate.record.discardedAt)) {
+          throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+        }
+        const targetIndex = lineageTasks.indexOf(target);
+        if (targetIndex >= 0) {
+          for (let i = targetIndex + 1; i < lineageTasks.length; i++) {
+            const later = lineageTasks[i]!;
+            if (this.isSecurityOrViolationFailure(later.record)) {
+              throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+            }
+          }
+        }
+      };
       const resumeSource = resumeTaskId ? this.tasks.get(resumeTaskId) : undefined;
       if (resumeTaskId) {
         if (!resumeSource) this.assertNotQuarantined(resumeTaskId);
-        if (!resumeSource?.project || !resumeSource.record.sessionId || resumeSource.record.workingDirectory !== workingDirectory ||
-          (resumeSource.record.status !== 'completed' && resumeSource.record.error?.code !== 'TEST_FAILED') || resumeSource.record.integratedAt) {
+        if (!resumeSource?.project || resumeSource.record.workingDirectory !== workingDirectory ||
+          !this.isTaskResumableStatus(resumeSource.record)) {
           throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
         }
-        options.sessionId = resumeSource.record.sessionId;
+        validateResumeLineage(resumeSource);
+        options.resumeFromTaskId = resumeSource.record.taskId;
+        if (resumeSource.record.sessionId) {
+          options.sessionId = resumeSource.record.sessionId;
+        } else {
+          delete options.sessionId;
+        }
       }
       const contextSource = options.contextTaskId ? this.tasks.get(options.contextTaskId) : undefined;
       if (options.contextTaskId && !contextSource) this.assertNotQuarantined(options.contextTaskId);
-      if (options.contextTaskId && (options.sessionId || !contextSource?.project || contextSource.record.status !== 'completed' ||
-        contextSource.record.integratedAt || contextSource.record.workingDirectory !== workingDirectory)) {
+      if (options.contextTaskId && (options.sessionId || resumeTaskId || !contextSource?.project || contextSource.record.status !== 'completed' ||
+        contextSource.record.integratedAt || contextSource.record.discardedAt || contextSource.record.workingDirectory !== workingDirectory)) {
         throw new BridgeError('INVALID_CONTEXT', 'Context requires a completed, retained, non-integrated task in the same project; use a new session');
       }
-      let previous = options.sessionId ? [...this.tasks.values()].reverse().find(task =>
-        task.record.sessionId === options.sessionId && task.record.workingDirectory === workingDirectory && task.project &&
-        (!resumeSource || task.project.copyDirectory === resumeSource.project!.copyDirectory) && !(task.record.error?.code === 'STATE_PERSISTENCE_FAILED' && !task.record.startedAt)) : undefined;
-      if (options.sessionId && (!previous || (previous.record.status !== 'completed' && previous.record.error?.code !== 'TEST_FAILED') || previous.record.integratedAt)) {
-        throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+      let previous: InternalTask | undefined = resumeSource;
+      if (!previous && options.sessionId) {
+        previous = [...this.tasks.values()].reverse().find(task =>
+          task.record.sessionId === options.sessionId && task.record.workingDirectory === workingDirectory && task.project &&
+          !(task.record.error?.code === 'STATE_PERSISTENCE_FAILED' && !task.record.startedAt));
+        if (!previous || !this.isTaskResumableStatus(previous.record)) {
+          throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+        }
+        validateResumeLineage(previous);
+        options.resumeFromTaskId = previous.record.taskId;
       }
       const previousProvider = previous?.record.execution?.provider ?? 'agy';
       const targetProvider = requestedProvider ?? (previous
@@ -874,7 +1203,7 @@ export class TaskManager {
       }
       const budgetGroup = options.groupAdmission ?? previous?.record.group;
       if (budgetGroup) this.checkGroupBudget(budgetGroup.groupId);
-      if (previous?.project && this.busyProjects.has(previous.project)) throw new BridgeError('TASK_NOT_READY', 'The copy is being reviewed or removed');
+      if (previous?.project && this.isProjectBusy(previous.project)) throw new BridgeError('TASK_NOT_READY', 'The copy is being reviewed or removed');
       if (previous?.project && this.hasQuarantinedCopySibling(previous.project)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
       if (previous && executor instanceof AgyExecutionAdapter && !previous.record.agentPolicy && this.config.enforceAgentPolicy) throw new BridgeError('AGENT_POLICY_CHANGED', 'This legacy session has no enforced policy; start a new task under the configured human ceiling');
       if (previous && (options.allowedTools !== undefined || options.mcpServers !== undefined)) throw new BridgeError('INVALID_AGENT_POLICY', 'Resume retains its original tool policy; use a new task to select different tools');
@@ -916,9 +1245,57 @@ export class TaskManager {
       options.artifactPaths = previous?.record.artifactPaths ?? options.artifactPaths;
       if (options.outputSchema !== undefined) options.outputSchema = validateOutputSchema(options.outputSchema);
       if (options.artifactPaths !== undefined) options.artifactPaths = [...artifactPathsSchema.parse(options.artifactPaths)];
-      if (previous) await this.assertProcessesReconciled(previous.record);
-      if (previous?.project) await assertManagedCopyPresent(previous.project);
-      if (previous?.project) await verifyProvidedSkills(previous.project.copyDirectory, previous.project.providedSkills ?? []);
+      let verifiedResumeArchive: VerifiedTaskArchive | undefined;
+      if (previous?.project) {
+        await this.assertProcessesReconciled(previous.record);
+        if (previous.project.workspaceStateDirectory) {
+          const occupant = this.isCurrentOccupant(previous);
+          if (occupant) {
+            if (previous.record.status === 'completed') {
+              await assertManagedCopyPresent(previous.project);
+              await verifyProvidedSkills(previous.project.copyDirectory, previous.project.providedSkills ?? []);
+            } else {
+              try {
+                await assertManagedCopyPresent(previous.project);
+                await verifyManagedCopy(previous.project);
+                await assertNoAgentConfigInCopy(previous.project, previous.record.mode ?? 'write');
+              } catch {
+                throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+              }
+            }
+            if (previous.project.archiveSha256) {
+              try {
+                verifiedResumeArchive = await this.loadArchiveForTask(previous);
+              } catch {
+                throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+              }
+            } else if (
+              previous.record.status === 'failed' &&
+              previous.record.error?.code === 'SERVER_RESTARTED' &&
+              !previous.project.archivedAt
+            ) {
+              try {
+                verifiedResumeArchive = await this.withProject(previous.project, async () =>
+                  this.recoverInterruptedCheckpointUnderLock(previous!),
+                );
+              } catch {
+                throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+              }
+            }
+          } else if (previous.project.archiveSha256) {
+            try {
+              verifiedResumeArchive = await this.loadArchiveForTask(previous);
+            } catch {
+              throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+            }
+          } else {
+            throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+          }
+        } else {
+          await assertManagedCopyPresent(previous.project);
+          await verifyProvidedSkills(previous.project.copyDirectory, previous.project.providedSkills ?? []);
+        }
+      }
       options.handoff ??= previous?.record.handoff;
       if (previous) options.peerContext = structuredClone(previous.options.peerContext);
       if (options.peerOrigin) {
@@ -974,12 +1351,55 @@ export class TaskManager {
       }
       options.deliveryMode ??= previous?.record.deliveryMode ?? contextSource?.record.deliveryMode ?? 'events';
       options.roleDefinition = roleDefinition;
+      if (previous && !options.nativeTest) {
+        const knownCause = this.knownResumeCause(previous.record);
+        if (options.sessionId) {
+          if (previous.record.status !== 'completed' || !this.isCurrentOccupant(previous)) {
+            options.resumeContext = {
+              hasConversation: true,
+              previousTaskId: previous.record.taskId,
+              previousStatus: previous.record.status,
+              ...(knownCause ? { knownCause } : {}),
+            };
+          }
+        } else {
+          let doneFiles: string[] = [];
+          if (verifiedResumeArchive) {
+            doneFiles = previewFromArchive(verifiedResumeArchive).files.map(file => file.path);
+          } else if (previous.project && this.isCurrentOccupant(previous)) {
+            doneFiles = (await previewProjectCopy(previous.project, this.config)).files.map(file => file.path);
+          }
+          options.resumeContext = {
+            hasConversation: false,
+            previousTaskId: previous.record.taskId,
+            previousStatus: previous.record.status,
+            ...(knownCause ? { knownCause } : {}),
+            doneFiles,
+            remainingSummary: this.summarizeRemainingWork(previous, acceptanceCriteria, mode),
+          };
+        }
+      }
       if (contextSource?.project) {
         if (options.includePaths) throw new BridgeError('INVALID_CONTEXT', 'A context task uses the existing copy selection');
-        options.handoff = await this.withProject(contextSource.project, async () => {
-          const treeSha256 = await fingerprintProjectCopy(contextSource.project!, this.config);
-          const preview = await previewProjectCopy(contextSource.project!, this.config);
+        options.handoff = await this.withTaskRead(contextSource, async archive => {
+          const preview = archive ? previewFromArchive(archive) : await previewProjectCopy(contextSource.project!, this.config);
+          const treeSha256 = archive ? archive.manifest.treeSha256 : await fingerprintProjectCopy(contextSource.project!, this.config);
           if (treeSha256 !== options.expectedContextSha256) throw new BridgeError('CONTEXT_CHANGED', 'Context files changed; inspect the context again');
+          if (contextSource.project!.workspaceStateDirectory && !contextSource.project!.archiveSha256) {
+            const manifest = await archiveTaskCheckpoint({
+              stateDirectory: this.config.stateDirectory,
+              taskId: contextSource.record.taskId,
+              lineageId: contextSource.project!.lineageId ?? randomUUID(),
+              mode: contextSource.record.mode ?? 'write',
+              project: contextSource.project!,
+              limits: this.config,
+              artifacts: contextSource.record.artifacts,
+            });
+            contextSource.project!.archivedAt = manifest.archivedAt;
+            contextSource.project!.archiveSha256 = manifest.manifestSha256;
+            this.persist(contextSource.record.taskId);
+          }
+          options.handoffArchiveSha256 = contextSource.project!.archiveSha256;
           return handoffSchema.parse({
             sourceTaskId: contextSource.record.taskId, sourceRole: contextSource.record.role ?? 'implementer',
             sourceModel: contextSource.record.model ?? null, treeSha256, patchSha256: preview.sha256,
@@ -991,44 +1411,69 @@ export class TaskManager {
               stale: test.sha256 !== preview.sha256 || (test.treeSha256 !== undefined && test.treeSha256 !== treeSha256) })),
           });
         });
-        taskPrompt({ ...options, role, acceptanceCriteria }, this.config.maxPromptChars);
-        contextProject = await this.withProject(contextSource.project, async () => {
-          if (await fingerprintProjectCopy(contextSource.project!, this.config) !== options.handoff!.treeSha256) throw new BridgeError('CONTEXT_CHANGED', 'Context changed before copying');
-          const fork = await forkProjectCopy(contextSource.project!, this.config);
-          const inheritedFailure = contextSource.project!.modelProofFailure ?? this.copyModelProofFailure(contextSource);
-          if (inheritedFailure) fork.modelProofFailure = inheritedFailure;
-          if (await fingerprintProjectCopy(fork, this.config) !== options.handoff!.treeSha256 ||
-            (await previewProjectCopy(fork, this.config)).sha256 !== options.handoff!.patchSha256) {
-            await discardProjectCopy(fork);
-            throw new BridgeError('CONTEXT_CHANGED', 'Context changed while copying or contains newly ignored files');
-          }
-          return fork;
-        });
       }
-      options.providedSkills = (previous?.project ?? contextProject)?.providedSkills;
+      options.providedSkills = (previous?.project ?? contextSource?.project)?.providedSkills;
       taskPrompt({ ...options, role, acceptanceCriteria }, this.config.maxPromptChars);
       if (previous && !previous.project) throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
-      pendingProjectRelease = previous?.project || contextProject ? this.state.acquire(this.projectLock((previous?.project ?? contextProject)!)) : undefined;
+      const canonical = canonicalWorkspacePaths(this.config.stateDirectory, workingDirectory);
+      const hasActiveOnRoot = [...this.tasks.values()].some(t =>
+        !terminal.has(t.record.status) && copyIdentity(t.record.workingDirectory) === copyIdentity(workingDirectory));
       if (previous) {
-        // Integration and discard do not hold the registry lock and may have ended during the awaits above; the copy lock now keeps them out.
+        if (!hasActiveOnRoot) {
+          transientProjectRelease = this.state.acquire(this.projectLock(previous.project!));
+        }
+        // Integration and discard do not hold the registry lock and may have ended during the awaits above.
         this.refresh();
         if (resumeTaskId && !this.tasks.has(resumeTaskId)) this.assertNotQuarantined(resumeTaskId);
         previous = this.tasks.get(previous.record.taskId);
-        if (!previous?.project || previous.record.integratedAt) throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+        if (!previous?.project || !this.isTaskResumableStatus(previous.record)) throw new BridgeError('INVALID_SESSION', RESUME_REFUSED);
+        validateResumeLineage(previous);
         if (this.hasQuarantinedCopySibling(previous.project)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+        if (!hasActiveOnRoot && previous.project.workspaceStateDirectory) {
+          const meta = readWorkspaceMetadata(canonical.metadataPath);
+          const isExactLive = this.isPositiveLiveOccupant(previous, meta, workingDirectory);
+          const tamperedOccupant = isExactLive
+            ? undefined
+            : await this.detectTamperedSameLineageLiveOccupant(previous, meta, workingDirectory);
+          const exemptTaskId = isExactLive ? previous.record.taskId : tamperedOccupant?.occupant.record.taskId;
+          await this.ensureRootReadyForReuse(workingDirectory, {
+            ...(exemptTaskId ? { allowUnarchivedOccupantTaskId: exemptTaskId } : {}),
+            lockHeld: true,
+          });
+        }
+        if (previous.project.archiveSha256) {
+          options.parentArchiveSha256 = previous.project.archiveSha256;
+        }
       }
       if (this.tasks.size >= this.config.maxRetainedTasks) {
         const candidates = [...this.tasks.values()].filter(task => terminal.has(task.record.status) && task !== contextSource && !this.hasPendingInbox(task.record) && !(options.sourceMessage && task === previous));
-        const oldestFinished = candidates.find(task => !this.hasUnverifiedCleanup(task));
-        if (!oldestFinished) throw this.retentionLimitError(candidates[0]);
-        if (oldestFinished !== previous && oldestFinished.project && ![...this.tasks.values()].some(other => other !== oldestFinished && other.project === oldestFinished.project)) {
-          if (!await this.discardTask(oldestFinished.record.taskId, true)) {
-            throw this.retentionLimitError(oldestFinished);
+        let evicted: InternalTask | undefined;
+        let firstBlocked: InternalTask | undefined;
+        for (const candidate of candidates) {
+          if (this.hasUnverifiedCleanup(candidate)) {
+            firstBlocked ??= candidate;
+            continue;
           }
+          if (candidate !== previous && candidate.project && ![...this.tasks.values()].some(other => other !== candidate && this.sameLineage(other, candidate))) {
+            const releaseForEvict = transientProjectRelease && this.sameCanonicalCopy(candidate.project, previous!.project!);
+            if (releaseForEvict) { transientProjectRelease?.(); transientProjectRelease = undefined; }
+            const discarded = await this.discardTask(candidate.record.taskId, true);
+            if (!discarded) {
+              firstBlocked ??= candidate;
+              continue;
+            }
+          }
+          evicted = candidate;
+          break;
         }
-        this.tasks.delete(oldestFinished.record.taskId);
-        this.events.drop(oldestFinished.record.taskId);
-        this.state.drop(oldestFinished.record.taskId);
+        if (!evicted) throw this.retentionLimitError(firstBlocked ?? candidates[0]);
+        this.tasks.delete(evicted.record.taskId);
+        this.events.drop(evicted.record.taskId);
+        this.state.drop(evicted.record.taskId);
+      }
+      if (!previous && !hasActiveOnRoot) {
+        transientProjectRelease ??= this.state.acquire(copyLockName(canonical.copyDirectory));
+        await this.ensureRootReadyForReuse(workingDirectory, { lockHeld: true });
       }
       const recordOutputSchema = options.outputSchema;
       const recordArtifactPaths = options.artifactPaths;
@@ -1042,13 +1487,16 @@ export class TaskManager {
       const isAgyExecutor = executor instanceof AgyExecutionAdapter;
       const record: TaskRecord = { group: options.group, memory: summarizeMemory(options.memorySnapshots), ...(options.craft ? { craft: { revision: options.craft.revision, manifestSha256: options.craft.manifestSha256, permanent: options.craft.permanent, catalog: options.craft.catalog.map(entry => entry.name) } } : {}), parentTaskId: options.parentTaskId, sourceMessage: options.sourceMessage, deliveryMode: options.deliveryMode, providedSkills: options.providedSkills, taskId, sessionId: options.sessionId, model, effort: options.effort, execution: this.initialExecutionIdentity(model, options.effort, executor), mode, role, roleDefinition, prompt: options.prompt,
         acceptanceCriteria, handoff: options.handoff ?? previous?.record.handoff, comparison: options.comparison,
-        tests: previous?.record.tests ?? contextSource?.record.tests, usageIsResume: isAgyExecutor ? Boolean(previous) : false,
-        usageBaseline: isAgyExecutor && previous ? this.latestObservedUsage(previous.record.sessionId, workingDirectory) : undefined,
+        tests: previous?.record.tests ?? contextSource?.record.tests, usageIsResume: isAgyExecutor ? Boolean(previous && options.sessionId) : false,
+        usageBaseline: isAgyExecutor && previous && options.sessionId ? this.latestObservedUsage(previous.record.sessionId, workingDirectory) : undefined,
         workingDirectory, status: 'queued', createdAt: new Date().toISOString(),
         outputSchema: recordOutputSchema, artifactPaths: recordArtifactPaths, agentPolicy: options.agentPolicy };
-      this.tasks.set(record.taskId, { record, ownerPid: process.pid, owned: true, options: { ...options, provider: executor.identity.provider, model: model ?? null, role, acceptanceCriteria, workingDirectory, timeoutSeconds, mode }, project: previous?.project ?? contextProject, releaseProject: pendingProjectRelease });
-      accepted = true;
-      pendingProjectRelease = undefined;
+      const initialProject = previous?.project
+        ? this.cloneProject(previous.project, { archivedAt: undefined, archiveSha256: undefined })
+        : undefined;
+      this.tasks.set(record.taskId, { record, ownerPid: process.pid, owned: true, options: { ...options, provider: executor.identity.provider, model: model ?? null, role, acceptanceCriteria, workingDirectory, timeoutSeconds, mode }, project: initialProject });
+      transientProjectRelease?.();
+      transientProjectRelease = undefined;
       this.queue.push(record.taskId);
       try { this.events.append(record.taskId, 'task.queued', { workingDirectory, model }); }
       catch (error) {
@@ -1064,7 +1512,7 @@ export class TaskManager {
       }
       if (!this.batching) this.pump();
       return { ...record };
-    } finally { pendingProjectRelease?.(); releaseRegistry(); if (contextProject && !accepted) await discardProjectCopy(contextProject); }
+    } finally { transientProjectRelease?.(); releaseRegistry(); }
   }
 
   status(taskId: string): TaskRecord {
@@ -1171,7 +1619,11 @@ export class TaskManager {
     if (!ref) {
       throw new BridgeError('ARTIFACT_NOT_FOUND', `Artifact not recorded: ${artifactPath}`);
     }
-    return this.withProject(task.project, async () => {
+    return this.withTaskRead(task, async archive => {
+      if (archive) {
+        const chunk = await readArtifactFromArchive(archive, ref, expectedSha256, offset, limit, this.config.maxCopyBytes);
+        return { taskId, ...chunk };
+      }
       const chunk = await readArtifact(task.project!, ref, expectedSha256, offset, limit, this.config.maxCopyBytes, this.config);
       return { taskId, ...chunk };
     });
@@ -1183,10 +1635,12 @@ export class TaskManager {
     const task = this.tasks.get(taskId);
     if (!task) this.assertNotQuarantined(taskId);
     if (!task?.project || !terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Wait for the task before reading its patch');
-    return this.withProject(task.project, async () => {
+    return this.withTaskRead(task, async archive => {
       const selected = relative?.replaceAll('\\', '/');
       let patch: string;
-      if (selected !== undefined) {
+      if (archive) {
+        patch = readPatchFromArchive(archive, expectedSha256, selected);
+      } else if (selected !== undefined) {
         patch = await readProjectPatch(task.project!, selected, this.config, expectedSha256);
       } else {
         const preview = await previewProjectCopy(task.project!, this.config);
@@ -1207,10 +1661,16 @@ export class TaskManager {
     const task = this.tasks.get(taskId);
     if (!task) this.assertNotQuarantined(taskId);
     if (!task || !task.project || !terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Wait for an isolated task to finish');
-    return this.withProject(task.project, async () => {
-      const preview = await previewProjectCopy(task.project!, this.config);
-      const current = task.record.verification && await verifyCriteria(task.project!, preview.sha256, task.record.acceptanceCriteria, task.record.verification.review.evidence);
-      const tree = task.record.tests?.some(test => this.isObservedTestSource(test.source)) ? await fingerprintProjectCopy(task.project!, this.config) : undefined;
+    return this.withTaskRead(task, async archive => {
+      const preview = archive ? previewFromArchive(archive) : await previewProjectCopy(task.project!, this.config);
+      const current = task.record.verification
+        ? (archive
+          ? await verifyCriteriaFromArchive(archive, preview.sha256, task.record.acceptanceCriteria, task.record.verification.review.evidence)
+          : await verifyCriteria(task.project!, preview.sha256, task.record.acceptanceCriteria, task.record.verification.review.evidence))
+        : undefined;
+      const tree = task.record.tests?.some(test => this.isObservedTestSource(test.source))
+        ? (archive ? archive.manifest.treeSha256 : await fingerprintProjectCopy(task.project!, this.config))
+        : undefined;
       return { ...preview, patch: includePatch ? preview.patch : undefined, patchLength: preview.patch.length,
         tests: (task.record.tests || []).map(test => ({ ...test, stale: test.sha256 !== preview.sha256 || (test.treeSha256 !== undefined && test.treeSha256 !== tree) })),
         verification: task.record.verification ? { ...task.record.verification, stale: task.record.verification.sha256 !== preview.sha256 ||
@@ -1224,8 +1684,8 @@ export class TaskManager {
     const task = this.tasks.get(taskId);
     if (!task) this.assertNotQuarantined(taskId);
     if (!task?.project || task.record.status !== 'completed' || task.record.integratedAt) throw new BridgeError('INVALID_CONTEXT', 'Context requires a completed, non-integrated task with a retained copy');
-    return this.withProject(task.project, async () => ({
-      taskId, treeSha256: await fingerprintProjectCopy(task.project!, this.config),
+    return this.withTaskRead(task, async archive => ({
+      taskId, treeSha256: archive ? archive.manifest.treeSha256 : await fingerprintProjectCopy(task.project!, this.config),
       role: task.record.role ?? 'implementer', report: task.record.report ?? null, handoff: task.record.handoff ?? null,
       acceptanceCriteria: task.record.acceptanceCriteria ?? [], includedFiles: task.project!.includedFiles,
     }));
@@ -1273,10 +1733,11 @@ export class TaskManager {
       throw error;
     });
     const opinions = await Promise.all(tasks.map(async task => {
-      const project = this.tasks.get(task.taskId)?.project;
-      const contextMatches = project && terminal.has(task.status) ? await this.withProject(project,
-        async () => await fingerprintProjectCopy(project, this.config) === comparison.treeSha256).catch(error => {
-          if (error instanceof BridgeError && error.code === 'TASK_NOT_READY') return null;
+      const internal = this.tasks.get(task.taskId);
+      const project = internal?.project;
+      const contextMatches = internal && project && terminal.has(task.status) ? await this.withTaskRead(internal,
+        async archive => (archive ? archive.manifest.treeSha256 : await fingerprintProjectCopy(project, this.config)) === comparison.treeSha256).catch(error => {
+          if (error instanceof BridgeError && ['TASK_NOT_READY', 'CHECKPOINT_UNAVAILABLE'].includes(error.code)) return null;
           throw error;
         }) : null;
       return { taskId: task.taskId, model: task.model!, status: task.status, contextMatches,
@@ -1309,10 +1770,9 @@ export class TaskManager {
     if (task.project?.modelProofFailure) return task.project.modelProofFailure;
     const ownFailure = this.modelProofFailure(task.record);
     if (ownFailure) return ownFailure;
-    const copyDirectory = task.project?.copyDirectory;
-    if (!copyDirectory) return undefined;
+    if (!task.project) return undefined;
     for (const candidate of this.tasks.values()) {
-      if (candidate.project?.copyDirectory === copyDirectory) {
+      if (this.sameLineage(candidate, task)) {
         const failure = candidate.project?.modelProofFailure ?? this.modelProofFailure(candidate.record);
         if (failure) return failure;
       }
@@ -1330,10 +1790,12 @@ export class TaskManager {
     const task = this.tasks.get(taskId);
     if (!task) this.assertNotQuarantined(taskId);
     if (!task?.project || !terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Wait for the task before verification');
-    return this.withProject(task.project, async () => {
-      const preview = await previewProjectCopy(task.project!, this.config);
+    return this.withTaskRead(task, async archive => {
+      const preview = archive ? previewFromArchive(archive) : await previewProjectCopy(task.project!, this.config);
       if (preview.sha256 !== expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Preview the current patch before verification');
-      const verification = await verifyCriteria(task.project!, preview.sha256, task.record.acceptanceCriteria, reviews);
+      const verification = archive
+        ? await verifyCriteriaFromArchive(archive, preview.sha256, task.record.acceptanceCriteria, reviews)
+        : await verifyCriteria(task.project!, preview.sha256, task.record.acceptanceCriteria, reviews);
       const proofFailure = this.copyModelProofFailure(task);
       if (proofFailure) {
         verification.checks.push({
@@ -1354,7 +1816,7 @@ export class TaskManager {
     this.refresh();
     const task = this.tasks.get(taskId), output = this.tasks.get(outputTaskId);
     if (!task?.project || !output?.project || task.record.status !== 'completed' || output.record.status !== 'completed' ||
-        task.project.copyDirectory !== output.project.copyDirectory || !task.record.group || !output.record.group ||
+        !this.sameLineage(task, output) || !task.record.group || !output.record.group ||
         task.record.group.rootTaskId !== output.record.group.rootTaskId || task.record.integratedAt || task.record.discardedAt) {
       throw new BridgeError('WORKFLOW_TASK_UNAVAILABLE', 'Workflow requires completed retained outputs in the same conversation copy');
     }
@@ -1362,19 +1824,29 @@ export class TaskManager {
     if (proofFailure) {
       throw new BridgeError('WORKFLOW_VALIDATION_FAILED', this.modelProofFailureMessage(proofFailure));
     }
-    return this.withProject(task.project, async () => {
-      const project = task.project!, preview = await previewProjectCopy(project, this.config), treeSha256 = await fingerprintProjectCopy(project, this.config);
+    return this.withTaskRead(task, async archive => {
+      const project = task.project!;
+      const preview = archive ? previewFromArchive(archive) : await previewProjectCopy(project, this.config);
+      const treeSha256 = archive ? archive.manifest.treeSha256 : await fingerprintProjectCopy(project, this.config);
       const value = output.record.structuredResult ? output.record.structuredResult.value : output.record.report?.data;
       const structured = validateStructuredResult({}, value);
       if (output.record.structuredResult && output.record.structuredResult.sha256 !== structured.sha256) throw new BridgeError('WORKFLOW_OUTPUT_CHANGED', 'Structured workflow output identity changed');
-      const artifacts = output.record.artifactPaths?.length ? await collectArtifacts(project, output.record.artifactPaths, this.config) : [];
+      const artifacts = output.record.artifactPaths?.length
+        ? (archive ? archive.manifest.artifacts : await collectArtifacts(project, output.record.artifactPaths, this.config))
+        : [];
       if (JSON.stringify(artifacts) !== JSON.stringify(output.record.artifacts ?? [])) throw new BridgeError('WORKFLOW_OUTPUT_CHANGED', 'Workflow artifacts changed since completion');
       const criteria = output.record.acceptanceCriteria ?? [];
       if (!criteria.length) throw new BridgeError('WORKFLOW_CRITERIA_REQUIRED', 'Every step requires independently checked acceptance criteria');
-      const automatic = await verifyCriteria(project, preview.sha256, criteria, []);
+      const automatic = archive
+        ? await verifyCriteriaFromArchive(archive, preview.sha256, criteria, [])
+        : await verifyCriteria(project, preview.sha256, criteria, []);
       if (automatic.checks.some(check => check.status === 'failed')) throw new BridgeError('WORKFLOW_VALIDATION_FAILED', 'An actual file acceptance check failed');
       const previous = task.record.verification ?? output.record.verification;
-      const reviewed = previous ? await verifyCriteria(project, preview.sha256, criteria, previous.review.evidence) : undefined;
+      const reviewed = previous
+        ? (archive
+          ? await verifyCriteriaFromArchive(archive, preview.sha256, criteria, previous.review.evidence)
+          : await verifyCriteria(project, preview.sha256, criteria, previous.review.evidence))
+        : undefined;
       const reviewPassed = previous?.status === 'passed' && previous.sha256 === preview.sha256 && reviewed?.status === 'passed' &&
         JSON.stringify(reviewed.fileHashes) === JSON.stringify(previous.fileHashes);
       const lastObservedTest = (task.record.tests ?? []).filter(test => test.source !== 'client-reported').at(-1);
@@ -1394,7 +1866,7 @@ export class TaskManager {
     });
   }
 
-  private async requireVerification(task: InternalTask, sha256: string): Promise<void> {
+  private async requireVerification(task: InternalTask, sha256: string, archive?: VerifiedTaskArchive): Promise<void> {
     const proofFailure = this.copyModelProofFailure(task);
     if (proofFailure) {
       throw new BridgeError('VERIFICATION_REQUIRED', this.modelProofFailureMessage(proofFailure));
@@ -1402,11 +1874,15 @@ export class TaskManager {
     const previous = task.record.verification;
     if (!previous || previous.status !== 'passed') throw new BridgeError('VERIFICATION_REQUIRED', 'All acceptance criteria require artifact checks and grounded Codex review before integration');
     if (previous.sha256 !== sha256) throw new BridgeError('VERIFICATION_STALE', 'Verify the current patch before integration');
-    const current = await verifyCriteria(task.project!, sha256, task.record.acceptanceCriteria, previous.review.evidence);
+    const current = archive
+      ? await verifyCriteriaFromArchive(archive, sha256, task.record.acceptanceCriteria, previous.review.evidence)
+      : await verifyCriteria(task.project!, sha256, task.record.acceptanceCriteria, previous.review.evidence);
     if (current.status !== 'passed' || JSON.stringify(current.fileHashes) !== JSON.stringify(previous.fileHashes)) {
       throw new BridgeError('VERIFICATION_STALE', 'Verification files or evidence changed; verify again');
     }
-    const tree = task.record.tests?.some(test => this.isObservedTestSource(test.source)) ? await fingerprintProjectCopy(task.project!, this.config) : undefined;
+    const tree = task.record.tests?.some(test => this.isObservedTestSource(test.source))
+      ? (archive ? archive.manifest.treeSha256 : await fingerprintProjectCopy(task.project!, this.config))
+      : undefined;
     const latestTests = new Map((task.record.tests || []).filter(test => this.isObservedTestSource(test.source)).map(test => [test.command, test]));
     if ([...latestTests.values()].some(test => test.sha256 !== sha256 || test.treeSha256 !== tree)) {
       throw new BridgeError('TESTS_STALE', 'Run the observed test commands again against the current files');
@@ -1416,16 +1892,200 @@ export class TaskManager {
     }
   }
 
+  private isPrePrepWindowsLocalFailure(task: InternalTask | undefined): task is InternalTask {
+    if (!task || task.project) return false;
+    const { record, options } = task;
+    if (record.status !== 'failed' || record.usageProvenance !== 'local-executor') return false;
+    if (record.error?.code !== 'WINDOWS_EXECUTION_RECOVERY_FAILED') return false;
+    if (record.startedAt !== undefined) return false;
+    if (record.integratedAt || record.discardedAt || !record.sessionId || record.mode === 'read-only') return false;
+    const nativeTest = options.nativeTest;
+    if (!nativeTest || !('backend' in nativeTest) || nativeTest.backend !== 'windows-lpac') return false;
+    if (!options.parentTaskId || record.parentTaskId !== options.parentTaskId) return false;
+    if (
+      options.parentCheckpointTaskId !== undefined &&
+      (typeof options.parentCheckpointTaskId !== 'string' || !options.parentCheckpointTaskId || options.parentCheckpointTaskId === record.taskId)
+    ) {
+      return false;
+    }
+    if (typeof options.parentArchiveSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(options.parentArchiveSha256)) return false;
+    return !hasTaskArchive(this.config.stateDirectory, record.taskId);
+  }
+
+  private resolveWindowsPrePrepRetryChain(source: InternalTask): { checkpointTask: InternalTask; chain: InternalTask[] } | undefined {
+    if (!this.isPrePrepWindowsLocalFailure(source)) return undefined;
+    const requiredPin = source.options.parentArchiveSha256!;
+    const pinnedCheckpointId = source.options.parentCheckpointTaskId;
+    const expectedProvider = source.record.execution?.provider ?? 'agy';
+    const visited = new Set<string>([source.record.taskId]);
+    const chain: InternalTask[] = [source];
+    let cursor = source;
+    let expectDirectCheckpoint = pinnedCheckpointId === undefined;
+    while (visited.size <= 32) {
+      const parentId = cursor.options.parentTaskId;
+      if (!parentId || cursor.record.parentTaskId !== parentId || visited.has(parentId)) return undefined;
+      if (cursor.options.parentArchiveSha256 !== requiredPin) return undefined;
+      const parent = this.tasks.get(parentId);
+      if (!parent) {
+        this.assertNotQuarantined(parentId);
+        return undefined;
+      }
+      if (
+        parent.record.workingDirectory !== cursor.record.workingDirectory ||
+        parent.record.sessionId !== cursor.record.sessionId ||
+        (parent.record.execution?.provider ?? 'agy') !== expectedProvider ||
+        parent.record.mode === 'read-only' ||
+        parent.record.integratedAt ||
+        parent.record.discardedAt ||
+        parent.record.agentPolicy?.sha256 !== cursor.record.agentPolicy?.sha256 ||
+        JSON.stringify(parent.record.group) !== JSON.stringify(cursor.record.group)
+      ) {
+        return undefined;
+      }
+      if (cursor.record.copyDirectory && parent.record.copyDirectory &&
+        copyIdentity(parent.record.copyDirectory) !== copyIdentity(cursor.record.copyDirectory)) {
+        return undefined;
+      }
+      if (parent.project) {
+        if (pinnedCheckpointId && parent.record.taskId !== pinnedCheckpointId) return undefined;
+        if (!parent.project.workspaceStateDirectory || !parent.project.lineageId) return undefined;
+        if (parent.project.archiveSha256 !== requiredPin) return undefined;
+        if (cursor.record.copyDirectory && copyIdentity(parent.project.copyDirectory) !== copyIdentity(cursor.record.copyDirectory)) {
+          return undefined;
+        }
+        if (source.record.copyDirectory && copyIdentity(parent.project.copyDirectory) !== copyIdentity(source.record.copyDirectory)) {
+          return undefined;
+        }
+        const parentCompleted = parent.record.status === 'completed';
+        const parentTestFailed = parent.record.status === 'failed' && parent.record.error?.code === 'TEST_FAILED';
+        const parentLocalFailure = parent.record.status === 'failed' && parent.record.error?.code !== 'TEST_FAILED' &&
+          parent.record.usageProvenance === 'local-executor' && !this.isSecurityOrViolationFailure(parent.record);
+        if (!terminal.has(parent.record.status) || (!parentCompleted && !parentTestFailed && !parentLocalFailure)) {
+          return undefined;
+        }
+        chain.push(parent);
+        return { checkpointTask: parent, chain };
+      }
+      if (expectDirectCheckpoint || !pinnedCheckpointId) return undefined;
+      if (
+        !this.isPrePrepWindowsLocalFailure(parent) ||
+        parent.options.parentArchiveSha256 !== requiredPin
+      ) {
+        return undefined;
+      }
+      if (parent.options.parentCheckpointTaskId !== undefined) {
+        if (parent.options.parentCheckpointTaskId !== pinnedCheckpointId) return undefined;
+      } else {
+        if (parent.options.parentTaskId !== pinnedCheckpointId || parent.record.parentTaskId !== pinnedCheckpointId) {
+          return undefined;
+        }
+        expectDirectCheckpoint = true;
+      }
+      visited.add(parent.record.taskId);
+      chain.push(parent);
+      cursor = parent;
+    }
+    return undefined;
+  }
+
+  private async verifyPrePrepParentArchive(
+    source: InternalTask,
+    checkpointTask: InternalTask,
+    expectedSha256: string,
+    excludeTaskId?: string,
+  ): Promise<VerifiedTaskArchive> {
+    const pinnedDigest = source.options.parentArchiveSha256;
+    const project = checkpointTask.project;
+    if (
+      !pinnedDigest ||
+      !/^[a-f0-9]{64}$/.test(pinnedDigest) ||
+      !project?.workspaceStateDirectory ||
+      !project.lineageId ||
+      project.archiveSha256 !== pinnedDigest
+    ) {
+      throw new BridgeError('CHECKPOINT_UNAVAILABLE', `Parent task ${checkpointTask.record.taskId} has no committed immutable archive matching the recorded checkpoint pin`);
+    }
+    this.assertArchivedTaskReadSafe(checkpointTask, excludeTaskId);
+    const archive = await loadVerifiedTaskArchive(this.config.stateDirectory, checkpointTask.record.taskId, {
+      expectedManifestSha256: pinnedDigest,
+      verifyAllBlobs: true,
+    });
+    if (
+      archive.manifest.taskId.toLowerCase() !== checkpointTask.record.taskId.toLowerCase() ||
+      archive.manifest.manifestSha256 !== pinnedDigest ||
+      archive.manifest.sourceDirectory !== project.sourceDirectory ||
+      copyIdentity(archive.manifest.sourceDirectory) !== copyIdentity(source.record.workingDirectory) ||
+      copyIdentity(archive.manifest.copyDirectory) !== copyIdentity(project.copyDirectory) ||
+      archive.manifest.lineageId !== project.lineageId ||
+      archive.manifest.mode !== 'write'
+    ) {
+      throw new BridgeError('CHECKPOINT_INVALID', `Archived checkpoint identity mismatch for task ${checkpointTask.record.taskId}`);
+    }
+    const preview = previewFromArchive(archive);
+    if (archive.manifest.patchSha256 !== expectedSha256 || preview.sha256 !== expectedSha256) {
+      throw new BridgeError('REVIEW_CHANGED', 'Preview the current patch before starting tests');
+    }
+    return archive;
+  }
+
+  private assertLatestForPrePrepRetry(current: InternalTask, checkpointTask: InternalTask, chain: readonly InternalTask[]): void {
+    const allTasks = [...this.tasks.values()];
+    const lineageWithProject = allTasks.filter(candidate => this.sameLineage(candidate, checkpointTask));
+    if (lineageWithProject.at(-1) !== checkpointTask) {
+      throw new BridgeError('TASK_NOT_READY', 'Run tests from the latest retained task for this isolated copy');
+    }
+    for (let i = 0; i + 1 < chain.length; i++) {
+      const childIndex = allTasks.indexOf(chain[i]!);
+      const parentIndex = allTasks.indexOf(chain[i + 1]!);
+      if (childIndex < 0 || parentIndex < 0 || parentIndex >= childIndex) {
+        throw new BridgeError('TASK_NOT_READY', 'Run tests from the latest retained task for this isolated copy');
+      }
+    }
+    const chainIds = new Set(chain.map(item => item.record.taskId));
+    const isRejectedPreStart = (candidate: InternalTask) =>
+      candidate.record.error?.code === 'STATE_PERSISTENCE_FAILED' && !candidate.record.startedAt;
+    const currentIndex = allTasks.indexOf(current);
+    for (let index = 0; index < allTasks.length; index++) {
+      const candidate = allTasks[index]!;
+      if (chainIds.has(candidate.record.taskId) || isRejectedPreStart(candidate)) continue;
+      const linkedToCurrent =
+        candidate.record.parentTaskId === current.record.taskId ||
+        candidate.options.parentTaskId === current.record.taskId;
+      const linkedToChain =
+        (candidate.record.parentTaskId !== undefined && chainIds.has(candidate.record.parentTaskId)) ||
+        (candidate.options.parentTaskId !== undefined && chainIds.has(candidate.options.parentTaskId)) ||
+        candidate.options.parentCheckpointTaskId === checkpointTask.record.taskId;
+      if (!terminal.has(candidate.record.status) && (this.sameLineage(candidate, checkpointTask) || linkedToCurrent || linkedToChain)) {
+        throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
+      }
+      if (linkedToCurrent || (index > currentIndex && linkedToChain)) {
+        throw new BridgeError('TASK_NOT_READY', 'Run tests from the latest retained task for this isolated copy');
+      }
+    }
+  }
+
   async startTests(taskId: string, expectedSha256: string, command: TestCommand, retries = 0, timeoutSeconds = 600, sandbox?: unknown) {
     this.assertStateDirectoryUsable();
     testCommandSchema.parse(command);
     if (!Number.isInteger(retries) || retries < 0 || retries > 3) throw new BridgeError('INVALID_TEST_COMMAND', 'retries must be between 0 and 3');
     const task = this.status(taskId);
     if (!task.sessionId || task.mode === 'read-only') throw new BridgeError('TASK_NOT_READY', 'Tests require a completed write task with a CLI conversation');
-    await this.assertProcessesReconciled(this.tasks.get(taskId)!.record);
-    const preview = await this.preview(taskId);
-    if (preview.sha256 !== expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Preview the current patch before starting tests');
     const executor = this.effectiveTestExecutor();
+    const internal = this.tasks.get(taskId);
+    if (executor === 'windows-lpac' && this.isPrePrepWindowsLocalFailure(internal)) {
+      const resolved = this.resolveWindowsPrePrepRetryChain(internal);
+      if (!resolved) {
+        throw new BridgeError('TASK_NOT_READY', 'Tests require a completed write task with an isolated copy and CLI conversation');
+      }
+      for (const link of resolved.chain) {
+        await this.assertProcessesReconciled(link.record);
+      }
+      await this.verifyPrePrepParentArchive(internal, resolved.checkpointTask, expectedSha256);
+    } else {
+      await this.assertProcessesReconciled(this.tasks.get(taskId)!.record);
+      const preview = await this.preview(taskId);
+      if (preview.sha256 !== expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Preview the current patch before starting tests');
+    }
     if (executor === 'windows-lpac' || executor === 'linux-bwrap') {
       if (executor === 'linux-bwrap') {
         const detection = this.linuxBwrapStatus ?? (process.platform === 'win32'
@@ -1439,8 +2099,111 @@ export class TaskManager {
     }
     if (task.agentPolicy) throw new BridgeError('POLICY_TEST_EXECUTOR_UNAVAILABLE', 'Tasks with an enforced tool policy require the bridge Windows LPAC executor for direct tests; native terminal access is not granted by this policy');
     if (sandbox !== undefined) throw new BridgeError('SANDBOX_PERMISSIONS_UNSUPPORTED', 'Per-test sandbox permissions require the Windows LPAC executor');
-    return this.run({ prompt: 'Run the requested tests in the native sandbox.', workingDirectory: task.workingDirectory, sessionId: task.sessionId,
-      model: task.model, timeoutSeconds, provider: this.executor.identity.provider, nativeTest: { ...command, expectedSha256, maxAttempts: retries + 1 } });
+    return this.run(
+      {
+        prompt: 'Run the requested tests in the native sandbox.',
+        workingDirectory: task.workingDirectory,
+        model: task.model,
+        timeoutSeconds,
+        provider: this.executor.identity.provider,
+        nativeTest: { ...command, expectedSha256, maxAttempts: retries + 1 },
+      },
+      taskId,
+    );
+  }
+
+  private async validateWindowsPrePrepRetryUnderLock(
+    sourceTaskId: string,
+    expectedSha256: string,
+  ): Promise<{ current: InternalTask; checkpointTask: InternalTask; chain: InternalTask[]; sourceExecutor: ExecutionAdapter }> {
+    this.refresh();
+    const current = this.tasks.get(sourceTaskId);
+    if (!current) this.assertNotQuarantined(sourceTaskId);
+    if (!this.isPrePrepWindowsLocalFailure(current)) {
+      throw new BridgeError('TASK_NOT_READY', 'Tests require a completed write task with an isolated copy and CLI conversation');
+    }
+    const resolved = this.resolveWindowsPrePrepRetryChain(current);
+    const checkpointProject = resolved?.checkpointTask.project;
+    if (!resolved || !checkpointProject) {
+      throw new BridgeError('TASK_NOT_READY', 'Tests require a completed write task with an isolated copy and CLI conversation');
+    }
+    const { checkpointTask, chain } = resolved;
+    const sourceExecutor = this.resumeExecutorFor(current.record);
+    for (const link of chain) {
+      this.assertResumeProvider(link.record, sourceExecutor);
+    }
+    this.assertLatestForPrePrepRetry(current, checkpointTask, chain);
+    if (this.isProjectBusy(checkpointProject)) throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
+    if (this.hasQuarantinedCopySibling(checkpointProject)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+    await this.withProject(
+      checkpointProject,
+      async () => {
+        await this.verifyPrePrepParentArchive(current, checkpointTask, expectedSha256);
+      },
+      { cleanupGuard: false },
+    );
+    if (this.queue.length >= this.config.maxQueuedTasks) throw new BridgeError('QUEUE_FULL', 'Task queue is full');
+    return { current, checkpointTask, chain, sourceExecutor };
+  }
+
+  private async queueWindowsPrePrepRetryUnderLock(
+    sourceTaskId: string,
+    backend: LocalTestBackend,
+    nativeTest: LocalNativeTestRequest,
+    timeoutSeconds: number,
+  ): Promise<TaskRecord> {
+    await this.validateWindowsPrePrepRetryUnderLock(sourceTaskId, nativeTest.expectedSha256);
+    await this.nativeRecovery;
+    await recoverWindowsExecutions(this.config.stateDirectory, { requireIdle: true });
+    this.nativeRecoveryError = undefined;
+    const { current, checkpointTask, chain, sourceExecutor } = await this.validateWindowsPrePrepRetryUnderLock(sourceTaskId, nativeTest.expectedSha256);
+    const checkpointProject = checkpointTask.project!;
+    const chainIds = new Set(chain.map(item => item.record.taskId));
+    if (this.tasks.size >= this.config.maxRetainedTasks) {
+      const otherCandidates = [...this.tasks.values()].filter(candidate =>
+        terminal.has(candidate.record.status) && !chainIds.has(candidate.record.taskId) && !this.hasPendingInbox(candidate.record));
+      let evicted: InternalTask | undefined;
+      let firstBlocked: InternalTask | undefined;
+      for (const candidate of otherCandidates) {
+        if (this.hasUnverifiedCleanup(candidate)) {
+          firstBlocked ??= candidate;
+          continue;
+        }
+        if (candidate.project && ![...this.tasks.values()].some(other => other !== candidate && this.sameLineage(other, candidate))) {
+          const discarded = await this.discardTask(candidate.record.taskId, true);
+          if (!discarded) {
+            firstBlocked ??= candidate;
+            continue;
+          }
+        }
+        evicted = candidate;
+        break;
+      }
+      if (!evicted) {
+        throw this.retentionLimitError(firstBlocked ?? otherCandidates[0]);
+      }
+      this.tasks.delete(evicted.record.taskId);
+      this.events.drop(evicted.record.taskId);
+      this.state.drop(evicted.record.taskId);
+    }
+    const isAgyExecutor = sourceExecutor instanceof AgyExecutionAdapter;
+    const record: TaskRecord = { parentTaskId: current.record.taskId, group: structuredClone(current.record.group), memory: structuredClone(current.record.memory), craft: current.record.craft, deliveryMode: current.record.deliveryMode, providedSkills: checkpointProject.providedSkills, taskId: randomUUID(), sessionId: current.record.sessionId, model: current.record.model, effort: current.record.effort,
+      execution: this.initialExecutionIdentity(current.record.model, current.record.effort, sourceExecutor),
+      mode: 'write', role: current.record.role, roleDefinition: current.record.roleDefinition, prompt: 'Run the requested tests in the Windows sandbox.',
+      acceptanceCriteria: current.record.acceptanceCriteria, handoff: current.record.handoff, tests: checkpointTask.record.tests ?? current.record.tests,
+      usageIsResume: isAgyExecutor,
+      usageBaseline: isAgyExecutor ? this.latestObservedUsage(current.record.sessionId, current.record.workingDirectory) : undefined,
+      workingDirectory: current.record.workingDirectory, copyDirectory: checkpointProject.copyDirectory, includedFiles: checkpointProject.includedFiles,
+      status: 'queued', createdAt: new Date().toISOString(),
+      outputSchema: current.record.outputSchema, artifactPaths: current.record.artifactPaths, agentPolicy: current.record.agentPolicy };
+    const options: RunOptions = { parentTaskId: current.record.taskId, parentCheckpointTaskId: checkpointTask.record.taskId, parentArchiveSha256: checkpointProject.archiveSha256!, group: structuredClone(current.record.group), memory: structuredClone(current.options.memory), memorySnapshots: structuredClone(current.options.memorySnapshots), craft: current.options.craft, deliveryMode: record.deliveryMode, providedSkills: record.providedSkills, prompt: record.prompt, workingDirectory: record.workingDirectory, sessionId: record.sessionId,
+      agentPolicy: record.agentPolicy, model: record.model, effort: record.effort, timeoutSeconds, mode: 'write', role: record.role, roleDefinition: record.roleDefinition,
+      acceptanceCriteria: record.acceptanceCriteria, nativeTest };
+    this.tasks.set(record.taskId, { record, options, ownerPid: process.pid, owned: true, project: this.cloneProject(checkpointProject, { archivedAt: undefined, archiveSha256: undefined }) });
+    this.queue.push(record.taskId);
+    this.events.append(record.taskId, 'task.queued', { workingDirectory: record.workingDirectory, model: record.model, backend });
+    if (!this.batching) this.pump();
+    return { ...record };
   }
 
   private async queueLocalTest(backend: LocalTestBackend, sourceTaskId: string, source: TaskRecord, expectedSha256: string, command: TestCommand, retries: number, timeoutSeconds: number, sandbox: unknown): Promise<TaskRecord> {
@@ -1456,50 +2219,62 @@ export class TaskManager {
     const nativeTest: LocalNativeTestRequest = { ...command, expectedSha256,
       maxAttempts: retries + 1, backend, sandbox: selection, policySha256: policy.sha256 };
     const releaseRegistry = this.state.acquire('registry');
-    let releaseProject: (() => void) | undefined;
     try {
       this.refresh();
       const current = this.tasks.get(sourceTaskId);
       if (!current) this.assertNotQuarantined(sourceTaskId);
+      if (backend === 'windows-lpac' && this.isPrePrepWindowsLocalFailure(current)) {
+        return await this.queueWindowsPrePrepRetryUnderLock(sourceTaskId, backend, nativeTest, timeoutSeconds);
+      }
       const isCompleted = current?.record.status === 'completed';
       const isTestFailed = current?.record.status === 'failed' && current?.record.error?.code === 'TEST_FAILED';
       const isLocalExecutorFailure = current?.record.status === 'failed' && current?.record.error?.code !== 'TEST_FAILED' && current?.record.usageProvenance === 'local-executor';
       if (!current?.project || !current.record.sessionId || current.record.mode === 'read-only' ||
-        !terminal.has(current.record.status) || (!isCompleted && !isTestFailed && !isLocalExecutorFailure) ||
-        current.record.integratedAt) {
+        !terminal.has(current.record.status) || (!isCompleted && !isTestFailed && !isLocalExecutorFailure) || current.record.integratedAt) {
         throw new BridgeError('TASK_NOT_READY', 'Tests require a completed write task with an isolated copy and CLI conversation');
       }
       const sourceExecutor = this.resumeExecutorFor(current.record);
       this.assertResumeProvider(current.record, sourceExecutor);
-      if ([...this.tasks.values()].filter(candidate => candidate.project === current.project).at(-1) !== current) {
+      if ([...this.tasks.values()].filter(other => this.sameLineage(other, current)).at(-1) !== current) {
         throw new BridgeError('TASK_NOT_READY', 'Run tests from the latest retained task for this isolated copy');
       }
-      if (this.busyProjects.has(current.project)) throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
+      if (this.isProjectBusy(current.project)) throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
       if (this.hasQuarantinedCopySibling(current.project)) throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
       const currentPreview = await this.preview(sourceTaskId, false);
       if (currentPreview.sha256 !== nativeTest.expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Copy changed while tests were queued');
       if (this.queue.length >= this.config.maxQueuedTasks) throw new BridgeError('QUEUE_FULL', 'Task queue is full');
-      releaseProject = this.state.acquire(this.projectLock(current.project));
       if (isLocalExecutorFailure && backend === 'windows-lpac') {
         await this.nativeRecovery;
         await recoverWindowsExecutions(this.config.stateDirectory, { requireIdle: true });
         this.nativeRecoveryError = undefined;
       }
       if (this.tasks.size >= this.config.maxRetainedTasks) {
-        const otherCandidates = [...this.tasks.values()].filter(candidate => terminal.has(candidate.record.status) && candidate !== current && !this.hasPendingInbox(candidate.record));
-        const oldestFinished = otherCandidates.find(candidate => !this.hasUnverifiedCleanup(candidate)) ?? (!this.hasPendingInbox(current.record) && !this.hasUnverifiedCleanup(current) ? current : undefined);
-        if (!oldestFinished) {
-          const excluded = otherCandidates[0] ?? (!this.hasPendingInbox(current.record) && this.hasUnverifiedCleanup(current) ? current : undefined);
-          throw this.retentionLimitError(excluded);
-        }
-        if (oldestFinished !== current && oldestFinished.project && ![...this.tasks.values()].some(other => other !== oldestFinished && other.project === oldestFinished.project)) {
-          if (!await this.discardTask(oldestFinished.record.taskId, true)) {
-            throw this.retentionLimitError(oldestFinished);
+        const otherCandidates = [...this.tasks.values()].filter(candidate =>
+          terminal.has(candidate.record.status) && candidate !== current && !this.hasPendingInbox(candidate.record));
+        const allCandidates = [...otherCandidates, ...(!this.hasPendingInbox(current.record) ? [current] : [])];
+        let evicted: InternalTask | undefined;
+        let firstBlocked: InternalTask | undefined;
+        for (const candidate of allCandidates) {
+          if (this.hasUnverifiedCleanup(candidate)) {
+            firstBlocked ??= candidate;
+            continue;
           }
+          if (candidate !== current && candidate.project && ![...this.tasks.values()].some(other => other !== candidate && this.sameLineage(other, candidate))) {
+            const discarded = await this.discardTask(candidate.record.taskId, true);
+            if (!discarded) {
+              firstBlocked ??= candidate;
+              continue;
+            }
+          }
+          evicted = candidate;
+          break;
         }
-        this.tasks.delete(oldestFinished.record.taskId);
-        this.events.drop(oldestFinished.record.taskId);
-        this.state.drop(oldestFinished.record.taskId);
+        if (!evicted) {
+          throw this.retentionLimitError(firstBlocked ?? allCandidates[0]);
+        }
+        this.tasks.delete(evicted.record.taskId);
+        this.events.drop(evicted.record.taskId);
+        this.state.drop(evicted.record.taskId);
       }
       const isAgyExecutor = sourceExecutor instanceof AgyExecutionAdapter;
       const record: TaskRecord = { parentTaskId: current.record.taskId, group: structuredClone(current.record.group), memory: structuredClone(current.record.memory), craft: current.record.craft, deliveryMode: current.record.deliveryMode, providedSkills: current.project.providedSkills, taskId: randomUUID(), sessionId: current.record.sessionId, model: current.record.model, effort: current.record.effort,
@@ -1511,16 +2286,15 @@ export class TaskManager {
         workingDirectory: current.record.workingDirectory, copyDirectory: current.project.copyDirectory, includedFiles: current.project.includedFiles,
         status: 'queued', createdAt: new Date().toISOString(),
         outputSchema: current.record.outputSchema, artifactPaths: current.record.artifactPaths, agentPolicy: current.record.agentPolicy };
-      const options: RunOptions = { parentTaskId: current.record.taskId, group: structuredClone(current.record.group), memory: structuredClone(current.options.memory), memorySnapshots: structuredClone(current.options.memorySnapshots), craft: current.options.craft, deliveryMode: record.deliveryMode, providedSkills: record.providedSkills, prompt: record.prompt, workingDirectory: record.workingDirectory, sessionId: record.sessionId,
+      const options: RunOptions = { parentTaskId: current.record.taskId, ...(current.project.archiveSha256 ? { parentArchiveSha256: current.project.archiveSha256 } : {}), group: structuredClone(current.record.group), memory: structuredClone(current.options.memory), memorySnapshots: structuredClone(current.options.memorySnapshots), craft: current.options.craft, deliveryMode: record.deliveryMode, providedSkills: record.providedSkills, prompt: record.prompt, workingDirectory: record.workingDirectory, sessionId: record.sessionId,
         agentPolicy: record.agentPolicy, model: record.model, effort: record.effort, timeoutSeconds, mode: 'write', role: record.role, roleDefinition: record.roleDefinition,
         acceptanceCriteria: record.acceptanceCriteria, nativeTest };
-      this.tasks.set(record.taskId, { record, options, ownerPid: process.pid, owned: true, project: current.project, releaseProject });
-      releaseProject = undefined;
+      this.tasks.set(record.taskId, { record, options, ownerPid: process.pid, owned: true, project: this.cloneProject(current.project, { archivedAt: undefined, archiveSha256: undefined }) });
       this.queue.push(record.taskId);
       this.events.append(record.taskId, 'task.queued', { workingDirectory: record.workingDirectory, model: record.model, backend });
       if (!this.batching) this.pump();
       return { ...record };
-    } finally { releaseProject?.(); releaseRegistry(); }
+    } finally { releaseRegistry(); }
   }
 
   async recordTest(taskId: string, expectedSha256: string, command: string, exitCode: number, output = '') {
@@ -1532,8 +2306,8 @@ export class TaskManager {
     if (!command.trim() || command.length > 1000 || !Number.isInteger(exitCode) || exitCode < 0 || exitCode > 255 || output.length > 4000) {
       throw new BridgeError('INVALID_TEST_EVIDENCE', 'Invalid command, exit code or output size');
     }
-    return this.withProject(task.project, async () => {
-      const preview = await previewProjectCopy(task.project!, this.config);
+    return this.withTaskRead(task, async archive => {
+      const preview = archive ? previewFromArchive(archive) : await previewProjectCopy(task.project!, this.config);
       if (preview.sha256 !== expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Preview again before recording test evidence');
       const evidence = { command: redactDiagnostic(command), exitCode, output: redactDiagnostic(output), sha256: expectedSha256, recordedAt: new Date().toISOString(), source: 'client-reported' as const };
       task.record.tests = [...(task.record.tests || []).slice(-19), evidence];
@@ -1542,29 +2316,45 @@ export class TaskManager {
     });
   }
 
-  private async withProject<T>(project: ProjectCopy, operation: () => Promise<T>, options?: { cleanupGuard?: boolean }): Promise<T> {
+  private async withProject<T>(
+    project: ProjectCopy,
+    operation: () => Promise<T>,
+    options?: { cleanupGuard?: boolean; allowMissingCopyIf?: () => Promise<boolean> },
+  ): Promise<T> {
     if (this.hasQuarantinedCopySibling(project)) {
       throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
     }
-    if (this.busyProjects.has(project) || [...this.tasks.values()].some(task => task.project === project && !terminal.has(task.record.status))) {
+    const key = this.projectKey(project);
+    if (this.busyProjects.has(key) || [...this.tasks.values()].some(task => task.project && this.sameCanonicalCopy(task.project, project) && !terminal.has(task.record.status))) {
       throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
     }
-    this.busyProjects.add(project);
+    this.busyProjects.add(key);
     let release: (() => void) | undefined;
     try {
       release = this.state.acquire(this.projectLock(project));
       // The marker is read from disk under the copy lock, so a marker written by another bridge instance is always seen, whatever this instance's task map says.
       if (options?.cleanupGuard !== false) {
-        await this.assertCopyCleanupConfirmed(project, { lockHeld: true });
+        const allowMissingCopy = options?.allowMissingCopyIf ? await options.allowMissingCopyIf() : false;
+        await this.assertCopyCleanupConfirmed(project, {
+          lockHeld: true,
+          ...(allowMissingCopy ? { allowMissingCopy: true } : {}),
+        });
       }
       return await operation();
     }
-    finally { release?.(); this.busyProjects.delete(project); this.scheduleInbox(project.copyDirectory); }
+    finally { release?.(); this.busyProjects.delete(key); this.scheduleInboxesForCopy(project.copyDirectory); }
   }
 
   async discard(taskId: string): Promise<TaskRecord> {
     await this.discardTask(taskId, false);
     return this.status(taskId);
+  }
+
+  private async assertNoPendingMcpCustody(copyDirectory: string, extraStateDirectory?: string): Promise<void> {
+    await assertNoPendingMcpCustodyForCopy(this.config.stateDirectory, copyDirectory);
+    if (extraStateDirectory && path.resolve(extraStateDirectory) !== path.resolve(this.config.stateDirectory)) {
+      await assertNoPendingMcpCustodyForCopy(extraStateDirectory, copyDirectory);
+    }
   }
 
   private async discardTask(taskId: string, automatic: boolean): Promise<boolean> {
@@ -1601,29 +2391,53 @@ export class TaskManager {
     if (!terminal.has(task.record.status)) throw new BridgeError('TASK_NOT_READY', 'Cancel and wait for the task before discarding');
     if (task.project) {
       const project = task.project;
+      const targetLineage = this.lineageKey(task);
       return await this.withProject(project, async () => {
-        if (automatic) {
-          // The check before the lock can be stale because another bridge instance may mark the copy in between.
-          let marker: ProcessCleanupMarker | undefined;
-          try {
-            marker = readProcessCleanupMarkerSync(project);
-          } catch {
-            return false;
-          }
-          if (marker && marker.entries.some(entry => this.entryContainment(entry) !== 'tracked')) {
-            return false;
-          }
-          for (const candidate of this.tasks.values()) {
-            if (candidate.project?.copyDirectory === project.copyDirectory && this.recordBlocksCleanup(candidate.record)) {
-              return false;
-            }
-          }
-          // Tracked entries alone do not block automatic discard and are never reconciled or signalled here,
-          // because an expired copy's stale PID may already have been reused by an unrelated process.
+        // Under the copy lock, prove previous processes ended (including tracked) before any deletion or release.
+        const cleanup = await this.confirmRootCleanupForRelease(project);
+        if (!cleanup.confirmed) {
+          if (automatic) return false;
+          throw this.unverifiedCleanupError(cleanup.blockingTaskIds);
         }
-        this.failPendingInbox(project.copyDirectory, task, 'cancelled', 'COPY_DISCARDED');
-        await discardProjectCopy(project);
-        for (const related of this.tasks.values()) if (related.project === project) {
+        try {
+          await this.assertNoPendingMcpCustody(project.copyDirectory, project.executionStateDirectory);
+        } catch (error) {
+          if (automatic && error instanceof BridgeError && error.code === 'WINDOWS_EXECUTION_RECOVERY_FAILED') return false;
+          throw error;
+        }
+        const lineageTasks = [...this.tasks.values()].filter(related => related.project && this.sameLineage(related, task));
+        const discardedIds = new Set(lineageTasks.map(related => related.record.taskId));
+        const copyKey = copyIdentity(project.copyDirectory);
+        const hasOtherInMemory = [...this.tasks.values()].some(other =>
+          !discardedIds.has(other.record.taskId) && !other.record.discardedAt && other.project && copyIdentity(other.project.copyDirectory) === copyKey);
+        const hasOtherOnDisk = this.state.loadWithQuarantine().tasks.some(other =>
+          !discardedIds.has(other.record.taskId) && !other.record.discardedAt && other.project && copyIdentity(other.project.copyDirectory) === copyKey);
+        const keepCanonicalWorkspace = Boolean(project.workspaceStateDirectory) && (hasOtherInMemory || hasOtherOnDisk);
+
+        this.failPendingInbox(targetLineage, task, 'cancelled', 'COPY_DISCARDED');
+        for (const related of lineageTasks) {
+          await removeTaskArchive(this.config.stateDirectory, related.record.taskId);
+          if (related.project?.executionPolicy?.receiptPath) {
+            rmSync(related.project.executionPolicy.receiptPath, { force: true });
+            await removeMcpConfigWitness(
+              related.project.executionStateDirectory ?? this.config.stateDirectory,
+              related.project.executionPolicy.executionId,
+            );
+          }
+        }
+        if (!keepCanonicalWorkspace) {
+          await discardProjectCopy(project);
+          if (project.workspaceStateDirectory && isOwnedWorkspacePath(project.copyDirectory, 'copy', [this.config.stateDirectory])) {
+            rmSync(path.dirname(project.copyDirectory), { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+          }
+        } else {
+          const metaFile = path.join(path.dirname(project.copyDirectory), WORKSPACE_META_FILE_NAME);
+          const meta = readWorkspaceMetadata(metaFile);
+          if (meta && meta.currentTaskId && discardedIds.has(meta.currentTaskId)) {
+            writeWorkspaceMetadata(metaFile, { ...meta, currentTaskId: undefined, currentLineageId: undefined, updatedAt: new Date().toISOString() });
+          }
+        }
+        for (const related of lineageTasks) {
           related.project = undefined;
           related.record.discardedAt = new Date().toISOString();
           this.events.append(related.record.taskId, 'copy.discarded', {});
@@ -1638,12 +2452,47 @@ export class TaskManager {
     if (this.degraded) return { discardedTaskIds: [] };
     this.refresh();
     const discardedTaskIds: string[] = [];
-    // discard() reloads the state, which replaces the copy objects of tasks this server does not run, so each copy is looked up again by directory.
-    for (const copyDirectory of new Set([...this.tasks.values()].flatMap(task => task.project ? [task.project.copyDirectory] : []))) {
-      const related = [...this.tasks.values()].filter(task => task.project?.copyDirectory === copyDirectory);
-      if (!related.length || related.some(task => this.hasQuarantinedCopySibling(task.project!) || this.busyProjects.has(task.project!) || !terminal.has(task.record.status) || this.hasUnverifiedCleanup(task))) continue;
+    const lineageIds = new Set<string>();
+    for (const task of this.tasks.values()) {
+      if (task.project && !task.record.discardedAt) lineageIds.add(this.lineageKey(task));
+    }
+    for (const lineageId of lineageIds) {
+      const related = [...this.tasks.values()].filter(task => task.project && !task.record.discardedAt && this.lineageKey(task) === lineageId);
+      if (!related.length || related.some(task => this.hasQuarantinedCopySibling(task.project!) || !terminal.has(task.record.status) || this.hasUnverifiedCleanup(task))) continue;
       const latest = Math.max(...related.map(task => Date.parse(task.record.completedAt || task.record.createdAt)));
       if (now - latest < this.config.copyRetentionHours * 3600000) continue;
+      const project = related[0]!.project!;
+      const relatedIds = new Set(related.map(task => task.record.taskId));
+      const hasOwnedActiveSibling = Boolean(project.workspaceStateDirectory) &&
+        [...this.tasks.values()].some(other =>
+          !relatedIds.has(other.record.taskId) && other.owned && !terminal.has(other.record.status) &&
+          copyIdentity(other.record.workingDirectory) === copyIdentity(project.sourceDirectory));
+      if (hasOwnedActiveSibling) {
+        if (related.some(task => task.record.processCleanup?.verified === false)) continue;
+        try {
+          await this.assertNoPendingMcpCustody(project.copyDirectory, project.executionStateDirectory);
+        } catch (error) {
+          if (error instanceof BridgeError && error.code === 'WINDOWS_EXECUTION_RECOVERY_FAILED') continue;
+          throw error;
+        }
+        this.failPendingInbox(lineageId, related[0]!, 'cancelled', 'COPY_DISCARDED');
+        for (const task of related) {
+          await removeTaskArchive(this.config.stateDirectory, task.record.taskId);
+          if (task.project?.executionPolicy?.receiptPath) {
+            rmSync(task.project.executionPolicy.receiptPath, { force: true });
+            await removeMcpConfigWitness(
+              task.project.executionStateDirectory ?? this.config.stateDirectory,
+              task.project.executionPolicy.executionId,
+            );
+          }
+          task.project = undefined;
+          task.record.discardedAt = new Date().toISOString();
+          this.events.append(task.record.taskId, 'copy.discarded', {});
+        }
+        discardedTaskIds.push(...related.map(task => task.record.taskId));
+        continue;
+      }
+      if (related.some(task => this.isProjectBusy(task.project!))) continue;
       if (!await this.discardTask(related[0]!.record.taskId, true)) continue;
       discardedTaskIds.push(...related.map(task => task.record.taskId));
     }
@@ -1681,30 +2530,54 @@ export class TaskManager {
     if (task.record.integratedAt) throw new BridgeError('ALREADY_INTEGRATED', 'This task was already integrated');
     if (task.record.mode === 'read-only') throw new BridgeError('READ_ONLY_TASK', 'Read-only tasks cannot be integrated');
     await this.assertProcessesReconciled(task.record);
-    if ([...this.tasks.values()].filter(other => other.project === task.project).at(-1) !== task) {
+    if ([...this.tasks.values()].filter(other => this.sameLineage(other, task)).at(-1) !== task) {
       throw new BridgeError('TASK_NOT_READY', 'Preview and integrate the latest task for this copy');
     }
-    if ([...this.tasks.values()].some(other => other !== task && other.project === task.project && !terminal.has(other.record.status))) {
+    if ([...this.tasks.values()].some(other => other !== task && this.sameLineage(other, task) && !terminal.has(other.record.status))) {
       throw new BridgeError('TASK_NOT_READY', 'Wait for the resumed task to finish');
     }
     return this.withProject(task.project, async () => {
-      const reviewed = await previewProjectCopy(task.project!, this.config);
+      const { preview: reviewed, archive: initialArchive } = await this.previewTaskUnderLock(task);
       if (!reviewed.files.length) throw new BridgeError('NO_CHANGES', 'The isolated copy has no changes');
       if (reviewed.sha256 !== expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Preview the current patch before requesting confirmation');
       const auto = this.config.approvalMode === 'auto';
       if (!auto && !confirm) throw new BridgeError('APPROVAL_REQUIRED', 'Integration requires confirmation');
-      await this.requireVerification(task, expectedSha256);
+      await this.requireVerification(task, expectedSha256, initialArchive);
       const approval = auto ? undefined : await confirm!(reviewed);
       if (!auto && approval !== true && (typeof approval !== 'object' || approval?.confirmed !== true)) {
         throw new BridgeError('APPROVAL_DENIED', 'Integration was not confirmed');
       }
       const releaseSource = this.state.acquire('source-' + createHash('sha256').update(task.record.workingDirectory).digest('hex'));
       try {
-        const current = await previewProjectCopy(task.project!, this.config);
+        const { preview: current, archive: recheckedArchive } = await this.previewTaskUnderLock(task);
         if (current.sha256 !== expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'The copy changed after confirmation');
-        await this.requireVerification(task, expectedSha256);
+        await this.requireVerification(task, expectedSha256, recheckedArchive);
+        if (!this.isCurrentOccupant(task)) {
+          if (!task.project!.archiveSha256) {
+            throw new BridgeError('CHECKPOINT_UNAVAILABLE', `No verified checkpoint digest is pinned for task ${task.record.taskId}`);
+          }
+          await this.ensureRootReadyForReuse(task.record.workingDirectory, { excludeTaskId: task.record.taskId, lockHeld: true });
+          const restored = await restoreTaskCheckpointIntoWorkspace({
+            stateDirectory: this.config.stateDirectory,
+            sourceTaskId: task.record.taskId,
+            expectedManifestSha256: task.project!.archiveSha256,
+            targetTaskId: task.record.taskId,
+            targetLineageId: task.project!.lineageId ?? randomUUID(),
+            limits: this.config,
+          });
+          if (restored.archive.manifest.patchSha256 !== expectedSha256) {
+            throw new BridgeError('REVIEW_CHANGED', 'Restored checkpoint patch no longer matches expected digest');
+          }
+          task.project = this.cloneProject(restored.project, {
+            archivedAt: task.project!.archivedAt,
+            archiveSha256: task.project!.archiveSha256,
+            modelProofFailure: task.project!.modelProofFailure,
+            executionPolicy: task.project!.executionPolicy,
+            executionStateDirectory: task.project!.executionStateDirectory,
+          });
+        }
         const preview = await integrateProjectCopy(task.project!, expectedSha256, this.config);
-        for (const related of this.tasks.values()) if (related.project === task.project) {
+        for (const related of this.tasks.values()) if (this.sameLineage(related, task)) {
           related.record.integratedAt = new Date().toISOString();
           this.events.append(related.record.taskId, 'copy.integrated', { sha256: expectedSha256, approvalSource: auto ? 'auto' : 'mcp-elicitation',
             ...(preview.restoredByteOrderMarks ? { restoredByteOrderMarks: preview.restoredByteOrderMarks } : {}),
@@ -1716,7 +2589,7 @@ export class TaskManager {
         }
         return preview;
       } finally { releaseSource(); }
-    });
+    }, { allowMissingCopyIf: () => this.hasVerifiedFencedFailedPrepArchive(task) });
   }
 
   private declaredContainment(provider: string | undefined): ProcessContainment {
@@ -1744,9 +2617,9 @@ export class TaskManager {
       return true;
     }
     if (marker?.entries.some(entry => this.entryContainment(entry) !== 'tracked')) return true;
-    const copyDirectory = task.project.copyDirectory;
+    const copyKey = copyIdentity(task.project.copyDirectory);
     for (const candidate of this.tasks.values()) {
-      if (candidate.project?.copyDirectory === copyDirectory && this.recordBlocksCleanup(candidate.record)) {
+      if (!candidate.record.discardedAt && candidate.project && copyIdentity(candidate.project.copyDirectory) === copyKey && this.recordBlocksCleanup(candidate.record)) {
         return true;
       }
     }
@@ -1775,7 +2648,7 @@ export class TaskManager {
     this.assertStateDirectoryUsable();
     this.status(taskId);
     const task = this.tasks.get(taskId)!;
-    if (task.project) this.scheduleInbox(task.project.copyDirectory);
+    if (task.project) this.scheduleInbox(this.lineageKey(task));
     return (task.record.inbox ?? []).map(item => ({
       messageId: item.messageId, taskId, text: item.text, receivedAt: item.receivedAt, receipt: this.inboxReceipt(item),
     }));
@@ -1796,7 +2669,7 @@ export class TaskManager {
     const target = this.tasks.get(taskId);
     if (target) await this.assertProcessesReconciled(target.record);
     const release = this.state.acquire('registry');
-    let directory: string | undefined;
+    let lineage: string | undefined;
     try {
       this.refresh();
       this.recoverInboxClaims(true);
@@ -1819,12 +2692,12 @@ export class TaskManager {
         task.record.inbox = [...(task.record.inbox ?? []), item];
         this.events.append(taskId, 'caller.message-queued', { messageId });
       }
-      directory = task.project?.copyDirectory;
+      lineage = task.project ? this.lineageKey(task) : undefined;
       if (terminal.has(task.record.status) && task.record.status !== 'completed') {
-        this.failPendingInbox(directory, task, task.record.status === 'cancelled' ? 'cancelled' : 'failed', 'TASK_NOT_COMPLETED');
+        this.failPendingInbox(lineage, task, task.record.status === 'cancelled' ? 'cancelled' : 'failed', 'TASK_NOT_COMPLETED');
       }
     } finally { release(); }
-    if (directory) await this.flushInbox(directory);
+    if (lineage) await this.flushInbox(lineage);
     this.refresh();
     const item = this.tasks.get(taskId)?.record.inbox?.find(entry => entry.messageId === messageId);
     if (!item) throw new BridgeError('TASK_NOT_FOUND', 'Caller message target was removed');
@@ -1858,8 +2731,8 @@ export class TaskManager {
     }
   }
 
-  private failPendingInbox(directory: string | undefined, current: InternalTask, state: 'failed' | 'cancelled', code: string): void {
-    const related = directory ? [...this.tasks.values()].filter(task => task.project?.copyDirectory === directory) : [current];
+  private failPendingInbox(lineage: string | undefined, current: InternalTask, state: 'failed' | 'cancelled', code: string): void {
+    const related = lineage ? [...this.tasks.values()].filter(task => task.project && this.lineageKey(task) === lineage) : [current];
     for (const task of related) {
       let changed = false;
       for (const item of task.record.inbox ?? []) if (item.receipt.state === 'queued' && task.record.dispatching?.messageId !== item.messageId) {
@@ -1898,21 +2771,32 @@ export class TaskManager {
 
   private continuationState(taskId: string) {
     const task = this.tasks.get(taskId)!;
-    const directory = task.project?.copyDirectory;
-    const related = directory ? [...this.tasks.values()].filter(candidate => candidate.project?.copyDirectory === directory) : [task];
+    const lineage = task.project ? this.lineageKey(task) : undefined;
+    const related = lineage ? [...this.tasks.values()].filter(candidate => candidate.project && this.lineageKey(candidate) === lineage) : [task];
     const continuationPending = related.some(candidate => this.hasPendingInbox(candidate.record));
-    if (directory && continuationPending && terminal.has(task.record.status)) this.scheduleInbox(directory);
+    if (lineage && continuationPending && terminal.has(task.record.status)) this.scheduleInbox(lineage);
     return { ...(task.record.continuationTaskId ? { continuationTaskId: task.record.continuationTaskId } : {}), continuationPending };
   }
 
-  private scheduleInbox(directory: string): void {
-    if (this.stopped || this.flushingInboxes.has(directory)) return;
-    void this.flushInbox(directory).catch(error => process.stderr.write('Caller inbox dispatch failed: ' + (error instanceof BridgeError ? error.code : 'AGY_PROCESS_FAILED') + '\n'));
+  private scheduleInboxesForCopy(copyDirectory: string): void {
+    const copyKey = copyIdentity(copyDirectory);
+    const lineages = new Set<string>();
+    for (const task of this.tasks.values()) {
+      if (task.project && copyIdentity(task.project.copyDirectory) === copyKey && this.hasPendingInbox(task.record)) {
+        lineages.add(this.lineageKey(task));
+      }
+    }
+    for (const lineage of lineages) this.scheduleInbox(lineage);
   }
 
-  private async flushInbox(directory: string): Promise<void> {
-    if (this.stopped || this.flushingInboxes.has(directory)) return;
-    this.flushingInboxes.add(directory);
+  private scheduleInbox(lineage: string): void {
+    if (this.stopped || this.flushingInboxes.has(lineage)) return;
+    void this.flushInbox(lineage).catch(error => process.stderr.write('Caller inbox dispatch failed: ' + (error instanceof BridgeError ? error.code : 'AGY_PROCESS_FAILED') + '\n'));
+  }
+
+  private async flushInbox(lineage: string): Promise<void> {
+    if (this.stopped || this.flushingInboxes.has(lineage)) return;
+    this.flushingInboxes.add(lineage);
     let target: InternalTask | undefined;
     let latest: InternalTask | undefined;
     let item: CallerInboxItem | undefined;
@@ -1922,11 +2806,11 @@ export class TaskManager {
       try {
         this.refresh();
         this.recoverInboxClaims(true);
-        const related = [...this.tasks.values()].filter(task => task.project?.copyDirectory === directory);
+        const related = [...this.tasks.values()].filter(task => task.project && this.lineageKey(task) === lineage);
         latest = related.filter(task => !(task.record.error?.code === 'STATE_PERSISTENCE_FAILED' && !task.record.startedAt)).at(-1);
-        if (!latest || !terminal.has(latest.record.status) || latest.owned || this.busyProjects.has(latest.project!)) return;
+        if (!latest || !terminal.has(latest.record.status) || latest.owned || this.isProjectBusy(latest.project!)) return;
         if (latest.record.status !== 'completed' || latest.record.integratedAt || latest.record.discardedAt || !latest.record.sessionId) {
-          this.failPendingInbox(directory, latest, 'failed', 'INVALID_MESSAGE_TARGET'); return;
+          this.failPendingInbox(lineage, latest, 'failed', 'INVALID_MESSAGE_TARGET'); return;
         }
         if (related.some(task => task.record.dispatching)) return;
         const queued = related.flatMap(task => (task.record.inbox ?? []).filter(entry => entry.receipt.state === 'queued').map(entry => ({ task, entry })));
@@ -1939,10 +2823,10 @@ export class TaskManager {
         this.events.append(target.record.taskId, 'caller.message-dispatching', { messageId: item.messageId });
       } finally { release(); }
       try {
-        const continuation = await this.run({ workingDirectory: latest!.record.workingDirectory, sessionId: latest!.record.sessionId,
+        const continuation = await this.run({ workingDirectory: latest!.record.workingDirectory,
           prompt: item!.text, peerOrigin: item!.peerOrigin, mode: latest!.record.mode, role: latest!.record.role, model: latest!.record.model ?? null,
           deliveryMode: latest!.record.deliveryMode, timeoutSeconds: latest!.options.timeoutSeconds,
-          parentTaskId: latest!.record.taskId, sourceMessage: { taskId: target!.record.taskId, messageId: item!.messageId } });
+          parentTaskId: latest!.record.taskId, sourceMessage: { taskId: target!.record.taskId, messageId: item!.messageId } }, latest!.record.taskId);
         const finish = this.state.acquire('registry');
         try {
           this.refresh();
@@ -1976,8 +2860,8 @@ export class TaskManager {
       if (!(error instanceof BridgeError && error.code === 'STATE_BUSY')) throw error;
     } finally {
       if (target) this.claimingMessages.delete(target.record.taskId);
-      this.flushingInboxes.delete(directory);
-      if (sent && !this.stopped) queueMicrotask(() => this.scheduleInbox(directory));
+      this.flushingInboxes.delete(lineage);
+      if (sent && !this.stopped) queueMicrotask(() => this.scheduleInbox(lineage));
     }
   }
 
@@ -2085,7 +2969,7 @@ export class TaskManager {
       task.record.status = 'cancelled';
       task.record.error = { code: 'TASK_CANCELLED', message: 'Task cancelled before execution' };
       task.record.completedAt = new Date().toISOString();
-      this.failPendingInbox(task.project?.copyDirectory, task, 'cancelled', 'TASK_CANCELLED');
+      this.failPendingInbox(task.project ? this.lineageKey(task) : undefined, task, 'cancelled', 'TASK_CANCELLED');
       appendMessage(task.record, 'error', 'bridge', 'Task cancelled before execution');
       this.events.append(taskId, 'task.cancelled', {});
       task.owned = false;
@@ -2115,8 +2999,7 @@ export class TaskManager {
   }
 
   private isTaskEligible(task: InternalTask): boolean {
-    if (task.record.group) return true;
-    const projectKey = task.record.workingDirectory;
+    const projectKey = copyIdentity(task.record.workingDirectory);
     const kind = this.taskKind(task);
     for (const activeEntry of this.activeTasks.values()) {
       if (activeEntry.projectKey === projectKey) return false;
@@ -2150,18 +3033,72 @@ export class TaskManager {
       this.queue.splice(index, 1);
       this.active++;
       this.activeTasks.set(taskId, {
-        projectKey: task.record.workingDirectory,
+        projectKey: copyIdentity(task.record.workingDirectory),
         kind: this.taskKind(task),
       });
       task.completion = this.execute(task).finally(() => {
-        task.releaseProject?.();
-        task.releaseProject = undefined;
-        task.owned = false;
-        this.activeTasks.delete(taskId);
-        this.active--;
+        this.releaseTaskExecutionSlot(task);
         this.pump();
-        if (task.project) this.scheduleInbox(task.project.copyDirectory);
+        if (task.project) this.scheduleInboxesForCopy(task.project.copyDirectory);
       });
+    }
+  }
+
+  private clearTaskHandles(task: InternalTask): void {
+    if (task.timer) { clearTimeout(task.timer); task.timer = undefined; }
+    task.nativeAbort = undefined;
+    if (task.executionAbort) { task.executionAbort.abort(task.termination ?? 'cancelled'); task.executionAbort = undefined; }
+    if (task.child) { this.terminate(task.child); task.child = undefined; }
+  }
+
+  private releaseTaskExecutionSlot(task: InternalTask): void {
+    task.releaseProject?.();
+    task.releaseProject = undefined;
+    task.owned = false;
+    if (this.activeTasks.delete(task.record.taskId)) {
+      this.active--;
+    }
+  }
+
+  private computeTerminalOutcome(
+    task: InternalTask,
+    status: 'completed' | 'failed' | 'cancelled' | 'timeout',
+    code?: string,
+    message?: string,
+  ): { status: 'completed' | 'failed' | 'cancelled' | 'timeout'; code?: string; message?: string } {
+    if (task.termination && status !== task.termination) {
+      status = task.termination;
+      code = status === 'timeout' ? 'TASK_TIMEOUT' : 'TASK_CANCELLED';
+      message = status === 'timeout' ? 'Task execution timed out' : 'Task cancelled';
+    }
+    if (status === 'timeout') code = 'TASK_TIMEOUT';
+    if (status === 'cancelled') code = 'TASK_CANCELLED';
+    return { status, code, message };
+  }
+
+  private async finalizeTask(
+    task: InternalTask,
+    status: 'completed' | 'failed' | 'cancelled' | 'timeout',
+    code?: string,
+    message?: string,
+  ): Promise<void> {
+    if (terminal.has(task.record.status)) {
+      this.releaseTaskExecutionSlot(task);
+      return;
+    }
+    this.clearTaskHandles(task);
+    const outcome = this.computeTerminalOutcome(task, status, code, message);
+    try {
+      await this.archiveTaskBeforeTerminal(task, outcome.status, outcome.code);
+      if (terminal.has(task.record.status)) {
+        return;
+      }
+      if (outcome.status !== 'completed' && !task.workspacePrepared && outcome.code !== 'GIT_CLEANUP_UNVERIFIED') {
+        task.project = undefined;
+      }
+      this.finish(task, outcome.status, outcome.code, outcome.message);
+    } finally {
+      this.releaseTaskExecutionSlot(task);
     }
   }
 
@@ -2180,8 +3117,49 @@ export class TaskManager {
       try {
         if (backend === 'windows-lpac') await this.executeWindowsNativeTest(task);
         else await this.executeLocalNativeTest(task);
+        if (
+          !task.archiveAttempted &&
+          terminal.has(task.record.status) &&
+          task.project?.workspaceStateDirectory &&
+          !task.project.archiveSha256 &&
+          this.requiresCheckpointArchive(task)
+        ) {
+          task.releaseProject ??= this.state.acquire(this.projectLock(task.project));
+          const metaFile = path.join(path.dirname(task.project.copyDirectory), WORKSPACE_META_FILE_NAME);
+          const meta = readWorkspaceMetadata(metaFile);
+          if (
+            meta &&
+            meta.fencedAt === undefined &&
+            meta.fencedReason === undefined &&
+            meta.currentLineageId !== undefined &&
+            meta.currentLineageId === task.project.lineageId &&
+            copyIdentity(meta.sourceDirectory) === copyIdentity(task.project.sourceDirectory) &&
+            (meta.currentTaskId === task.record.taskId || meta.currentTaskId === task.options.parentTaskId)
+          ) {
+            if (meta.currentTaskId !== task.record.taskId) {
+              writeWorkspaceMetadata(metaFile, {
+                version: 1,
+                sourceDirectory: meta.sourceDirectory,
+                rootKey: meta.rootKey,
+                currentTaskId: task.record.taskId,
+                currentLineageId: task.project.lineageId,
+                ...(meta.lastPreparedDurationMs !== undefined ? { lastPreparedDurationMs: meta.lastPreparedDurationMs } : {}),
+                updatedAt: new Date().toISOString(),
+                ...(meta.windowsLpac ? { windowsLpac: meta.windowsLpac } : {}),
+              });
+            }
+            task.workspacePrepared = true;
+            await this.archiveTaskBeforeTerminal(task, task.record.status as 'completed' | 'failed' | 'cancelled' | 'timeout', task.record.error?.code);
+            if (task.project.archiveSha256) {
+              this.persist(task.record.taskId);
+            }
+          }
+        }
       } catch (error) {
-        this.finishFromError(task, error, backend === 'windows-lpac' ? 'WINDOWS_EXECUTION_UNVERIFIED' : 'LINUX_EXECUTION_UNVERIFIED');
+        await this.finalizeFromError(task, error, backend === 'windows-lpac' ? 'WINDOWS_EXECUTION_UNVERIFIED' : 'LINUX_EXECUTION_UNVERIFIED');
+      } finally {
+        this.clearTaskHandles(task);
+        this.releaseTaskExecutionSlot(task);
       }
       return;
     }
@@ -2191,12 +3169,167 @@ export class TaskManager {
     let native: Awaited<ReturnType<typeof prepareNativeTest>> | undefined;
     let readOnlyBaseline: Map<string, string> | undefined;
     let policyReceiptOffset = 0;
+    let preparationInfo: { preparationMs: number; scopeSha256?: string } | undefined;
     try {
-      task.project ??= await createProjectCopy(record.workingDirectory, task.options.includePaths, project => {
-        task.project = project;
-        this.events.append(record.taskId, 'copy.created', { copyDirectory: project.copyDirectory });
-      }, this.config, task.options.skills, task.options.agentPolicy ? { policy: task.options.agentPolicy, catalog: this.config.mcpCatalog, stateDirectory: this.config.stateDirectory, executionId: record.taskId, readOnlyRoots: task.options.craft ? [path.join(task.options.craft.root, 'skills')] : [] } : undefined);
-      if (task.options.agentPolicy && !task.project.executionPolicy) await stageProjectExecutionPolicy(task.project, { policy: task.options.agentPolicy, catalog: this.config.mcpCatalog, stateDirectory: this.config.stateDirectory, executionId: record.taskId, readOnlyRoots: task.options.craft ? [path.join(task.options.craft.root, 'skills')] : [] }, this.config);
+      const canonical = canonicalWorkspacePaths(this.config.stateDirectory, record.workingDirectory);
+      const lockTarget = task.project ? this.projectLock(task.project) : copyLockName(canonical.copyDirectory);
+      task.releaseProject ??= this.state.acquire(lockTarget);
+      const policyStageOptions = task.options.agentPolicy
+        ? {
+            policy: task.options.agentPolicy,
+            catalog: this.config.mcpCatalog,
+            stateDirectory: this.config.stateDirectory,
+            executionId: record.taskId,
+            readOnlyRoots: task.options.craft ? [path.join(task.options.craft.root, 'skills')] : [],
+          }
+        : undefined;
+
+      if (task.options.resumeFromTaskId && task.project) {
+        const resumeSource = this.tasks.get(task.options.resumeFromTaskId);
+        if (task.project.workspaceStateDirectory) {
+          const metaFile = path.join(path.dirname(task.project.copyDirectory), WORKSPACE_META_FILE_NAME);
+          const meta = readWorkspaceMetadata(metaFile);
+          if (resumeSource && this.isPositiveLiveOccupant(resumeSource, meta, record.workingDirectory)) {
+            const livePrepStartMs = performance.now();
+            await this.ensureRootReadyForReuse(record.workingDirectory, {
+              excludeTaskId: record.taskId,
+              allowUnarchivedOccupantTaskId: resumeSource.record.taskId,
+              lockHeld: true,
+            });
+            // Run live security checks before any policy restaging so .agents tampering is caught before launch.
+            await verifyManagedCopy(task.project);
+            await ensureAgentGuard(task.project, record.mode ?? 'write');
+            await assertNoAgentConfigInCopy(task.project, record.mode ?? 'write');
+            const preparationMs = Math.round((performance.now() - livePrepStartMs) * 1000) / 1000;
+            if (meta) {
+              writeWorkspaceMetadata(metaFile, {
+                version: 1,
+                sourceDirectory: meta.sourceDirectory,
+                rootKey: meta.rootKey,
+                currentTaskId: record.taskId,
+                currentLineageId: task.project.lineageId,
+                lastPreparedDurationMs: preparationMs,
+                updatedAt: new Date().toISOString(),
+                ...(meta.windowsLpac ? { windowsLpac: meta.windowsLpac } : {}),
+              });
+            }
+            task.workspacePrepared = true;
+            preparationInfo = { preparationMs };
+          } else {
+            const tamperedOccupant = await this.detectTamperedSameLineageLiveOccupant(resumeSource, meta, record.workingDirectory);
+            if (tamperedOccupant) {
+              throw tamperedOccupant.error;
+            }
+            await this.ensureRootReadyForReuse(record.workingDirectory, {
+              excludeTaskId: record.taskId,
+              lockHeld: true,
+            });
+            const expectedManifestSha256 = resumeSource?.project?.archiveSha256 ?? task.options.parentArchiveSha256;
+            if (!expectedManifestSha256) {
+              throw new BridgeError('CHECKPOINT_UNAVAILABLE', `No verified checkpoint digest is pinned for task ${task.options.resumeFromTaskId}`);
+            }
+            const restored = await restoreTaskCheckpointIntoWorkspace({
+              stateDirectory: this.config.stateDirectory,
+              sourceTaskId: task.options.resumeFromTaskId,
+              expectedManifestSha256,
+              targetTaskId: record.taskId,
+              targetLineageId: task.project.lineageId ?? resumeSource?.project?.lineageId ?? randomUUID(),
+              limits: this.config,
+            });
+            task.workspacePrepared = true;
+            preparationInfo = { preparationMs: restored.preparationMs, scopeSha256: restored.scopeSha256 };
+            task.project = this.cloneProject(restored.project, {
+              ...(task.project.modelProofFailure ? { modelProofFailure: task.project.modelProofFailure } : {}),
+            });
+          }
+          // Every resumed turn gets its own immutable execution policy receipt keyed by record.taskId.
+          if (policyStageOptions && task.project.executionPolicy?.executionId !== record.taskId) {
+            await this.assertNoPendingMcpCustody(task.project.copyDirectory, task.project.executionStateDirectory);
+            await removeStagedExecutionPolicyHelpers(task.project.copyDirectory);
+            task.project.executionPolicy = undefined;
+            task.project.executionStateDirectory = undefined;
+            await stageProjectExecutionPolicy(task.project, policyStageOptions, this.config);
+          }
+        } else {
+          // Legacy temp copy resume path
+          await verifyManagedCopy(task.project);
+          task.workspacePrepared = true;
+          if (policyStageOptions && task.project.executionPolicy?.executionId !== record.taskId) {
+            await this.assertNoPendingMcpCustody(task.project.copyDirectory, task.project.executionStateDirectory);
+            await removeStagedExecutionPolicyHelpers(task.project.copyDirectory);
+            task.project.executionPolicy = undefined;
+            task.project.executionStateDirectory = undefined;
+            await stageProjectExecutionPolicy(task.project, policyStageOptions, this.config);
+          }
+        }
+      } else if (task.options.contextTaskId && !task.project) {
+        await this.ensureRootReadyForReuse(record.workingDirectory, {
+          excludeTaskId: record.taskId,
+          lockHeld: true,
+        });
+        const contextSource = this.tasks.get(task.options.contextTaskId);
+        const expectedManifestSha256 = task.options.handoffArchiveSha256 ?? contextSource?.project?.archiveSha256;
+        if (!expectedManifestSha256) {
+          throw new BridgeError('CHECKPOINT_UNAVAILABLE', `No verified checkpoint digest is pinned for context task ${task.options.contextTaskId}`);
+        }
+        const lineageId = randomUUID();
+        const restored = await restoreTaskCheckpointIntoWorkspace({
+          stateDirectory: this.config.stateDirectory,
+          sourceTaskId: task.options.contextTaskId,
+          expectedManifestSha256,
+          targetTaskId: record.taskId,
+          targetLineageId: lineageId,
+          limits: this.config,
+        });
+        task.workspacePrepared = true;
+        preparationInfo = { preparationMs: restored.preparationMs, scopeSha256: restored.scopeSha256 };
+        const inheritedFailure = contextSource
+          ? (contextSource.project?.modelProofFailure ?? this.copyModelProofFailure(contextSource))
+          : undefined;
+        task.project = this.cloneProject(restored.project, {
+          ...(inheritedFailure ? { modelProofFailure: inheritedFailure } : {}),
+        });
+        this.events.append(record.taskId, 'copy.created', { copyDirectory: task.project.copyDirectory });
+        if (policyStageOptions) {
+          await stageProjectExecutionPolicy(task.project, policyStageOptions, this.config);
+        }
+      } else if (!task.project) {
+        await this.ensureRootReadyForReuse(record.workingDirectory, {
+          excludeTaskId: record.taskId,
+          lockHeld: true,
+        });
+        const lineageId = randomUUID();
+        try {
+          task.project = await createProjectCopy(
+            record.workingDirectory,
+            task.options.includePaths,
+            project => {
+              task.project = project;
+              this.events.append(record.taskId, 'copy.created', { copyDirectory: project.copyDirectory });
+            },
+            this.config,
+            task.options.skills,
+            policyStageOptions,
+            {
+              stateDirectory: this.config.stateDirectory,
+              lineageId,
+              taskId: record.taskId,
+              onPrepared: info => { preparationInfo = info; },
+            },
+          );
+          task.workspacePrepared = true;
+        } catch (error) {
+          if (!(error instanceof BridgeError && error.code === 'GIT_CLEANUP_UNVERIFIED')) {
+            task.project = undefined;
+          }
+          throw error;
+        }
+      }
+
+      if (policyStageOptions && !task.project.executionPolicy) {
+        await this.assertNoPendingMcpCustody(task.project.copyDirectory, task.project.executionStateDirectory);
+        await stageProjectExecutionPolicy(task.project, policyStageOptions, this.config);
+      }
       await verifyManagedCopy(task.project);
       if (task.project.executionPolicy?.policy.sha256 !== task.options.agentPolicy?.sha256) throw new BridgeError('AGENT_POLICY_CHANGED', 'Copy policy does not match the task snapshot');
       record.providedSkills = task.project.providedSkills;
@@ -2206,18 +3339,26 @@ export class TaskManager {
         delivered: this.permanentDeliveredSkills(task.project.providedSkills),
         initListing: 'not-observed',
       };
-      task.releaseProject ??= this.state.acquire(this.projectLock(task.project));
       record.copyDirectory = task.project.copyDirectory;
       record.includedFiles = task.project.includedFiles;
       const blockedFiles = (task.project?.blockedFiles ?? []).map(b => ({ path: b.path, reason: b.reason }));
-      this.events.append(record.taskId, 'copy.ready', { copyDirectory: record.copyDirectory, blockedFiles });
-      if (record.handoff && !task.options.sessionId) {
+      this.events.append(record.taskId, 'copy.ready', {
+        copyDirectory: record.copyDirectory,
+        blockedFiles,
+        ...(preparationInfo
+          ? {
+              preparationMs: preparationInfo.preparationMs,
+              ...(preparationInfo.scopeSha256 ? { scopeSha256: preparationInfo.scopeSha256 } : {}),
+            }
+          : {}),
+      });
+      if (record.handoff && !task.options.sessionId && !task.options.resumeFromTaskId) {
         if (await fingerprintProjectCopy(task.project, this.config) !== record.handoff.treeSha256 ||
           (await previewProjectCopy(task.project, this.config)).sha256 !== record.handoff.patchSha256) throw new BridgeError('CONTEXT_CHANGED', 'Queued context copy changed before execution');
         this.events.append(record.taskId, 'context.copied', { sourceTaskId: record.handoff.sourceTaskId, treeSha256: record.handoff.treeSha256 });
       }
       if (record.mode === 'read-only' && record.handoff) readOnlyBaseline = await snapshotCopyFiles(task.project, this.config);
-      if (task.termination) { this.finish(task, task.termination); return; }
+      if (task.termination) { await this.finalizeTask(task, task.termination); return; }
       if (task.options.nativeTest) {
         const preview = await previewProjectCopy(task.project, this.config);
         if (preview.sha256 !== task.options.nativeTest.expectedSha256) throw new BridgeError('REVIEW_CHANGED', 'Copy changed while tests were queued');
@@ -2233,16 +3374,43 @@ export class TaskManager {
       await verifyCraftSelection(task.options.craft!);
       const isAgyExecutor = this.taskExecutor(record) instanceof AgyExecutionAdapter;
       const isAgyWrite = isAgyExecutor && record.mode !== 'read-only';
-      const { result: execResult, styles, boms } = await this.runAgyStep(
+      const canAttemptAbsentConversationFallback = Boolean(
+        isAgyExecutor && !native && task.options.resumeFromTaskId && task.options.sessionId,
+      );
+      const preAttemptTreeSha256 = canAttemptAbsentConversationFallback
+        ? await fingerprintProjectCopy(task.project, this.config)
+        : undefined;
+      let { result: execResult, styles, boms } = await this.runAgyStep(
         task,
         native ? { ...task.options, prompt: native.prompt } : task.options,
         { prepareLf: isAgyWrite, convertLf: isAgyWrite && !native },
       );
+      if (
+        !task.termination &&
+        canAttemptAbsentConversationFallback &&
+        execResult.status === 'failed' &&
+        execResult.error.code === 'AGY_CONVERSATION_NOT_FOUND'
+      ) {
+        const fallback = await this.tryFallbackAbsentConversation(
+          task,
+          execResult as Partial<AgyExecutionResult>,
+          preAttemptTreeSha256!,
+          policyReceiptOffset,
+          isAgyWrite,
+        );
+        if (fallback) {
+          execResult = fallback.result;
+          styles = fallback.styles;
+          boms = fallback.boms;
+          policyReceiptOffset = fallback.policyReceiptOffset;
+        }
+      }
       if (task.termination) {
+        await native?.cleanup(); native = undefined;
         if (!isAgyExecutor && (execResult.status === 'cancelled' || execResult.status === 'timeout') && execResult.status === task.termination) {
-          this.finish(task, task.termination, execResult.error.code, execResult.error.message);
+          await this.finalizeTask(task, task.termination, execResult.error.code, execResult.error.message);
         } else {
-          this.finish(task, task.termination);
+          await this.finalizeTask(task, task.termination);
         }
         return;
       }
@@ -2270,27 +3438,27 @@ export class TaskManager {
             }
             if (execResult.status !== 'completed') {
               const nonCompleteError = this.resultFailure(task, execResult);
-              this.finish(task, this.terminalStateFromResult(task, execResult), nonCompleteError.code, nonCompleteError.message);
+              await this.finalizeTask(task, this.terminalStateFromResult(task, execResult), nonCompleteError.code, nonCompleteError.message);
               return;
             }
             throw new BridgeError('TEST_EXECUTION_UNVERIFIED', 'No valid execution receipt from the exact run_command call; check native sandbox permissions');
           }
           if (last.beforeSha256 !== last.afterSha256 || last.afterSha256 !== tree) throw new BridgeError('TEST_CHANGED_PATCH', 'Project files changed during or after the test; run tests again');
-          if (last.exitCode !== 0) { this.finish(task, 'failed', 'TEST_FAILED', 'Observed test command failed'); return; }
+          if (last.exitCode !== 0) { await this.finalizeTask(task, 'failed', 'TEST_FAILED', 'Observed test command failed'); return; }
         }
       }
       if (task.termination) {
         if (!isAgyExecutor && (execResult.status === 'cancelled' || execResult.status === 'timeout') && execResult.status === task.termination) {
-          this.finish(task, task.termination, execResult.error.code, execResult.error.message);
+          await this.finalizeTask(task, task.termination, execResult.error.code, execResult.error.message);
         } else {
-          this.finish(task, task.termination);
+          await this.finalizeTask(task, task.termination);
         }
         return;
       }
       if (record.mode === 'read-only') await verifyReadOnlyCopy(task.project, readOnlyBaseline);
       if (execResult.status !== 'completed') {
         const nonCompleteError = this.resultFailure(task, execResult);
-        this.finish(task, this.terminalStateFromResult(task, execResult), nonCompleteError.code, nonCompleteError.message);
+        await this.finalizeTask(task, this.terminalStateFromResult(task, execResult), nonCompleteError.code, nonCompleteError.message);
         return;
       }
       const deniedReads = await this.verifyPolicyAndReadDenials(task, execResult, policyReceiptOffset, 'No new guarded finish was observed for this conversation');
@@ -2309,18 +3477,94 @@ export class TaskManager {
         this.events.append(record.taskId, 'task.denied-reads', deniedReads);
       }
       this.recordToolErrors(task, execResult.toolErrors);
-      this.finish(task, 'completed');
+      await this.finalizeTask(task, 'completed');
     } catch (error) {
-      if (task.timer) { clearTimeout(task.timer); task.timer = undefined; }
-      if (task.executionAbort) { task.executionAbort.abort(task.termination ?? 'cancelled'); task.executionAbort = undefined; }
-      if (task.child) { this.terminate(task.child); task.child = undefined; }
-      this.finishFromError(task, error, 'AGY_PROCESS_FAILED');
+      this.clearTaskHandles(task);
+      await native?.cleanup().catch(() => {});
+      native = undefined;
+      await this.finalizeFromError(task, error, 'AGY_PROCESS_FAILED');
     } finally {
-      if (task.timer) { clearTimeout(task.timer); task.timer = undefined; }
-      if (task.executionAbort) { task.executionAbort.abort(task.termination ?? 'cancelled'); task.executionAbort = undefined; }
-      if (task.child) { this.terminate(task.child); task.child = undefined; }
-      await native?.cleanup();
+      this.clearTaskHandles(task);
+      await native?.cleanup().catch(() => {});
+      this.releaseTaskExecutionSlot(task);
     }
+  }
+
+  private async tryFallbackAbsentConversation(
+    task: InternalTask,
+    failedResult: Partial<AgyExecutionResult>,
+    preAttemptTreeSha256: string,
+    policyReceiptOffset: number,
+    isAgyWrite: boolean,
+  ): Promise<{
+    result: ExecutionResult;
+    styles?: Map<string, LineEndingStyle>;
+    boms?: Set<string>;
+    policyReceiptOffset: number;
+  } | undefined> {
+    const record = task.record;
+    const project = task.project;
+    if (!project || !task.options.resumeFromTaskId || !task.options.sessionId) return undefined;
+    const processCleanup = failedResult.processCleanup ?? record.processCleanup;
+    // Always require positive proof of clean process exit; missing PID or missing cleanup record forbids fallback.
+    if (processCleanup?.verified !== true) return undefined;
+    try {
+      await this.assertCopyCleanupConfirmed(project, { excludeTaskId: record.taskId, lockHeld: true });
+      if (await readLineEndingConversionsMarker(project)) return undefined;
+      await verifyManagedCopy(project);
+      await ensureAgentGuard(project, record.mode ?? 'write');
+      await assertNoAgentConfigInCopy(project, record.mode ?? 'write');
+      const postAttemptTreeSha256 = await fingerprintProjectCopy(project, this.config);
+      if (postAttemptTreeSha256 !== preAttemptTreeSha256) return undefined;
+    } catch {
+      return undefined;
+    }
+    let nextPolicyOffset = policyReceiptOffset;
+    if (project.executionPolicy) {
+      try {
+        const receipt = await readExecutionPolicyReceipt(
+          project.executionPolicy,
+          project.executionStateDirectory ?? this.config.stateDirectory,
+          policyReceiptOffset,
+        );
+        if (receipt.decisionCount > 0 || receipt.deniedCount > 0) return undefined;
+        nextPolicyOffset = receipt.nextOffset;
+      } catch {
+        return undefined;
+      }
+      task.editReceipts = { offset: nextPolicyOffset, pending: new Map(), ambiguous: new Set() };
+    }
+    const previousSessionId = task.options.sessionId;
+    const resumeSource = this.tasks.get(task.options.resumeFromTaskId);
+    const doneFiles = (await previewProjectCopy(project, this.config)).files.map(file => file.path);
+    const priorCause = task.options.resumeContext?.knownCause ?? (resumeSource ? this.knownResumeCause(resumeSource.record) : undefined);
+    const knownCause = priorCause
+      ? `the prior conversation was no longer available after ${priorCause}`
+      : 'the prior conversation was no longer available';
+    const freshResumeContext: ResumeContext = {
+      hasConversation: false,
+      previousTaskId: task.options.resumeFromTaskId,
+      previousStatus: resumeSource?.record.status ?? 'failed',
+      knownCause,
+      doneFiles,
+      remainingSummary: this.summarizeRemainingWork(resumeSource, record.acceptanceCriteria, record.mode ?? 'write'),
+    };
+    record.sessionId = undefined;
+    record.usageIsResume = false;
+    record.usageBaseline = undefined;
+    record.result = undefined;
+    record.usage = undefined;
+    record.exitCode = undefined;
+    this.events.append(record.taskId, 'session.fallback', {
+      previousSessionId,
+      reason: 'AGY_CONVERSATION_NOT_FOUND',
+    });
+    const step = await this.runAgyStep(
+      task,
+      { ...task.options, sessionId: undefined, resumeContext: freshResumeContext },
+      { prepareLf: isAgyWrite, convertLf: isAgyWrite },
+    );
+    return { ...step, policyReceiptOffset: nextPolicyOffset };
   }
 
   private localTestRequest(task: InternalTask): LocalNativeTestRequest {
@@ -2335,6 +3579,9 @@ export class TaskManager {
     if (request.backend === 'windows-lpac') {
       await this.nativeRecovery;
       if (this.nativeRecoveryError) throw this.nativeRecoveryError;
+      if (task.options.parentCheckpointTaskId) {
+        await recoverWindowsExecutions(this.config.stateDirectory, { requireIdle: true });
+      }
     }
     const label = request.backend === 'windows-lpac' ? 'Windows' : 'Linux';
     const release = this.state.acquire('sandbox-policy');
@@ -2388,6 +3635,13 @@ export class TaskManager {
           windowsNodeRuntime: this.config.windowsNodeRuntime, portableNodeCacheDirectory: this.config.windowsNodeCacheDirectory,
           portableNodeCacheDirectoryInvalid: this.config.windowsNodeCacheDirectoryInvalid,
           sandbox: request.sandbox, signal: controller.signal,
+          ...(task.project.executionPolicy ? {
+            managedMcpConfig: {
+              executionId: task.project.executionPolicy.executionId,
+              executionStateDirectory: task.project.executionStateDirectory ?? this.config.stateDirectory,
+              file: task.project.executionPolicy.files.find(entry => entry.path === '.agents/mcp_config.json'),
+            },
+          } : {}),
           onProcess,
         });
       } finally {
@@ -2422,6 +3676,25 @@ export class TaskManager {
         JSON.stringify({ executable: request.executable, args: request.args }) +
         '. Make only relevant fixes in the isolated copy. Do not run tests, change the command, weaken assertions, alter sandbox permissions, or change bridge configuration. Stop after the repair so the bridge can rerun the same command.' };
     if (task.record.agentPolicy) options.agentPolicy = this.checkAgentPolicySnapshot(task.record.agentPolicy);
+    if (task.options.agentPolicy && task.project.executionPolicy?.executionId !== task.record.taskId) {
+      await this.assertNoPendingMcpCustody(task.project.copyDirectory, task.project.executionStateDirectory);
+      await verifyManagedCopy(task.project);
+      const stageRequest = {
+        policy: task.options.agentPolicy,
+        catalog: this.config.mcpCatalog,
+        stateDirectory: this.config.stateDirectory,
+        executionId: task.record.taskId,
+        readOnlyRoots: task.options.craft ? [path.join(task.options.craft.root, 'skills')] : [],
+      };
+      if (process.platform === 'win32' && task.project.executionPolicy) {
+        await handoffProjectExecutionPolicyWithProvenMcpConfig(task.project, stageRequest, this.config);
+      } else {
+        await removeStagedExecutionPolicyHelpers(task.project.copyDirectory);
+        task.project.executionPolicy = undefined;
+        task.project.executionStateDirectory = undefined;
+        await stageProjectExecutionPolicy(task.project, stageRequest, this.config);
+      }
+    }
     await verifyManagedCopy(task.project);
     const receiptOffset = task.project.executionPolicy ? (await readExecutionPolicyReceipt(task.project.executionPolicy, task.project.executionStateDirectory ?? this.config.stateDirectory)).nextOffset : 0;
     task.editReceipts = task.project.executionPolicy ? { offset: receiptOffset, pending: new Map(), ambiguous: new Set() } : undefined;
@@ -2467,9 +3740,50 @@ export class TaskManager {
       return true;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      this.finish(task, 'failed', 'PROCESS_CLEANUP_UNVERIFIED', message);
+      await this.finalizeTask(task, 'failed', 'PROCESS_CLEANUP_UNVERIFIED', message);
       return false;
     }
+  }
+
+  private async prepareWindowsPrePrepRetryWorkspace(
+    task: InternalTask,
+    request: LocalNativeTestRequest,
+  ): Promise<{ preparationMs: number; scopeSha256?: string }> {
+    const causalParent = task.options.parentTaskId ? this.tasks.get(task.options.parentTaskId) : undefined;
+    if (
+      !this.isPrePrepWindowsLocalFailure(causalParent) ||
+      causalParent.options.parentArchiveSha256 !== task.options.parentArchiveSha256
+    ) {
+      throw new BridgeError('CHECKPOINT_UNAVAILABLE', 'Pre-preparation parent state changed before native test execution');
+    }
+    const resolved = this.resolveWindowsPrePrepRetryChain(causalParent);
+    const checkpointParent = resolved?.checkpointTask;
+    if (
+      !checkpointParent?.project ||
+      checkpointParent.record.taskId !== task.options.parentCheckpointTaskId ||
+      checkpointParent.project.archiveSha256 !== task.options.parentArchiveSha256
+    ) {
+      throw new BridgeError('CHECKPOINT_UNAVAILABLE', 'Parent task workspace checkpoint is no longer retained for native test execution');
+    }
+    await this.verifyPrePrepParentArchive(causalParent, checkpointParent, request.expectedSha256, task.record.taskId);
+    await recoverWindowsExecutions(this.config.stateDirectory, { requireIdle: true });
+    await this.ensureRootReadyForReuse(task.record.workingDirectory, {
+      excludeTaskId: task.record.taskId,
+      lockHeld: true,
+    });
+    const restored = await restoreTaskCheckpointIntoWorkspace({
+      stateDirectory: this.config.stateDirectory,
+      sourceTaskId: checkpointParent.record.taskId,
+      expectedManifestSha256: task.options.parentArchiveSha256!,
+      targetTaskId: task.record.taskId,
+      targetLineageId: checkpointParent.project.lineageId!,
+      limits: this.config,
+    });
+    task.workspacePrepared = true;
+    task.project = this.cloneProject(restored.project, {
+      ...(task.project?.modelProofFailure ? { modelProofFailure: task.project.modelProofFailure } : {}),
+    });
+    return { preparationMs: restored.preparationMs, scopeSha256: restored.scopeSha256 };
   }
 
   private async executeLocalNativeTest(task: InternalTask): Promise<void> {
@@ -2477,8 +3791,141 @@ export class TaskManager {
     const label = request.backend === 'windows-lpac' ? 'Windows' : 'Linux';
     const source = request.backend === 'windows-lpac' ? 'windows-executor' as const : 'linux-executor' as const;
     await this.beginLocalNativeTest(task, request);
-    if (task.termination) { this.finish(task, task.termination); return; }
+    if (task.termination) { await this.finalizeTask(task, task.termination); return; }
     if (!task.project) throw new BridgeError('TASK_NOT_READY', `${label} tests require an isolated project copy`);
+    task.releaseProject ??= this.state.acquire(this.projectLock(task.project));
+    if (task.project.workspaceStateDirectory) {
+      const parentTask = task.options.parentTaskId ? this.tasks.get(task.options.parentTaskId) : undefined;
+      const metaFile = path.join(path.dirname(task.project.copyDirectory), WORKSPACE_META_FILE_NAME);
+      const meta = readWorkspaceMetadata(metaFile);
+      let nativePreparationInfo: { preparationMs: number; scopeSha256?: string } | undefined;
+      if (request.backend === 'windows-lpac' && task.options.parentCheckpointTaskId) {
+        nativePreparationInfo = await this.prepareWindowsPrePrepRetryWorkspace(task, request);
+      } else if (parentTask && this.isPositiveLiveOccupant(parentTask, meta, task.record.workingDirectory)) {
+        const livePrepStartMs = performance.now();
+        await this.ensureRootReadyForReuse(task.record.workingDirectory, {
+          excludeTaskId: task.record.taskId,
+          allowUnarchivedOccupantTaskId: parentTask.record.taskId,
+          lockHeld: true,
+        });
+        await verifyManagedCopy(task.project);
+        const preparationMs = Math.round((performance.now() - livePrepStartMs) * 1000) / 1000;
+        if (meta) {
+          writeWorkspaceMetadata(metaFile, {
+            version: 1,
+            sourceDirectory: meta.sourceDirectory,
+            rootKey: meta.rootKey,
+            currentTaskId: task.record.taskId,
+            currentLineageId: task.project.lineageId,
+            lastPreparedDurationMs: preparationMs,
+            updatedAt: new Date().toISOString(),
+            ...(meta.windowsLpac ? { windowsLpac: meta.windowsLpac } : {}),
+          });
+        }
+        task.workspacePrepared = true;
+        nativePreparationInfo = { preparationMs };
+      } else if (parentTask) {
+        await this.ensureRootReadyForReuse(task.record.workingDirectory, {
+          excludeTaskId: task.record.taskId,
+          lockHeld: true,
+        });
+        const expectedManifestSha256 = parentTask.project?.archiveSha256 ?? task.options.parentArchiveSha256;
+        if (!expectedManifestSha256) {
+          throw new BridgeError('CHECKPOINT_UNAVAILABLE', 'Parent task workspace checkpoint digest is missing for native test execution');
+        }
+        const restored = await restoreTaskCheckpointIntoWorkspace({
+          stateDirectory: this.config.stateDirectory,
+          sourceTaskId: parentTask.record.taskId,
+          expectedManifestSha256,
+          targetTaskId: task.record.taskId,
+          targetLineageId: task.project.lineageId ?? parentTask.project?.lineageId ?? randomUUID(),
+          limits: this.config,
+        });
+        task.workspacePrepared = true;
+        nativePreparationInfo = { preparationMs: restored.preparationMs, scopeSha256: restored.scopeSha256 };
+        task.project = this.cloneProject(restored.project, {
+          ...(task.project.modelProofFailure ? { modelProofFailure: task.project.modelProofFailure } : {}),
+        });
+      } else {
+        await this.ensureRootReadyForReuse(task.record.workingDirectory, {
+          excludeTaskId: task.record.taskId,
+          lockHeld: true,
+        });
+        if (
+          task.options.parentTaskId &&
+          meta &&
+          meta.currentTaskId === task.options.parentTaskId &&
+          meta.fencedAt === undefined &&
+          meta.fencedReason === undefined &&
+          copyIdentity(meta.sourceDirectory) === copyIdentity(task.record.workingDirectory) &&
+          existsSync(task.project.copyDirectory)
+        ) {
+          const livePrepStartMs = performance.now();
+          await verifyManagedCopy(task.project);
+          const preparationMs = Math.round((performance.now() - livePrepStartMs) * 1000) / 1000;
+          writeWorkspaceMetadata(metaFile, {
+            version: 1,
+            sourceDirectory: meta.sourceDirectory,
+            rootKey: meta.rootKey,
+            currentTaskId: task.record.taskId,
+            currentLineageId: task.project.lineageId,
+            lastPreparedDurationMs: preparationMs,
+            updatedAt: new Date().toISOString(),
+            ...(meta.windowsLpac ? { windowsLpac: meta.windowsLpac } : {}),
+          });
+          task.workspacePrepared = true;
+          nativePreparationInfo = { preparationMs };
+        } else if (task.options.parentTaskId && task.options.parentArchiveSha256 && hasTaskArchive(this.config.stateDirectory, task.options.parentTaskId)) {
+          const restored = await restoreTaskCheckpointIntoWorkspace({
+            stateDirectory: this.config.stateDirectory,
+            sourceTaskId: task.options.parentTaskId,
+            expectedManifestSha256: task.options.parentArchiveSha256,
+            targetTaskId: task.record.taskId,
+            targetLineageId: task.project.lineageId ?? randomUUID(),
+            limits: this.config,
+          });
+          task.workspacePrepared = true;
+          nativePreparationInfo = { preparationMs: restored.preparationMs, scopeSha256: restored.scopeSha256 };
+          task.project = this.cloneProject(restored.project, {
+            ...(task.project.modelProofFailure ? { modelProofFailure: task.project.modelProofFailure } : {}),
+          });
+        } else {
+          throw new BridgeError('CHECKPOINT_UNAVAILABLE', 'Parent task workspace checkpoint is unavailable for native test execution');
+        }
+      }
+      if (nativePreparationInfo) {
+        this.events.append(task.record.taskId, 'copy.ready', {
+          copyDirectory: task.project.copyDirectory,
+          preparationMs: nativePreparationInfo.preparationMs,
+          ...(nativePreparationInfo.scopeSha256 ? { scopeSha256: nativePreparationInfo.scopeSha256 } : {}),
+        });
+      }
+      if (task.options.agentPolicy && task.project.executionPolicy?.executionId !== task.record.taskId) {
+        await verifyManagedCopy(task.project);
+        const stageRequest = {
+          policy: task.options.agentPolicy,
+          catalog: this.config.mcpCatalog,
+          stateDirectory: this.config.stateDirectory,
+          executionId: task.record.taskId,
+          readOnlyRoots: task.options.craft ? [path.join(task.options.craft.root, 'skills')] : [],
+        };
+        if (request.backend === 'windows-lpac') {
+          await this.assertNoPendingMcpCustody(task.project.copyDirectory, task.project.executionStateDirectory);
+          if (task.project.executionPolicy) {
+            await handoffProjectExecutionPolicyWithProvenMcpConfig(task.project, stageRequest, this.config);
+          } else {
+            await stageProjectExecutionPolicy(task.project, stageRequest, this.config);
+          }
+        } else {
+          await removeStagedExecutionPolicyHelpers(task.project.copyDirectory);
+          task.project.executionPolicy = undefined;
+          task.project.executionStateDirectory = undefined;
+          await stageProjectExecutionPolicy(task.project, stageRequest, this.config);
+        }
+      }
+    } else {
+      task.workspacePrepared = true;
+    }
     const initial = await previewProjectCopy(task.project, this.config);
     if (initial.sha256 !== request.expectedSha256) throw new BridgeError('REVIEW_CHANGED', `Copy changed while the ${label} test was queued`);
     const deadline = Date.now() + task.options.timeoutSeconds! * 1000;
@@ -2524,12 +3971,12 @@ export class TaskManager {
         if (beforeTree !== afterTree) throw new BridgeError('TEST_CHANGED_PATCH', `Project files changed during the observed ${label} test command`);
         if (result.exitCode === 0) {
           if (!modelInvoked) task.record.usageProvenance = 'local-executor';
-          this.finish(task, 'completed');
+          await this.finalizeTask(task, 'completed');
           return;
         }
         if (attempt === request.maxAttempts) {
           if (!modelInvoked) task.record.usageProvenance = 'local-executor';
-          this.finish(task, 'failed', 'TEST_FAILED', `Observed ${label} test command failed`);
+          await this.finalizeTask(task, 'failed', 'TEST_FAILED', `Observed ${label} test command failed`);
           return;
         }
         const repairSeconds = this.remainingSeconds(deadline);
@@ -2544,19 +3991,9 @@ export class TaskManager {
         task.record.usageProvenance = undefined;
         await this.repairLocalTest(task, request, result.exitCode, repairSeconds);
       }
-      if (task.termination) this.finish(task, task.termination);
+      if (task.termination) await this.finalizeTask(task, task.termination);
     } finally {
-      if (task.timer) clearTimeout(task.timer);
-      task.timer = undefined;
-      task.nativeAbort = undefined;
-      if (task.executionAbort) {
-        task.executionAbort.abort(task.termination ?? 'cancelled');
-        task.executionAbort = undefined;
-      }
-      if (task.child) {
-        this.terminate(task.child);
-        task.child = undefined;
-      }
+      this.clearTaskHandles(task);
     }
   }
 
@@ -3090,9 +4527,9 @@ export class TaskManager {
     }
   }
 
-  private finishFromError(task: InternalTask, error: unknown, fallbackCode: string): void {
+  private async finalizeFromError(task: InternalTask, error: unknown, fallbackCode: string): Promise<void> {
     if (task.termination) {
-      this.finish(task, task.termination);
+      await this.finalizeTask(task, task.termination);
       return;
     }
     const rawCode = error instanceof BridgeError ? error.code : fallbackCode;
@@ -3102,7 +4539,7 @@ export class TaskManager {
     const message = rawCode !== code
       ? `Provider reported ${rawCode} without host termination: ${rawMessage}`
       : rawMessage;
-    this.finish(task, 'failed', code, message);
+    await this.finalizeTask(task, 'failed', code, message);
   }
 
   private terminalStateFromResult(task: InternalTask, _result: ExecutionResult): 'failed' | 'cancelled' | 'timeout' {
@@ -3250,7 +4687,7 @@ export class TaskManager {
     if (status === 'timeout') code = 'TASK_TIMEOUT';
     if (status === 'cancelled') code = 'TASK_CANCELLED';
     if (code) task.record.error = { code, message: redactDiagnostic(message || code) };
-    if (status !== 'completed') this.failPendingInbox(task.project?.copyDirectory, task, status === 'cancelled' ? 'cancelled' : 'failed', code ?? 'TASK_NOT_COMPLETED');
+    if (status !== 'completed') this.failPendingInbox(task.project ? this.lineageKey(task) : undefined, task, status === 'cancelled' ? 'cancelled' : 'failed', code ?? 'TASK_NOT_COMPLETED');
     const output = task.record.result as { response?: unknown; structured_output?: { summary?: unknown } } | undefined;
     const reported = typeof output?.structured_output?.summary === 'string' ? output.structured_output.summary : typeof output?.response === 'string' && output.response.trim() ? output.response : task.record.report?.data.summary;
     const hasPeerEnvelope = typeof reported === 'string' && reported.includes('<black-gravity-peer-message>');
@@ -3270,14 +4707,354 @@ export class TaskManager {
   }
 
   private assertNoUnconfirmedUntrackedLaunch(copyDirectory: string): void {
+    const copyKey = copyIdentity(copyDirectory);
     const blockingTaskIds: string[] = [];
     for (const candidate of this.tasks.values()) {
-      if (candidate.project?.copyDirectory === copyDirectory && this.recordBlocksCleanup(candidate.record)) {
+      if (!candidate.record.discardedAt && candidate.project && copyIdentity(candidate.project.copyDirectory) === copyKey && this.recordBlocksCleanup(candidate.record)) {
         blockingTaskIds.push(candidate.record.taskId);
       }
     }
     if (blockingTaskIds.length > 0) {
       throw this.unverifiedCleanupError(blockingTaskIds);
+    }
+  }
+
+  private async confirmRootCleanupForRelease(
+    project: Pick<ProjectCopy, 'copyDirectory' | 'gitDirectory'>,
+    options?: { excludeTaskId?: string },
+  ): Promise<{ confirmed: true } | { confirmed: false; blockingTaskIds: string[] }> {
+    let marker: ProcessCleanupMarker | undefined;
+    try {
+      marker = readProcessCleanupMarkerSync(project);
+    } catch {
+      return { confirmed: false, blockingTaskIds: ['unknown'] };
+    }
+    const copyKey = copyIdentity(project.copyDirectory);
+    const unconfirmedTasks = [...this.tasks.values()].filter(candidate =>
+      candidate.record.taskId !== options?.excludeTaskId &&
+      !candidate.record.discardedAt &&
+      candidate.project &&
+      copyIdentity(candidate.project.copyDirectory) === copyKey &&
+      candidate.record.processCleanup?.verified === false,
+    );
+    const nonTrackedMarker = marker?.entries.filter(entry => this.entryContainment(entry) !== 'tracked') ?? [];
+    const nonTrackedTasks = unconfirmedTasks.filter(candidate => this.recordContainment(candidate.record) !== 'tracked');
+    if (nonTrackedMarker.length > 0 || nonTrackedTasks.length > 0) {
+      return {
+        confirmed: false,
+        blockingTaskIds: [
+          ...nonTrackedMarker.map(entry => entry.taskId),
+          ...nonTrackedTasks.map(candidate => candidate.record.taskId),
+        ],
+      };
+    }
+    if (marker && marker.entries.length > 0) {
+      const reconciledLaunchIds: string[] = [];
+      const reconciledTaskIds = new Set<string>();
+      const failedTaskIds: string[] = [];
+      for (const entry of marker.entries) {
+        const retry = await reconcileLaunchIdentity({
+          pid: entry.pid,
+          start: entry.start,
+          spawnedAt: Date.parse(entry.spawnedAt),
+          processGroup: process.platform !== 'win32',
+        });
+        if (retry.verified) {
+          reconciledLaunchIds.push(entry.launchId);
+          reconciledTaskIds.add(entry.taskId);
+        } else {
+          failedTaskIds.push(entry.taskId);
+        }
+      }
+      if (failedTaskIds.length > 0) {
+        return { confirmed: false, blockingTaskIds: failedTaskIds };
+      }
+      removeProcessCleanupMarkerEntriesSync(project, reconciledLaunchIds);
+      for (const taskId of reconciledTaskIds) {
+        const task = this.tasks.get(taskId);
+        if (task?.record.processCleanup?.verified === false) {
+          task.record.processCleanup = { ...task.record.processCleanup, verified: true, checkedAt: new Date().toISOString(), remaining: 0 };
+          this.persist(taskId);
+        }
+      }
+    }
+    const stillUnconfirmed = unconfirmedTasks.filter(candidate => candidate.record.processCleanup?.verified === false);
+    const failedRecordIds: string[] = [];
+    const verifiedRecords: InternalTask[] = [];
+    for (const candidate of stillUnconfirmed) {
+      const cleanup = candidate.record.processCleanup!;
+      const retry = await reconcileLaunchIdentity({
+        pid: candidate.record.pid,
+        start: cleanup.start,
+        spawnedAt: Date.parse(cleanup.spawnedAt),
+        processGroup: process.platform !== 'win32',
+      });
+      if (retry.verified) {
+        verifiedRecords.push(candidate);
+      } else {
+        failedRecordIds.push(candidate.record.taskId);
+      }
+    }
+    if (failedRecordIds.length > 0) {
+      return { confirmed: false, blockingTaskIds: failedRecordIds };
+    }
+    for (const candidate of verifiedRecords) {
+      candidate.record.processCleanup = {
+        ...candidate.record.processCleanup!,
+        verified: true,
+        checkedAt: new Date().toISOString(),
+        remaining: 0,
+      };
+      this.persist(candidate.record.taskId);
+    }
+    return { confirmed: true };
+  }
+
+  private async archiveTaskBeforeTerminal(
+    task: InternalTask,
+    status: 'completed' | 'failed' | 'cancelled' | 'timeout',
+    errorCode?: string,
+  ): Promise<void> {
+    task.archiveAttempted = true;
+    const project = task.project;
+    if (!project?.workspaceStateDirectory || task.record.discardedAt) return;
+    if (!task.workspacePrepared || !task.releaseProject) return;
+    if (!this.statusRequiresCheckpointArchive(project, task.record, status, errorCode)) return;
+    if (task.record.processCleanup?.verified === false) return;
+    const metaFile = path.join(path.dirname(project.copyDirectory), WORKSPACE_META_FILE_NAME);
+    let meta: WorkspaceMetadata | undefined;
+    try {
+      meta = readWorkspaceMetadata(metaFile);
+    } catch {
+      return;
+    }
+    if (
+      !meta ||
+      meta.currentTaskId !== task.record.taskId ||
+      copyIdentity(meta.sourceDirectory) !== copyIdentity(project.sourceDirectory) ||
+      (meta.currentLineageId && project.lineageId && meta.currentLineageId !== project.lineageId) ||
+      meta.fencedAt !== undefined ||
+      meta.fencedReason !== undefined
+    ) {
+      return;
+    }
+    try {
+      const marker = readProcessCleanupMarkerSync(project);
+      if (marker && marker.entries.length > 0) return;
+    } catch {
+      return;
+    }
+    try {
+      if (await readLineEndingConversionsMarker(project)) return;
+    } catch {
+      return;
+    }
+    try {
+      const manifest = await archiveTaskCheckpoint({
+        stateDirectory: this.config.stateDirectory,
+        taskId: task.record.taskId,
+        lineageId: project.lineageId ?? randomUUID(),
+        mode: task.record.mode ?? 'write',
+        project,
+        limits: this.config,
+        artifacts: task.record.artifacts,
+      });
+      project.archivedAt = manifest.archivedAt;
+      project.archiveSha256 = manifest.manifestSha256;
+    } catch {
+      // Leave archiveSha256 unset; task remains an unarchived occupant so security tamper checks and reuse fences remain intact.
+    }
+  }
+
+  private async recoverInterruptedCheckpointUnderLock(task: InternalTask): Promise<VerifiedTaskArchive> {
+    const project = task.project;
+    if (
+      task.record.status !== 'failed' ||
+      task.record.error?.code !== 'SERVER_RESTARTED' ||
+      !project?.workspaceStateDirectory ||
+      task.record.discardedAt ||
+      task.record.integratedAt ||
+      project.archivedAt ||
+      project.archiveSha256
+    ) {
+      throw new BridgeError('CHECKPOINT_UNAVAILABLE', `Task ${task.record.taskId} is not eligible for first-time interrupted checkpoint recovery`);
+    }
+    if (hasTaskArchive(this.config.stateDirectory, task.record.taskId) || existsSync(archiveDirectoryFor(this.config.stateDirectory, task.record.taskId))) {
+      throw new BridgeError('ARCHIVE_VERIFICATION_FAILED', `Existing archive path for interrupted task ${task.record.taskId} cannot be recreated`);
+    }
+    const canonical = canonicalWorkspacePaths(this.config.stateDirectory, project.sourceDirectory);
+    if (
+      copyIdentity(canonical.copyDirectory) !== copyIdentity(project.copyDirectory) ||
+      copyIdentity(canonical.gitDirectory) !== copyIdentity(project.gitDirectory)
+    ) {
+      throw new BridgeError('CHECKPOINT_INVALID', `Interrupted task ${task.record.taskId} workspace path mismatch`);
+    }
+    if (this.hasQuarantinedCopySibling(canonical)) {
+      throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+    }
+    const copyKey = copyIdentity(canonical.copyDirectory);
+    const hasNonTerminal = [...this.tasks.values()].some(
+      other =>
+        other.record.taskId !== task.record.taskId &&
+        !other.record.discardedAt &&
+        other.project &&
+        copyIdentity(other.project.copyDirectory) === copyKey &&
+        !terminal.has(other.record.status),
+    );
+    if (hasNonTerminal) {
+      throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
+    }
+    const meta = readWorkspaceMetadata(canonical.metadataPath);
+    if (
+      !meta ||
+      meta.currentTaskId !== task.record.taskId ||
+      meta.sourceDirectory !== project.sourceDirectory ||
+      (meta.currentLineageId && project.lineageId && meta.currentLineageId !== project.lineageId)
+    ) {
+      throw new BridgeError('CHECKPOINT_INVALID', `Workspace bytes do not positively belong to interrupted task ${task.record.taskId}`);
+    }
+    const cleanup = await this.confirmRootCleanupForRelease(canonical);
+    if (!cleanup.confirmed) {
+      throw this.unverifiedCleanupError(cleanup.blockingTaskIds);
+    }
+    const postMarker = readProcessCleanupMarkerSync(project);
+    if (postMarker && postMarker.entries.length > 0) {
+      throw this.unverifiedCleanupError(postMarker.entries.map(entry => entry.taskId));
+    }
+    const conversions = await readLineEndingConversionsMarker(project);
+    if (conversions) {
+      if (conversions.taskId !== task.record.taskId) {
+        throw new BridgeError('LINE_ENDINGS_UNRESTORED', 'Unrestored line endings belong to a different task');
+      }
+      await this.restoreLineEndings(task);
+    }
+    const manifest = await archiveTaskCheckpoint({
+      stateDirectory: this.config.stateDirectory,
+      taskId: task.record.taskId,
+      lineageId: project.lineageId ?? meta.currentLineageId ?? randomUUID(),
+      mode: task.record.mode ?? 'write',
+      project,
+      limits: this.config,
+      artifacts: task.record.artifacts,
+      verifyBaselineMap: true,
+      requireFreshArchive: true,
+    });
+    const verified = await loadVerifiedTaskArchive(this.config.stateDirectory, task.record.taskId, {
+      expectedManifestSha256: manifest.manifestSha256,
+      verifyAllBlobs: true,
+    });
+    project.archivedAt = manifest.archivedAt;
+    project.archiveSha256 = manifest.manifestSha256;
+    this.persist(task.record.taskId);
+    return verified;
+  }
+
+  private async ensureRootReadyForReuse(
+    workingDirectory: string,
+    options: { excludeTaskId?: string; allowUnarchivedOccupantTaskId?: string; lockHeld: boolean },
+  ): Promise<void> {
+    const canonical = canonicalWorkspacePaths(this.config.stateDirectory, workingDirectory);
+    const copyKey = copyIdentity(canonical.copyDirectory);
+    if (this.hasQuarantinedCopySibling(canonical)) {
+      throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
+    }
+    const hasNonTerminal = [...this.tasks.values()].some(
+      task =>
+        task.record.taskId !== options.excludeTaskId &&
+        !task.record.discardedAt &&
+        task.project &&
+        copyIdentity(task.project.copyDirectory) === copyKey &&
+        !terminal.has(task.record.status),
+    );
+    if (hasNonTerminal) {
+      throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
+    }
+    const workspaceExists = existsSync(canonical.gitDirectory) || existsSync(canonical.copyDirectory);
+    const rootTasks = [...this.tasks.values()].filter(
+      task =>
+        task.record.taskId !== options.excludeTaskId &&
+        !task.record.discardedAt &&
+        task.project &&
+        copyIdentity(task.project.copyDirectory) === copyKey,
+    );
+    const meta = readWorkspaceMetadata(canonical.metadataPath);
+    await this.assertNoPendingMcpCustody(canonical.copyDirectory);
+    if (workspaceExists || rootTasks.length > 0) {
+      if (existsSync(canonical.gitDirectory)) {
+        await checkFenceMarker(canonical);
+      }
+      const cleanup = await this.confirmRootCleanupForRelease(canonical, { excludeTaskId: options.excludeTaskId });
+      if (!cleanup.confirmed) {
+        throw this.unverifiedCleanupError(cleanup.blockingTaskIds);
+      }
+      if (existsSync(canonical.gitDirectory)) {
+        const conversions = await readLineEndingConversionsMarker(canonical);
+        const recoverableOwner = conversions
+          ? rootTasks.find(candidate =>
+              candidate.record.taskId === conversions.taskId &&
+              candidate.record.taskId === meta?.currentTaskId &&
+              candidate.record.status === 'failed' &&
+              candidate.record.error?.code === 'SERVER_RESTARTED' &&
+              !candidate.project?.archivedAt &&
+              !candidate.project?.archiveSha256)
+          : undefined;
+        if (conversions && !recoverableOwner) {
+          throw new BridgeError('LINE_ENDINGS_UNRESTORED', 'A previous run left files converted to LF; confirm its processes ended before starting another');
+        }
+      }
+    }
+    for (const candidate of rootTasks) {
+      if (
+        candidate.record.taskId === meta?.currentTaskId &&
+        candidate.record.error?.code &&
+        TAMPER_ERROR_CODES.has(candidate.record.error.code)
+      ) {
+        throw new BridgeError(
+          'TASK_NOT_READY',
+          `Previous task ${candidate.record.taskId} on this workspace failed integrity verification (${candidate.record.error.code}); inspect or discard it before starting new work`,
+        );
+      }
+      if (!this.requiresCheckpointArchive(candidate)) continue;
+      const isExemptLiveOccupant = Boolean(
+        options.allowUnarchivedOccupantTaskId &&
+        candidate.record.taskId === options.allowUnarchivedOccupantTaskId &&
+        meta?.currentTaskId === candidate.record.taskId &&
+        copyIdentity(meta.sourceDirectory) === copyIdentity(workingDirectory) &&
+        (!meta.currentLineageId || !candidate.project?.lineageId || meta.currentLineageId === candidate.project.lineageId),
+      );
+      if (!candidate.project?.archiveSha256) {
+        if (isExemptLiveOccupant) {
+          continue;
+        }
+        if (
+          candidate.record.status === 'failed' &&
+          candidate.record.error?.code === 'SERVER_RESTARTED' &&
+          !candidate.project?.archivedAt &&
+          this.isCurrentOccupant(candidate)
+        ) {
+          await this.recoverInterruptedCheckpointUnderLock(candidate);
+        } else {
+          throw new BridgeError(
+            'TASK_NOT_READY',
+            `Previous task ${candidate.record.taskId} on this workspace has an unarchived checkpoint; inspect or discard it before starting new work`,
+          );
+        }
+      }
+      const mustVerify = candidate.record.taskId === meta?.currentTaskId ||
+        (!meta?.currentTaskId && existsSync(canonical.copyDirectory) && candidate === rootTasks.at(-1));
+      if (mustVerify) {
+        try {
+          await this.loadArchiveForTask(candidate);
+        } catch {
+          throw new BridgeError(
+            'ARCHIVE_VERIFICATION_FAILED',
+            `Required checkpoint archive for task ${candidate.record.taskId} is missing or failed integrity verification; workspace was not modified`,
+          );
+        }
+      }
+    }
+    if (existsSync(canonical.gitDirectory) && await readLineEndingConversionsMarker(canonical)) {
+      throw new BridgeError('LINE_ENDINGS_UNRESTORED', 'A previous run left files converted to LF; confirm its processes ended before starting another');
     }
   }
 
@@ -3322,9 +5099,11 @@ export class TaskManager {
 
   private async assertCopyCleanupConfirmed(
     project: ProjectCopy,
-    options?: { excludeTaskId?: string; lockHeld?: boolean },
+    options?: { excludeTaskId?: string; lockHeld?: boolean; allowMissingCopy?: boolean },
   ): Promise<void> {
-    await assertManagedCopyPresent(project);
+    if (!options?.allowMissingCopy) {
+      await assertManagedCopyPresent(project);
+    }
     if (this.hasQuarantinedCopySibling(project)) {
       throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
     }
@@ -3337,13 +5116,15 @@ export class TaskManager {
       throw this.unverifiedCleanupError(untrackedEntries.map(entry => entry.taskId));
     }
 
+    const copyKey = copyIdentity(project.copyDirectory);
     const hasNonTerminal = [...this.tasks.values()].some(
       task =>
-        task.project?.copyDirectory === project.copyDirectory &&
+        task.project &&
+        copyIdentity(task.project.copyDirectory) === copyKey &&
         task.record.taskId !== options?.excludeTaskId &&
         !terminal.has(task.record.status),
     );
-    if ((!options?.lockHeld && this.busyProjects.has(project)) || hasNonTerminal) {
+    if ((!options?.lockHeld && this.isProjectBusy(project)) || hasNonTerminal) {
       throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
     }
 
@@ -3352,7 +5133,7 @@ export class TaskManager {
       return;
     }
 
-    this.busyProjects.add(project);
+    this.busyProjects.add(copyKey);
     let release: (() => void) | undefined;
     try {
       release = this.state.acquire(this.projectLock(project));
@@ -3361,15 +5142,18 @@ export class TaskManager {
       await this.reconcileAndRemoveTrackedCleanupEntries(project, freshMarker);
     } finally {
       release?.();
-      this.busyProjects.delete(project);
+      this.busyProjects.delete(copyKey);
     }
   }
 
   // A copy whose processes may still run cannot be reused; another observation may confirm they ended.
   private async assertProcessesReconciled(record: TaskRecord): Promise<void> {
     const existing = this.tasks.get(record.taskId);
+    const fencedArchived = existing ? await this.hasVerifiedFencedFailedPrepArchive(existing) : false;
     if (existing?.project) {
-      await this.assertCopyCleanupConfirmed(existing.project);
+      await this.assertCopyCleanupConfirmed(existing.project, {
+        ...(fencedArchived ? { allowMissingCopy: true } : {}),
+      });
     } else if (record.copyDirectory) {
       this.assertNoUnconfirmedUntrackedLaunch(record.copyDirectory);
     }
@@ -3386,6 +5170,7 @@ export class TaskManager {
         processGroup: process.platform !== 'win32',
       });
       record.processCleanup = { ...cleanup, verified: retry.verified, checkedAt: new Date().toISOString(), remaining: retry.remaining.length };
+      if (retry.verified) this.persist(record.taskId);
       if (!retry.verified) throw this.unverifiedCleanupError([record.taskId]);
     }
     // Only this task's own launch, whose cleanup is now confirmed, can release the files it converted. Every write of the
@@ -3396,11 +5181,15 @@ export class TaskManager {
     if (this.hasQuarantinedCopySibling(project)) {
       throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
     }
-    if ((await readLineEndingConversions(project))?.taskId !== record.taskId) return;
-    if (this.busyProjects.has(project) || [...this.tasks.values()].some(other => other.project === project && !terminal.has(other.record.status))) {
+    const lineEndings = fencedArchived
+      ? (existsSync(project.gitDirectory) ? await readLineEndingConversionsMarker(project) : undefined)
+      : await readLineEndingConversions(project);
+    if (lineEndings?.taskId !== record.taskId) return;
+    const copyKey = this.projectKey(project);
+    if (this.busyProjects.has(copyKey) || [...this.tasks.values()].some(other => other.project && this.sameCanonicalCopy(other.project, project) && !terminal.has(other.record.status))) {
       throw new BridgeError('TASK_NOT_READY', 'Wait for all operations on this copy to finish');
     }
-    this.busyProjects.add(project);
+    this.busyProjects.add(copyKey);
     let release: (() => void) | undefined;
     try {
       release = this.state.acquire(this.projectLock(project));
@@ -3408,7 +5197,7 @@ export class TaskManager {
         throw new BridgeError('TASK_NOT_READY', 'Another snapshot of this copy is quarantined');
       }
       if ((await readLineEndingConversions(project))?.taskId === record.taskId) await this.restoreLineEndings(task!);
-    } finally { release?.(); this.busyProjects.delete(project); }
+    } finally { release?.(); this.busyProjects.delete(copyKey); }
   }
 
   // The CLI's edit tool matches text exactly and fails on CRLF, so pure CRLF files run as LF. The list is recorded with the

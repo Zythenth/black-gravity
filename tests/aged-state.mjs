@@ -29,8 +29,25 @@ async function exists(target) {
 // The fixture and the server must resolve the same temporary directory, which the SDK does not pass on Linux.
 export const temporaryEnv = Object.fromEntries(['TEMP', 'TMP', 'TMPDIR'].filter(key => process.env[key]).map(key => [key, process.env[key]]));
 
+// Put Windows PowerShell 5.1 system modules first so Desktop CimCmdlets loads from 5.1 PSHOME, while retaining
+// the four fixed ProgramFiles/SystemRoot roots empirically required for fast startup without inheriting user PSModulePath.
+const windowsPowerShellEnv = process.platform === 'win32'
+  ? (() => {
+      const systemRoot = process.env.SystemRoot || 'C:\\Windows';
+      const programFiles = process.env.ProgramFiles || 'C:\\Program Files';
+      return {
+        PSModulePath: [
+          path.win32.join(systemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules'),
+          path.win32.join(programFiles, 'PowerShell', 'Modules'),
+          path.win32.join(programFiles, 'PowerShell', '7', 'Modules'),
+          path.win32.join(programFiles, 'WindowsPowerShell', 'Modules'),
+        ].join(path.win32.delimiter),
+      };
+    })()
+  : {};
+
 function fixtureEnv(offsetMs, caseRoot) {
-  const env = { ...temporaryEnv, BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: path.join(caseRoot, 'windows-node-cache'), BRIDGE_TEST_CLOCK_OFFSET_MS: String(offsetMs) };
+  const env = { ...temporaryEnv, ...windowsPowerShellEnv, BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: path.join(caseRoot, 'windows-node-cache'), BRIDGE_TEST_CLOCK_OFFSET_MS: String(offsetMs) };
   for (const key of ['PATH', 'PATHEXT', 'SystemRoot', 'HOME', 'USERPROFILE']) {
     if (process.env[key]) env[key] = process.env[key];
   }
@@ -38,12 +55,21 @@ function fixtureEnv(offsetMs, caseRoot) {
 }
 
 function runFixture(caseRoot, state, taskCount, withGroup, offsetMs) {
-  const output = execFileSync(process.execPath, ['--import', clockURL, fixture, caseRoot, state, String(taskCount), String(withGroup)], {
-    cwd: caseRoot,
-    encoding: 'utf8',
-    env: fixtureEnv(offsetMs, caseRoot),
-  });
-  return JSON.parse(output.trim());
+  try {
+    const output = execFileSync(process.execPath, ['--import', clockURL, fixture, caseRoot, state, String(taskCount), String(withGroup)], {
+      cwd: caseRoot,
+      encoding: 'utf8',
+      env: fixtureEnv(offsetMs, caseRoot),
+    });
+    return JSON.parse(output.trim());
+  } catch (error) {
+    const rawStderr = typeof error?.stderr === 'string' ? error.stderr : Buffer.isBuffer(error?.stderr) ? error.stderr.toString('utf8') : '';
+    const diagnosticLine = rawStderr.split(/\r?\n/).find(line => line.startsWith('aged-state-diagnostic: '));
+    if (diagnosticLine) {
+      throw new Error(`${String(error)}; ${diagnosticLine.slice(0, 2000)}`, { cause: error });
+    }
+    throw error;
+  }
 }
 
 export async function withAgedServer(bin, root, name, prepare, verify, server = {}) {
@@ -63,7 +89,7 @@ export async function withAgedServer(bin, root, name, prepare, verify, server = 
       args: ['--import', clockURL, ...(server.args ?? []), bin],
       cwd: root,
       stderr: 'pipe',
-      env: { ...temporaryEnv, AGY_PATH: path.join(root, 'missing-agy'), BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_CLOCK_OFFSET_MS: String(200 * 3600000), BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: path.join(caseRoot, 'windows-node-cache'), ...(server.env ?? {}) },
+      env: { ...temporaryEnv, ...windowsPowerShellEnv, AGY_PATH: path.join(root, 'missing-agy'), BRIDGE_STATE_DIRECTORY: state, BRIDGE_TEST_CLOCK_OFFSET_MS: String(200 * 3600000), BRIDGE_WINDOWS_NODE_CACHE_DIRECTORY: path.join(caseRoot, 'windows-node-cache'), ...(server.env ?? {}) },
     });
     transport.stderr.on('data', chunk => { stderr += String(chunk); });
     await client.connect(transport);
@@ -95,12 +121,18 @@ export async function checkAgedState(bin, root) {
     const expiredIds = new Set(expired.tasks.map(task => task.taskId));
     const retainedList = run(1, 0, 100 * 3600000).tasks.filter(task => !expiredIds.has(task.taskId));
     assert.equal(retainedList.length, 1);
+    assert.equal(retainedList[0].copyDirectory, expired.tasks[0].copyDirectory);
     return { expired: expired.tasks, groupId: expired.groupId, retained: retainedList[0] };
-  }, async ({ client, getStderr, expired, groupId, retained }) => {
+  }, async ({ client, state, getStderr, expired, groupId, retained }) => {
     const health = await client.callTool({ name: 'black_gravity_health', arguments: {} });
     assert.equal(health.isError, undefined, JSON.stringify(health.structuredContent));
     assert.deepEqual(health.structuredContent.maintenanceIssues ?? [], []);
-    for (const task of expired) await assert.rejects(access(task.copyDirectory), { code: 'ENOENT' });
+    for (const task of expired) {
+      const expiredStatus = await client.callTool({ name: 'black_gravity_status', arguments: { taskId: task.taskId } });
+      assert.equal(expiredStatus.isError, undefined, JSON.stringify(expiredStatus.structuredContent));
+      assert.equal(typeof expiredStatus.structuredContent.task.discardedAt, 'string');
+      await assert.rejects(access(path.join(state, 'task-archives', task.taskId.toLowerCase())), { code: 'ENOENT' });
+    }
     assert.equal(await readFile(path.join(retained.copyDirectory, 'source.txt'), 'utf8'), 'source');
     const status = await client.callTool({ name: 'black_gravity_status', arguments: { taskId: retained.taskId } });
     assert.equal(status.isError, undefined, JSON.stringify(status.structuredContent));
@@ -120,6 +152,7 @@ export async function checkFailedCleanup(bin, root) {
     const expired = first.tasks[0];
     const retainedList = run(1, 0, 100 * 3600000).tasks.filter(task => task.taskId !== expired.taskId);
     assert.equal(retainedList.length, 1);
+    assert.equal(retainedList[0].copyDirectory, expired.copyDirectory);
     const lockFile = path.join(state, copyLockName(expired.copyDirectory) + '.lock');
     await writeFile(lockFile, JSON.stringify({ pid: process.pid, token: randomUUID() }), { flag: 'wx', mode: 0o600 });
     setLockFile(lockFile);
@@ -147,7 +180,9 @@ export async function checkFailedCleanup(bin, root) {
       const response = await client.callTool(call);
       assert.equal(response.isError, undefined, JSON.stringify(response.structuredContent));
     }
-    assert.equal(await readFile(path.join(expired.copyDirectory, 'source.txt'), 'utf8'), 'source');
+    const beforeExpiredStatus = await client.callTool({ name: 'black_gravity_status', arguments: { taskId: expired.taskId } });
+    assert.equal(beforeExpiredStatus.structuredContent.task.discardedAt, undefined);
+    await access(path.join(state, 'task-archives', expired.taskId.toLowerCase()));
     assert.equal(await readFile(path.join(retained.copyDirectory, 'source.txt'), 'utf8'), 'source');
     await unlink(lockFile);
     const deadline = Date.now() + 90000;
@@ -159,7 +194,13 @@ export async function checkFailedCleanup(bin, root) {
       if (!currentHealth.structuredContent.maintenanceIssues?.length) break;
     }
     assert.deepEqual(currentHealth?.structuredContent.maintenanceIssues ?? [], [], JSON.stringify(currentHealth?.structuredContent));
-    await assert.rejects(access(expired.copyDirectory), { code: 'ENOENT' });
+    const afterExpiredStatus = await client.callTool({ name: 'black_gravity_status', arguments: { taskId: expired.taskId } });
+    assert.equal(afterExpiredStatus.isError, undefined, JSON.stringify(afterExpiredStatus.structuredContent));
+    assert.equal(typeof afterExpiredStatus.structuredContent.task.discardedAt, 'string');
+    await assert.rejects(access(path.join(state, 'task-archives', expired.taskId.toLowerCase())), { code: 'ENOENT' });
+    const retainedStatus = await client.callTool({ name: 'black_gravity_status', arguments: { taskId: retained.taskId } });
+    assert.equal(retainedStatus.isError, undefined, JSON.stringify(retainedStatus.structuredContent));
+    assert.equal(retainedStatus.structuredContent.task.discardedAt, undefined);
     assert.equal(await readFile(path.join(retained.copyDirectory, 'source.txt'), 'utf8'), 'source');
     const finalStderr = getStderr();
     assert.equal(finalStderr.split(/\r?\n/).filter(line => warningLine.test(line)).length, 1, finalStderr);

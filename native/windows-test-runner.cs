@@ -6,6 +6,7 @@ using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
+using System.Security.Cryptography;
 using System.Security.Principal;
 using System.Text;
 using System.Threading;
@@ -14,7 +15,7 @@ using Microsoft.Win32.SafeHandles;
 
 internal static class WindowsTestRunner
 {
-    const uint FileShareRead = 1, FileShareWrite = 2, OpenExisting = 3, FileFlagBackupSemantics = 0x02000000, FileFlagOpenReparsePoint = 0x00200000, InvalidFileAttributes = 0xffffffff;
+    const uint FileListDirectory = 1, FileShareRead = 1, FileShareWrite = 2, OpenExisting = 3, FileFlagBackupSemantics = 0x02000000, FileFlagOpenReparsePoint = 0x00200000, InvalidFileAttributes = 0xffffffff;
     const uint WaitObject0 = 0, WaitTimeout = 0x102, ProcessQueryLimitedInformation = 0x1000, Synchronize = 0x100000;
     const uint DosRawTargetPath = 1, DosRemoveDefinition = 2, DosExactMatchOnRemove = 4, DosNoBroadcast = 8;
     const int ProcThreadAttributeSecurityCapabilities = 0x20009, ProcThreadAttributeHandleList = 0x20002, ProcThreadAttributeJobList = 0x2000D, ProcThreadAttributeAllApplicationPackagesPolicy = 0x2000F;
@@ -35,8 +36,86 @@ internal static class WindowsTestRunner
         public bool network;
         public bool childProcesses;
         public string stateDirectory;
+        public string capabilityNonce;
+        public int ownerPid;
         public Grant[] grants;
         public Dictionary<string, string> environment;
+        public McpCustodyRequest mcpCustody;
+    }
+
+    public sealed class McpCustodyRequest
+    {
+        public string executionId;
+        public string sha256;
+        public long bytes;
+    }
+
+    public sealed class McpStagingWitness
+    {
+        public int version;
+        public string executionId;
+        public string copyDirectory;
+        public string agentsDirectory;
+        public string mcpConfigPath;
+        public long? copyVolume;
+        public long? copyFileIndexHigh;
+        public long? copyFileIndexLow;
+        public long? agentsVolume;
+        public long? agentsFileIndexHigh;
+        public long? agentsFileIndexLow;
+        public long? volume;
+        public long? fileIndexHigh;
+        public long? fileIndexLow;
+        public long? bytes;
+        public string sha256;
+    }
+
+    public sealed class McpCustodyLease
+    {
+        public int version;
+        public string executionId;
+        public string sourcePath;
+        public string agentsPath;
+        public string custodyDirectory;
+        public string custodyPath;
+        public uint copyVolume;
+        public uint copyFileIndexHigh;
+        public uint copyFileIndexLow;
+        public uint agentsVolume;
+        public uint agentsFileIndexHigh;
+        public uint agentsFileIndexLow;
+        public uint custodyDirVolume;
+        public uint custodyDirFileIndexHigh;
+        public uint custodyDirFileIndexLow;
+        public uint volume;
+        public uint fileIndexHigh;
+        public uint fileIndexLow;
+        public long bytes;
+        public string sha256;
+        public string originalDaclBase64;
+        public string originalDaclSha256;
+        public string custodyDaclBase64;
+        public string custodyDaclSha256;
+    }
+
+    sealed class McpCustodyHold : IDisposable
+    {
+        public McpCustodyLease lease;
+        public IntPtr fileHandle = IntPtr.Zero;
+        public IntPtr slotDirHandle = IntPtr.Zero;
+        public IntPtr copyDirHandle = IntPtr.Zero;
+        public IntPtr agentsDirHandle = IntPtr.Zero;
+        public PinnedTarget copyPin;
+        public PinnedTarget agentsPin;
+        public void Dispose()
+        {
+            if (fileHandle != IntPtr.Zero && fileHandle != InvalidHandle) { CloseHandle(fileHandle); fileHandle = IntPtr.Zero; }
+            if (slotDirHandle != IntPtr.Zero && slotDirHandle != InvalidHandle) { CloseHandle(slotDirHandle); slotDirHandle = IntPtr.Zero; }
+            if (agentsDirHandle != IntPtr.Zero && agentsDirHandle != InvalidHandle) { CloseHandle(agentsDirHandle); agentsDirHandle = IntPtr.Zero; }
+            if (copyDirHandle != IntPtr.Zero && copyDirHandle != InvalidHandle) { CloseHandle(copyDirHandle); copyDirHandle = IntPtr.Zero; }
+            if (agentsPin != null) { agentsPin.Dispose(); agentsPin = null; }
+            if (copyPin != null) { copyPin.Dispose(); copyPin = null; }
+        }
     }
 
     public sealed class Grant
@@ -58,6 +137,8 @@ internal static class WindowsTestRunner
         public string phase;
         public int controllerPid;
         public long controllerStarted;
+        public int ownerPid;
+        public long ownerStarted;
         public string cwd;
         public string runtime;
         public string scratch;
@@ -66,6 +147,51 @@ internal static class WindowsTestRunner
         public AliasPlan[] aliases;
         public bool nullDeviceGrant;
         public bool? jobCreated;
+        public string capabilityNonce;
+        public string readCapabilitySid;
+        public string modifyCapabilitySid;
+        public string nativeDaclSha256;
+        public McpCustodyLease mcpCustody;
+    }
+
+    public sealed class WorkspaceLpacMeta
+    {
+        public int version;
+        public string initializedAt;
+        public string dev;
+        public string ino;
+        public string birthtimeNs;
+        public string daclSha256;
+        public string capabilityNonce;
+        public string readCapabilitySid;
+        public string modifyCapabilitySid;
+        public long? volume;
+        public long? fileIndexHigh;
+        public long? fileIndexLow;
+        public string nativeDaclSha256;
+    }
+
+    public sealed class WorkspaceMeta
+    {
+        public int version;
+        public string sourceDirectory;
+        public string rootKey;
+        public string currentTaskId;
+        public string currentLineageId;
+        public string updatedAt;
+        public double? lastPreparedDurationMs;
+        public WorkspaceLpacMeta windowsLpac;
+    }
+
+    sealed class CanonicalWorkspaceInfo
+    {
+        public string copyPath;
+        public string rootKey;
+        public string metadataPath;
+        public WorkspaceMeta meta;
+        public Guid capabilityNonce;
+        public SecurityIdentifier readSid;
+        public SecurityIdentifier modifySid;
     }
 
     public sealed class AliasPlan
@@ -160,6 +286,11 @@ internal static class WindowsTestRunner
     [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
     [DllImport("advapi32.dll", SetLastError = true)] static extern bool GetTokenInformation(IntPtr token, int kind, IntPtr information, uint size, out uint returned);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr CreateFile(string name, uint desiredAccess, uint shareMode, IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool CreateDirectory(string pathName, IntPtr securityAttributes);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool ReadFile(IntPtr handle, byte[] buffer, uint bytesToRead, out uint bytesRead, IntPtr overlapped);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFilePointerEx(IntPtr handle, long distanceToMove, out long newFilePointer, uint moveMethod);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] static extern uint GetFinalPathNameByHandle(IntPtr handle, StringBuilder path, uint size, uint flags);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool SetFileInformationByHandle(IntPtr handle, int fileInformationClass, IntPtr fileInformation, uint bufferSize);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandle(IntPtr handle, out ByHandleFileInformation info);
     [StructLayout(LayoutKind.Sequential)] struct FileAttributeTagInfo { public uint attributes, tag; }
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetFileInformationByHandleEx(IntPtr handle, int kind, out FileAttributeTagInfo info, uint size);
@@ -634,6 +765,2164 @@ internal static class WindowsTestRunner
         if (!Directory.Exists(lease)) Directory.CreateDirectory(lease);
         if ((File.GetAttributes(lease) & FileAttributes.ReparsePoint) != 0) throw new Exception("Lease directory is linked");
         return lease;
+    }
+
+    static bool IsLowerHex(string value, int length)
+    {
+        if (String.IsNullOrEmpty(value) || value.Length != length) return false;
+        for (int index = 0; index < value.Length; index++)
+        {
+            char ch = value[index];
+            if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+        }
+        return true;
+    }
+
+    static string ComputeSha256Hex(byte[] data)
+    {
+        using (SHA256 sha = SHA256.Create())
+        {
+            byte[] hash = sha.ComputeHash(data);
+            var sb = new StringBuilder(hash.Length * 2);
+            for (int index = 0; index < hash.Length; index++) sb.Append(hash[index].ToString("x2", CultureInfo.InvariantCulture));
+            return sb.ToString();
+        }
+    }
+
+    static string ComputeWorkspaceRootKey(string sourceDirectory)
+    {
+        RequireLocalAbsolutePath(sourceDirectory, "Workspace source directory");
+        string resolved = Path.GetFullPath(sourceDirectory);
+        if (resolved.Length > 3) resolved = resolved.TrimEnd(Path.DirectorySeparatorChar);
+        byte[] bytes = Encoding.UTF8.GetBytes(resolved.ToLowerInvariant());
+        return ComputeSha256Hex(bytes).Substring(0, 32);
+    }
+
+    static bool OverlapsPath(string left, string right)
+    {
+        if (String.IsNullOrEmpty(left) || String.IsNullOrEmpty(right)) return false;
+        string a = Path.GetFullPath(left).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        string b = Path.GetFullPath(right).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        if (String.Equals(a, b, StringComparison.OrdinalIgnoreCase)) return true;
+        string aPrefix = a.EndsWith("\\", StringComparison.Ordinal) ? a : a + "\\";
+        string bPrefix = b.EndsWith("\\", StringComparison.Ordinal) ? b : b + "\\";
+        return b.StartsWith(aPrefix, StringComparison.OrdinalIgnoreCase) || a.StartsWith(bPrefix, StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool TryGetCanonicalWorkspaceRootKey(string directory, string stateDirectory, out string fullCopy, out string rootKey, out string metadataPath)
+    {
+        fullCopy = null; rootKey = null; metadataPath = null;
+        if (String.IsNullOrEmpty(directory) || String.IsNullOrEmpty(stateDirectory)) return false;
+        try
+        {
+            RequireLocalAbsolutePath(directory, "Workspace copy directory");
+            RequireLocalAbsolutePath(stateDirectory, "State directory");
+        }
+        catch { return false; }
+        string copy = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar);
+        string state = Path.GetFullPath(stateDirectory).TrimEnd(Path.DirectorySeparatorChar);
+        if (!String.Equals(Path.GetFileName(copy), "copy", StringComparison.OrdinalIgnoreCase)) return false;
+        string workspaceDir = Path.GetDirectoryName(copy);
+        if (String.IsNullOrEmpty(workspaceDir)) return false;
+        string key = Path.GetFileName(workspaceDir);
+        if (!IsLowerHex(key, 32)) return false;
+        string workspacesDir = Path.GetDirectoryName(workspaceDir);
+        if (String.IsNullOrEmpty(workspacesDir) || !String.Equals(Path.GetFileName(workspacesDir), "workspaces", StringComparison.OrdinalIgnoreCase)) return false;
+        string parentState = Path.GetDirectoryName(workspacesDir);
+        if (String.IsNullOrEmpty(parentState) || !String.Equals(parentState.TrimEnd(Path.DirectorySeparatorChar), state, StringComparison.OrdinalIgnoreCase)) return false;
+        fullCopy = copy;
+        rootKey = key;
+        metadataPath = Path.Combine(workspaceDir, "workspace.json");
+        return true;
+    }
+
+    static string WorkspaceCapabilityName(string rootKey, Guid capabilityNonce, bool modify)
+    {
+        return "blackGravityWorkspace" + rootKey + capabilityNonce.ToString("N") + (modify ? "Modify" : "Read");
+    }
+
+    static SecurityIdentifier DeriveNamedCapabilitySid(string name)
+    {
+        var allocations = new List<IntPtr>();
+        try
+        {
+            IntPtr sidPtr = DeriveCapability(name, allocations);
+            var sid = new SecurityIdentifier(sidPtr);
+            if (!IsNamedCapabilitySid(sid)) throw new Exception("Derived capability SID has unexpected authority");
+            return sid;
+        }
+        finally
+        {
+            foreach (IntPtr ptr in allocations) if (ptr != IntPtr.Zero) LocalFree(ptr);
+        }
+    }
+
+    static bool IsAppContainerPackageSid(SecurityIdentifier sid)
+    {
+        return sid != null && sid.Value.StartsWith("S-1-15-2-", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool IsNamedCapabilitySid(SecurityIdentifier sid)
+    {
+        return sid != null && sid.Value.StartsWith("S-1-15-3-1024-", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static string DaclSha256(RawSecurityDescriptor descriptor)
+    {
+        if (descriptor == null || descriptor.DiscretionaryAcl == null) throw new Exception("Target has no DACL");
+        byte[] flagBytes = BitConverter.GetBytes((int)descriptor.ControlFlags);
+        byte[] aclBytes = new byte[descriptor.DiscretionaryAcl.BinaryLength];
+        descriptor.DiscretionaryAcl.GetBinaryForm(aclBytes, 0);
+        byte[] combined = new byte[flagBytes.Length + aclBytes.Length];
+        Buffer.BlockCopy(flagBytes, 0, combined, 0, flagBytes.Length);
+        Buffer.BlockCopy(aclBytes, 0, combined, flagBytes.Length, aclBytes.Length);
+        return ComputeSha256Hex(combined);
+    }
+
+    static CanonicalWorkspaceInfo ValidateCanonicalWorkspaceCopy(string cwd, string stateDirectory, JavaScriptSerializer serializer, bool requireInitialized)
+    {
+        string fullCopy, rootKey, metadataPath;
+        if (!TryGetCanonicalWorkspaceRootKey(cwd, stateDirectory, out fullCopy, out rootKey, out metadataPath))
+        {
+            throw new Exception("Directory is not an owned canonical workspace copy");
+        }
+        if (!Directory.Exists(fullCopy) || (File.GetAttributes(fullCopy) & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new Exception("Canonical workspace copy directory is unavailable or linked");
+        }
+        if (!File.Exists(metadataPath) || (File.GetAttributes(metadataPath) & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new Exception("Canonical workspace metadata is missing or linked");
+        }
+        var metaInfo = new FileInfo(metadataPath);
+        if (metaInfo.Length <= 0 || metaInfo.Length > 1024 * 1024) throw new Exception("Canonical workspace metadata size is invalid");
+        WorkspaceMeta meta = serializer.Deserialize<WorkspaceMeta>(File.ReadAllText(metadataPath, Encoding.UTF8));
+        if (meta == null || meta.version != 1 || String.IsNullOrEmpty(meta.sourceDirectory) || !String.Equals(meta.rootKey, rootKey, StringComparison.Ordinal))
+        {
+            throw new Exception("Canonical workspace metadata identity mismatch");
+        }
+        if (!String.Equals(ComputeWorkspaceRootKey(meta.sourceDirectory), rootKey, StringComparison.Ordinal))
+        {
+            throw new Exception("Canonical workspace rootKey does not match sourceDirectory");
+        }
+        var info = new CanonicalWorkspaceInfo { copyPath = fullCopy, rootKey = rootKey, metadataPath = metadataPath, meta = meta };
+        if (requireInitialized)
+        {
+            if (meta.windowsLpac == null || meta.windowsLpac.version != 1) throw new Exception("Canonical workspace LPAC permissions are not initialized");
+            Guid capNonce;
+            if (String.IsNullOrEmpty(meta.windowsLpac.capabilityNonce) || !Guid.TryParseExact(meta.windowsLpac.capabilityNonce, "D", out capNonce))
+            {
+                throw new Exception("Canonical workspace LPAC capability nonce is missing or invalid");
+            }
+            if (!meta.windowsLpac.volume.HasValue || !meta.windowsLpac.fileIndexHigh.HasValue || !meta.windowsLpac.fileIndexLow.HasValue ||
+                meta.windowsLpac.volume.Value < 0 || meta.windowsLpac.volume.Value > UInt32.MaxValue ||
+                meta.windowsLpac.fileIndexHigh.Value < 0 || meta.windowsLpac.fileIndexHigh.Value > UInt32.MaxValue ||
+                meta.windowsLpac.fileIndexLow.Value < 0 || meta.windowsLpac.fileIndexLow.Value > UInt32.MaxValue)
+            {
+                throw new Exception("Canonical workspace LPAC folder identity is missing or invalid");
+            }
+            if (!IsLowerHex(meta.windowsLpac.nativeDaclSha256, 64))
+            {
+                throw new Exception("Canonical workspace LPAC DACL digest is missing or invalid");
+            }
+            SecurityIdentifier expectedRead = DeriveNamedCapabilitySid(WorkspaceCapabilityName(rootKey, capNonce, false));
+            SecurityIdentifier expectedModify = DeriveNamedCapabilitySid(WorkspaceCapabilityName(rootKey, capNonce, true));
+            if (String.IsNullOrEmpty(meta.windowsLpac.readCapabilitySid) || String.IsNullOrEmpty(meta.windowsLpac.modifyCapabilitySid) ||
+                !expectedRead.Equals(new SecurityIdentifier(meta.windowsLpac.readCapabilitySid)) ||
+                !expectedModify.Equals(new SecurityIdentifier(meta.windowsLpac.modifyCapabilitySid)) ||
+                expectedRead.Equals(expectedModify))
+            {
+                throw new Exception("Canonical workspace LPAC capability SID mismatch");
+            }
+            info.capabilityNonce = capNonce;
+            info.readSid = expectedRead;
+            info.modifySid = expectedModify;
+        }
+        return info;
+    }
+
+    static string ValidateCanonicalWorkspaceDacl(
+        PinnedTarget rootPin,
+        SecurityIdentifier allowedRead,
+        SecurityIdentifier allowedModify,
+        string expectedNativeDaclSha256,
+        bool requireBoth,
+        int maxFiles)
+    {
+        RawSecurityDescriptor rootDescriptor = ReadDacl(rootPin.grant.path);
+        string actualDigest = DaclSha256(rootDescriptor);
+        if (expectedNativeDaclSha256 != null && !String.Equals(actualDigest, expectedNativeDaclSha256, StringComparison.Ordinal))
+        {
+            throw new Exception("Canonical workspace folder DACL changed since LPAC baseline was pinned");
+        }
+        CheckWorkspaceEntryDacl(rootDescriptor, true, true, allowedRead, allowedModify, requireBoth);
+        ValidateCanonicalWorkspaceChildren(rootPin.grant.path, allowedRead, allowedModify, requireBoth, maxFiles, new int[] { 0 });
+        return actualDigest;
+    }
+
+    static void CheckWorkspaceEntryDacl(
+        RawSecurityDescriptor descriptor,
+        bool isRoot,
+        bool isDirectory,
+        SecurityIdentifier allowedRead,
+        SecurityIdentifier allowedModify,
+        bool requireBoth)
+    {
+        if (descriptor == null || descriptor.DiscretionaryAcl == null) throw new Exception("Canonical workspace entry has no DACL");
+        if (!isRoot && (descriptor.ControlFlags & ControlFlags.DiscretionaryAclProtected) != 0)
+        {
+            throw new Exception("Canonical workspace descendant has a protected DACL");
+        }
+        int expectedReadMask = (int)(FileSystemRights.ReadAndExecute | FileSystemRights.Synchronize);
+        int expectedModifyMask = (int)(FileSystemRights.Modify | FileSystemRights.Synchronize);
+        AceFlags inheritBoth = AceFlags.ContainerInherit | AceFlags.ObjectInherit;
+        int readMatches = 0, modifyMatches = 0;
+        RawAcl acl = descriptor.DiscretionaryAcl;
+        for (int index = 0; index < acl.Count; index++)
+        {
+            KnownAce known = acl[index] as KnownAce;
+            if (known == null) continue;
+            if (IsAppContainerPackageSid(known.SecurityIdentifier))
+            {
+                throw new Exception("Canonical workspace contains forbidden AppContainer package ACE");
+            }
+            if (!IsNamedCapabilitySid(known.SecurityIdentifier)) continue;
+            CommonAce common = known as CommonAce;
+            if (allowedRead != null && allowedRead.Equals(known.SecurityIdentifier))
+            {
+                if (common == null || common.AceQualifier != AceQualifier.AccessAllowed || common.IsCallback ||
+                    common.AccessMask != expectedReadMask || (common.AceFlags & AceFlags.InheritOnly) != 0 ||
+                    (isRoot && common.AceFlags != inheritBoth) ||
+                    (!isRoot && isDirectory && (common.AceFlags & inheritBoth) != inheritBoth))
+                {
+                    throw new Exception("Canonical workspace read capability ACE was altered");
+                }
+                readMatches++;
+            }
+            else if (allowedModify != null && allowedModify.Equals(known.SecurityIdentifier))
+            {
+                if (common == null || common.AceQualifier != AceQualifier.AccessAllowed || common.IsCallback ||
+                    common.AccessMask != expectedModifyMask || (common.AceFlags & AceFlags.InheritOnly) != 0 ||
+                    (isRoot && common.AceFlags != inheritBoth) ||
+                    (!isRoot && isDirectory && (common.AceFlags & inheritBoth) != inheritBoth))
+                {
+                    throw new Exception("Canonical workspace modify capability ACE was altered");
+                }
+                modifyMatches++;
+            }
+            else
+            {
+                throw new Exception("Canonical workspace contains unexpected capability ACE");
+            }
+        }
+        if (requireBoth && (readMatches != 1 || modifyMatches != 1))
+        {
+            throw new Exception("Canonical workspace scoped LPAC capability ACEs are missing or duplicated");
+        }
+        if (!requireBoth && (readMatches != 0 || modifyMatches != 0))
+        {
+            throw new Exception("Canonical workspace already contains LPAC capability ACEs");
+        }
+    }
+
+    static void ValidateCanonicalWorkspaceChildren(
+        string directory,
+        SecurityIdentifier allowedRead,
+        SecurityIdentifier allowedModify,
+        bool requireBoth,
+        int maxFiles,
+        int[] count)
+    {
+        foreach (string child in Directory.EnumerateFileSystemEntries(directory))
+        {
+            if (++count[0] > maxFiles) throw new Exception("Canonical workspace exceeds the configured file limit");
+            using (var pin = new PinnedTarget { grant = new Grant { rights = "read" }, maxFiles = maxFiles })
+            {
+                ValidatePathComponents(child, pin, false, maxFiles);
+                CheckWorkspaceEntryDacl(ReadDacl(pin.grant.path), false, pin.grant.directory, allowedRead, allowedModify, requireBoth);
+                if (pin.grant.directory)
+                {
+                    ValidateCanonicalWorkspaceChildren(pin.grant.path, allowedRead, allowedModify, requireBoth, maxFiles, count);
+                }
+            }
+        }
+    }
+
+    const int MaxMcpConfigBytes = 1024 * 1024;
+    const uint FileReadData = 0x00000001;
+    const uint FileReadAttributes = 0x00000080;
+    const uint DeleteAccess = 0x00010000;
+    const uint RequiredCustodyFileAccess = FileReadData | FileReadAttributes | DeleteAccess | StandardRightsRead | StandardRightsWriteDac | Synchronize;
+
+    static bool IsInitLeaseVersion(int version) { return version == 4 || version == 6; }
+    static bool IsRunLeaseWithJobVersion(int version) { return version == 3 || version == 5; }
+
+    static string CanonicalLocalPath(string value, string description)
+    {
+        RequireLocalAbsolutePath(value, description);
+        string full = Path.GetFullPath(value);
+        if (full.Length > 3) full = full.TrimEnd(Path.DirectorySeparatorChar);
+        return full;
+    }
+
+    static bool IsValidUint32(long? value)
+    {
+        return value.HasValue && value.Value >= 0 && value.Value <= UInt32.MaxValue;
+    }
+
+    static string FinalPathByHandle(IntPtr handle)
+    {
+        var sb = new StringBuilder(260);
+        uint length = GetFinalPathNameByHandle(handle, sb, (uint)sb.Capacity, 0);
+        if (length == 0) Check(false, "Resolve final path by handle");
+        if (length >= (uint)sb.Capacity)
+        {
+            if (length > 32768) throw new Exception("Final handle path exceeded bounded length");
+            sb = new StringBuilder(checked((int)length + 1));
+            length = GetFinalPathNameByHandle(handle, sb, (uint)sb.Capacity, 0);
+            if (length == 0 || length >= (uint)sb.Capacity) Check(false, "Read final path by handle");
+        }
+        string raw = sb.ToString(0, checked((int)length));
+        if (raw.StartsWith("\\\\?\\UNC\\", StringComparison.OrdinalIgnoreCase)) throw new Exception("Handle resolved to UNC path");
+        if (raw.StartsWith("\\\\?\\", StringComparison.Ordinal)) raw = raw.Substring(4);
+        return CanonicalLocalPath(raw, "Final handle path");
+    }
+
+    static byte[] ReadHandleAllBytes(IntPtr handle, int maxBytes, string description)
+    {
+        long position;
+        Check(SetFilePointerEx(handle, 0, out position, 0), "Rewind " + description);
+        using (var ms = new MemoryStream())
+        {
+            var buffer = new byte[16384];
+            for (;;)
+            {
+                uint bytesRead;
+                Check(ReadFile(handle, buffer, (uint)buffer.Length, out bytesRead, IntPtr.Zero), "Read " + description);
+                if (bytesRead == 0) break;
+                if (ms.Length + bytesRead > maxBytes) throw new Exception(description + " exceeded maximum size");
+                ms.Write(buffer, 0, checked((int)bytesRead));
+            }
+            return ms.ToArray();
+        }
+    }
+
+    static string HashHandleContents(IntPtr handle, long expectedBytes)
+    {
+        if (expectedBytes < 0 || expectedBytes > MaxMcpConfigBytes) throw new Exception("Invalid managed MCP config expected size");
+        long position;
+        Check(SetFilePointerEx(handle, 0, out position, 0), "Rewind managed MCP config handle");
+        var buffer = new byte[16384];
+        long total = 0;
+        using (SHA256 sha = SHA256.Create())
+        {
+            for (;;)
+            {
+                uint bytesRead;
+                Check(ReadFile(handle, buffer, (uint)buffer.Length, out bytesRead, IntPtr.Zero), "Read managed MCP config handle");
+                if (bytesRead == 0) break;
+                total += bytesRead;
+                if (total > expectedBytes) throw new Exception("Managed MCP config byte size exceeded witness");
+                sha.TransformBlock(buffer, 0, checked((int)bytesRead), null, 0);
+            }
+            if (total != expectedBytes) throw new Exception("Managed MCP config byte size mismatch");
+            sha.TransformFinalBlock(new byte[0], 0, 0);
+            byte[] hash = sha.Hash;
+            var sb = new StringBuilder(hash.Length * 2);
+            for (int index = 0; index < hash.Length; index++) sb.Append(hash[index].ToString("x2", CultureInfo.InvariantCulture));
+            return sb.ToString();
+        }
+    }
+
+    static void RenameHandleNoReplace(IntPtr handle, string destinationPath)
+    {
+        string fullDest = CanonicalLocalPath(destinationPath, "Custody rename destination");
+        string targetName = fullDest.Length >= 248 ? "\\\\?\\" + fullDest : fullDest;
+        byte[] nameBytes = Encoding.Unicode.GetBytes(targetName);
+        int rootOffset = IntPtr.Size;
+        int lengthOffset = rootOffset + IntPtr.Size;
+        int nameOffset = lengthOffset + 4;
+        int totalSize = nameOffset + nameBytes.Length + 2;
+        IntPtr buffer = Marshal.AllocHGlobal(totalSize);
+        try
+        {
+            for (int index = 0; index < totalSize; index++) Marshal.WriteByte(buffer, index, 0);
+            Marshal.WriteByte(buffer, 0, 0); // ReplaceIfExists = FALSE
+            Marshal.WriteIntPtr(buffer, rootOffset, IntPtr.Zero); // RootDirectory = NULL
+            Marshal.WriteInt32(buffer, lengthOffset, nameBytes.Length);
+            Marshal.Copy(nameBytes, 0, IntPtr.Add(buffer, nameOffset), nameBytes.Length);
+            Check(SetFileInformationByHandle(handle, 3, buffer, checked((uint)totalSize)), "Rename managed MCP config by handle without replace");
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    static byte[] ReadKernelDaclBytes(IntPtr handle)
+    {
+        uint needed;
+        GetKernelObjectSecurity(handle, 4, null, 0, out needed);
+        int err = Marshal.GetLastWin32Error();
+        if (err != 0 && err != 122) Check(false, "Measure kernel object DACL");
+        if (needed < 20 || needed > 65536) throw new Exception("Invalid kernel object DACL size: " + needed);
+        byte[] buffer = new byte[needed];
+        Check(GetKernelObjectSecurity(handle, 4, buffer, needed, out needed), "Read kernel object DACL");
+        return buffer;
+    }
+
+    static byte[] SerializeDaclBytes(RawSecurityDescriptor descriptor)
+    {
+        byte[] bytes = new byte[descriptor.BinaryLength];
+        descriptor.GetBinaryForm(bytes, 0);
+        return bytes;
+    }
+
+    static void WriteKernelDaclExact(IntPtr handle, RawSecurityDescriptor target)
+    {
+        byte[] targetBytes = SerializeDaclBytes(target);
+        var toWrite = new RawSecurityDescriptor(targetBytes, 0);
+        ControlFlags storedFlags = target.ControlFlags;
+        // AR preserves AI in this non-propagating write; Windows consumes AR.
+        if ((storedFlags & ControlFlags.DiscretionaryAclAutoInherited) != 0)
+        {
+            toWrite.SetFlags(storedFlags | ControlFlags.DiscretionaryAclAutoInheritRequired);
+        }
+        WriteKernelDacl(handle, toWrite);
+        RawSecurityDescriptor observed = ReadKernelDacl(handle);
+        if (!SameDacl(target, observed))
+        {
+            throw new Exception("Managed MCP config DACL update was not preserved exactly");
+        }
+    }
+
+    static void ValidateRepresentableDacl(RawSecurityDescriptor descriptor, string label)
+    {
+        if (descriptor == null || descriptor.DiscretionaryAcl == null || (descriptor.ControlFlags & ControlFlags.DiscretionaryAclPresent) == 0)
+        {
+            throw new Exception("Managed MCP config " + label + " DACL is missing or null");
+        }
+        if (descriptor.Owner != null || descriptor.Group != null || descriptor.SystemAcl != null)
+        {
+            throw new Exception("Managed MCP config " + label + " security descriptor contains unexpected sections");
+        }
+        AceFlags validFlags = AceFlags.ObjectInherit | AceFlags.ContainerInherit | AceFlags.NoPropagateInherit | AceFlags.InheritOnly | AceFlags.Inherited;
+        RawAcl acl = descriptor.DiscretionaryAcl;
+        for (int index = 0; index < acl.Count; index++)
+        {
+            CommonAce ace = acl[index] as CommonAce;
+            if (ace == null)
+            {
+                throw new Exception("Unrepresentable ACE type in managed MCP config " + label + " DACL");
+            }
+            if (ace.IsCallback)
+            {
+                throw new Exception("Unrepresentable callback ACE in managed MCP config " + label + " DACL");
+            }
+            if (ace.AceQualifier != AceQualifier.AccessAllowed && ace.AceQualifier != AceQualifier.AccessDenied)
+            {
+                throw new Exception("Unsupported ACE qualifier in managed MCP config " + label + " DACL");
+            }
+            if (ace.OpaqueLength != 0)
+            {
+                throw new Exception("Unrepresentable opaque ACE payload in managed MCP config " + label + " DACL");
+            }
+            if ((ace.AceFlags & ~validFlags) != 0)
+            {
+                throw new Exception("Unrepresentable ACE flags in managed MCP config " + label + " DACL");
+            }
+        }
+        var roundTripped = new RawSecurityDescriptor(SerializeDaclBytes(descriptor), 0);
+        if (!SameDacl(descriptor, roundTripped))
+        {
+            throw new Exception("Managed MCP config " + label + " DACL failed exact binary round-trip verification");
+        }
+    }
+
+    static RawSecurityDescriptor ParseValidatedLeaseDacl(string base64, string expectedSha256, string label)
+    {
+        if (String.IsNullOrEmpty(base64) || base64.Length > 131072 || !IsLowerHex(expectedSha256, 64))
+        {
+            throw new Exception("Managed MCP config lease " + label + " DACL metadata is missing or invalid");
+        }
+        byte[] bytes;
+        try { bytes = Convert.FromBase64String(base64); }
+        catch { throw new Exception("Managed MCP config lease " + label + " DACL encoding is invalid"); }
+        if (bytes.Length < 20 || bytes.Length > 65536)
+        {
+            throw new Exception("Managed MCP config lease " + label + " DACL length is invalid");
+        }
+        if (!String.Equals(ComputeSha256Hex(bytes), expectedSha256, StringComparison.Ordinal))
+        {
+            throw new Exception("Managed MCP config lease " + label + " DACL digest mismatch");
+        }
+        var descriptor = new RawSecurityDescriptor(bytes, 0);
+        ValidateRepresentableDacl(descriptor, label);
+        return descriptor;
+    }
+
+    static uint ExpandFileAccessMask(int mask)
+    {
+        uint value = unchecked((uint)mask);
+        if ((value & 0x10000000u) != 0) value |= 0x001F01FFu;
+        if ((value & 0x80000000u) != 0) value |= 0x00120089u;
+        if ((value & 0x40000000u) != 0) value |= 0x00120116u;
+        if ((value & 0x20000000u) != 0) value |= 0x001200A0u;
+        return value;
+    }
+
+    static bool IsAllowedCustodySid(SecurityIdentifier sid, SecurityIdentifier controllerUser)
+    {
+        return controllerUser.Equals(sid) ||
+            String.Equals(sid.Value, "S-1-5-18", StringComparison.OrdinalIgnoreCase) ||
+            String.Equals(sid.Value, "S-1-5-32-544", StringComparison.OrdinalIgnoreCase);
+    }
+
+    static bool CurrentControllerIsAdministrator()
+    {
+        using (WindowsIdentity current = WindowsIdentity.GetCurrent())
+        {
+            return new WindowsPrincipal(current).IsInRole(WindowsBuiltInRole.Administrator);
+        }
+    }
+
+    static bool DenySidCouldMatchController(SecurityIdentifier sid, SecurityIdentifier controllerUser, bool isAdmin)
+    {
+        if (controllerUser.Equals(sid) || WorldSid.Equals(sid)) return true;
+        if (String.Equals(sid.Value, "S-1-5-11", StringComparison.OrdinalIgnoreCase)) return true;
+        if (String.Equals(sid.Value, "S-1-5-32-545", StringComparison.OrdinalIgnoreCase)) return true;
+        if (isAdmin && String.Equals(sid.Value, "S-1-5-32-544", StringComparison.OrdinalIgnoreCase)) return true;
+        return false;
+    }
+
+    static void ValidateMonotonicCustodyDacl(RawSecurityDescriptor original, RawSecurityDescriptor custody, SecurityIdentifier controllerUser)
+    {
+        ValidateRepresentableDacl(original, "original");
+        ValidateRepresentableDacl(custody, "custody");
+        if ((custody.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0 ||
+            (custody.ControlFlags & (ControlFlags.DiscretionaryAclAutoInherited | ControlFlags.DiscretionaryAclAutoInheritRequired)) != 0)
+        {
+            throw new Exception("Tightened custody DACL is not strictly protected against inheritance");
+        }
+        var originalDenies = new List<CommonAce>();
+        var originalAllows = new List<CommonAce>();
+        for (int index = 0; index < original.DiscretionaryAcl.Count; index++)
+        {
+            CommonAce ace = (CommonAce)original.DiscretionaryAcl[index];
+            if (ace.AceQualifier == AceQualifier.AccessDenied) originalDenies.Add(ace);
+            else originalAllows.Add(ace);
+        }
+        var custodyDenies = new List<CommonAce>();
+        bool isAdmin = CurrentControllerIsAdministrator();
+        uint deniedForController = 0;
+        uint allowedForController = 0;
+        for (int index = 0; index < custody.DiscretionaryAcl.Count; index++)
+        {
+            CommonAce ace = (CommonAce)custody.DiscretionaryAcl[index];
+            if ((ace.AceFlags & AceFlags.Inherited) != 0)
+            {
+                throw new Exception("Tightened custody DACL cannot retain inherited ACE flags");
+            }
+            if (ace.AceQualifier == AceQualifier.AccessDenied)
+            {
+                custodyDenies.Add(ace);
+                if ((ace.AceFlags & AceFlags.InheritOnly) == 0 && DenySidCouldMatchController(ace.SecurityIdentifier, controllerUser, isAdmin))
+                {
+                    deniedForController |= ExpandFileAccessMask(ace.AccessMask);
+                }
+                continue;
+            }
+            if (ace.SecurityIdentifier.Value.StartsWith("S-1-15-", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Tightened custody DACL still permits an AppContainer or capability SID");
+            }
+            if (!IsAllowedCustodySid(ace.SecurityIdentifier, controllerUser))
+            {
+                throw new Exception("Tightened custody DACL permits an unauthorized principal");
+            }
+            bool matchedOriginal = false;
+            for (int origIndex = 0; origIndex < originalAllows.Count; origIndex++)
+            {
+                CommonAce origAce = originalAllows[origIndex];
+                if (origAce.SecurityIdentifier.Equals(ace.SecurityIdentifier) &&
+                    origAce.AccessMask == ace.AccessMask &&
+                    (origAce.AceFlags & ~AceFlags.Inherited) == ace.AceFlags)
+                {
+                    matchedOriginal = true;
+                    break;
+                }
+            }
+            if (!matchedOriginal)
+            {
+                throw new Exception("Tightened custody DACL widened or added an allow ACE beyond the original DACL");
+            }
+            if ((ace.AceFlags & AceFlags.InheritOnly) == 0 &&
+                (controllerUser.Equals(ace.SecurityIdentifier) ||
+                 (isAdmin && String.Equals(ace.SecurityIdentifier.Value, "S-1-5-32-544", StringComparison.OrdinalIgnoreCase))))
+            {
+                allowedForController |= (ExpandFileAccessMask(ace.AccessMask) & ~deniedForController);
+            }
+        }
+        if (custodyDenies.Count != originalDenies.Count)
+        {
+            throw new Exception("Tightened custody DACL did not preserve all original deny ACEs");
+        }
+        for (int index = 0; index < originalDenies.Count; index++)
+        {
+            CommonAce expectedDeny = originalDenies[index];
+            CommonAce actualDeny = custodyDenies[index];
+            if (!expectedDeny.SecurityIdentifier.Equals(actualDeny.SecurityIdentifier) ||
+                expectedDeny.AccessMask != actualDeny.AccessMask ||
+                (expectedDeny.AceFlags & ~AceFlags.Inherited) != actualDeny.AceFlags)
+            {
+                throw new Exception("Tightened custody DACL altered an original deny ACE");
+            }
+        }
+        if ((allowedForController & RequiredCustodyFileAccess) != RequiredCustodyFileAccess)
+        {
+            throw new Exception("Original managed MCP config DACL does not grant controller recovery rights without widening; failing closed");
+        }
+    }
+
+    static RawSecurityDescriptor BuildMonotonicCustodyDacl(RawSecurityDescriptor original, SecurityIdentifier controllerUser)
+    {
+        ValidateRepresentableDacl(original, "original");
+        var tightenedAcl = new RawAcl(original.DiscretionaryAcl.Revision, original.DiscretionaryAcl.Count);
+        int insertIndex = 0;
+        for (int index = 0; index < original.DiscretionaryAcl.Count; index++)
+        {
+            CommonAce ace = (CommonAce)original.DiscretionaryAcl[index];
+            AceFlags keptFlags = ace.AceFlags & ~AceFlags.Inherited;
+            if (ace.AceQualifier == AceQualifier.AccessDenied)
+            {
+                tightenedAcl.InsertAce(insertIndex++, new CommonAce(keptFlags, AceQualifier.AccessDenied, ace.AccessMask, ace.SecurityIdentifier, false, null));
+                continue;
+            }
+            if (ace.SecurityIdentifier.Value.StartsWith("S-1-15-", StringComparison.OrdinalIgnoreCase)) continue;
+            if (!IsAllowedCustodySid(ace.SecurityIdentifier, controllerUser)) continue;
+            tightenedAcl.InsertAce(insertIndex++, new CommonAce(keptFlags, AceQualifier.AccessAllowed, ace.AccessMask, ace.SecurityIdentifier, false, null));
+        }
+        var built = new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            null,
+            null,
+            null,
+            tightenedAcl);
+        var normalized = new RawSecurityDescriptor(SerializeDaclBytes(built), 0);
+        ValidateMonotonicCustodyDacl(original, normalized, controllerUser);
+        return normalized;
+    }
+
+    static RawSecurityDescriptor BuildProtectedControllerDacl(SecurityIdentifier controllerUser, bool isDirectory, bool includeOwner)
+    {
+        AceFlags flags = isDirectory ? AceFlags.ContainerInherit | AceFlags.ObjectInherit : AceFlags.None;
+        int mask = (int)FileSystemRights.FullControl;
+        var acl = new RawAcl(RawAcl.AclRevision, 2);
+        acl.InsertAce(0, new CommonAce(flags, AceQualifier.AccessAllowed, mask, controllerUser, false, null));
+        acl.InsertAce(1, new CommonAce(flags, AceQualifier.AccessAllowed, mask, new SecurityIdentifier("S-1-5-18"), false, null));
+        return new RawSecurityDescriptor(
+            ControlFlags.DiscretionaryAclPresent | ControlFlags.DiscretionaryAclProtected,
+            includeOwner ? controllerUser : null,
+            null,
+            null,
+            acl);
+    }
+
+    static bool IsProtectedControllerDacl(RawSecurityDescriptor descriptor, SecurityIdentifier controllerUser, bool isDirectory)
+    {
+        if (descriptor == null || descriptor.DiscretionaryAcl == null) return false;
+        if ((descriptor.ControlFlags & ControlFlags.DiscretionaryAclProtected) == 0) return false;
+        AceFlags expectedFlags = isDirectory ? AceFlags.ContainerInherit | AceFlags.ObjectInherit : AceFlags.None;
+        int expectedMask = (int)FileSystemRights.FullControl;
+        var systemSid = new SecurityIdentifier("S-1-5-18");
+        RawAcl acl = descriptor.DiscretionaryAcl;
+        if (acl.Count != 2) return false;
+        bool sawUser = false, sawSystem = false;
+        for (int index = 0; index < acl.Count; index++)
+        {
+            CommonAce ace = acl[index] as CommonAce;
+            if (ace == null || ace.IsCallback || ace.AceQualifier != AceQualifier.AccessAllowed ||
+                ace.AceFlags != expectedFlags || ace.AccessMask != expectedMask) return false;
+            if (ace.SecurityIdentifier.Value.StartsWith("S-1-15-", StringComparison.OrdinalIgnoreCase)) return false;
+            if (controllerUser.Equals(ace.SecurityIdentifier)) sawUser = true;
+            else if (systemSid.Equals(ace.SecurityIdentifier)) sawSystem = true;
+            else return false;
+        }
+        return sawUser && sawSystem;
+    }
+
+    static void EnforceProtectedControllerDaclByHandle(IntPtr handle, SecurityIdentifier controllerUser, bool isDirectory)
+    {
+        RawSecurityDescriptor desired = BuildProtectedControllerDacl(controllerUser, isDirectory, false);
+        WriteKernelDacl(handle, desired);
+        RawSecurityDescriptor verified = ReadKernelDacl(handle);
+        if (!IsProtectedControllerDacl(verified, controllerUser, isDirectory))
+        {
+            throw new Exception("Protected controller DACL verification failed");
+        }
+    }
+
+    static bool CreateDirectoryWithProtectedDacl(string directoryPath, SecurityIdentifier controllerUser, bool allowExisting)
+    {
+        RawSecurityDescriptor descriptor = BuildProtectedControllerDacl(controllerUser, true, true);
+        byte[] sdBytes = new byte[descriptor.BinaryLength];
+        descriptor.GetBinaryForm(sdBytes, 0);
+        IntPtr pSd = Marshal.AllocHGlobal(sdBytes.Length);
+        IntPtr pSa = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(SecurityAttributes)));
+        try
+        {
+            Marshal.Copy(sdBytes, 0, pSd, sdBytes.Length);
+            Marshal.StructureToPtr(new SecurityAttributes { length = Marshal.SizeOf(typeof(SecurityAttributes)), descriptor = pSd, inherit = 0 }, pSa, false);
+            if (CreateDirectory(directoryPath, pSa)) return true;
+            int error = Marshal.GetLastWin32Error();
+            if (allowExisting && error == 183) return false;
+            throw new Win32Exception(error, "Create protected custody directory (Win32 " + error + ")");
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(pSa);
+            Marshal.FreeHGlobal(pSd);
+        }
+    }
+
+    static void ValidateMcpCustodyRequest(McpCustodyRequest custody)
+    {
+        if (custody == null) return;
+        Guid executionGuid;
+        if (String.IsNullOrEmpty(custody.executionId) || !Guid.TryParseExact(custody.executionId, "D", out executionGuid) ||
+            !IsLowerHex(custody.sha256, 64) || custody.bytes < 0 || custody.bytes > MaxMcpConfigBytes)
+        {
+            throw new Exception("Invalid managed MCP config custody request");
+        }
+    }
+
+    static void ValidateMcpCustodyLease(McpCustodyLease custody, string expectedCwd, string canonicalState, Guid leaseNonce)
+    {
+        if (custody == null) return;
+        Guid executionGuid;
+        if (custody.version != 1 || String.IsNullOrEmpty(custody.executionId) || !Guid.TryParseExact(custody.executionId, "D", out executionGuid) ||
+            !IsLowerHex(custody.sha256, 64) || custody.bytes < 0 || custody.bytes > MaxMcpConfigBytes)
+        {
+            throw new Exception("Invalid managed MCP config custody lease");
+        }
+        string fullCwd = CanonicalLocalPath(expectedCwd, "Custody workspace copy");
+        string expectedAgents = Path.Combine(fullCwd, ".agents");
+        string expectedSource = Path.Combine(expectedAgents, "mcp_config.json");
+        string expectedCustodyDir = Path.Combine(Path.Combine(canonicalState, "windows-lpac-custody"), leaseNonce.ToString("N"));
+        string expectedCustodyPath = Path.Combine(expectedCustodyDir, "mcp_config.json");
+        if (String.IsNullOrEmpty(custody.agentsPath) || String.IsNullOrEmpty(custody.sourcePath) ||
+            String.IsNullOrEmpty(custody.custodyDirectory) || String.IsNullOrEmpty(custody.custodyPath) ||
+            !String.Equals(CanonicalLocalPath(custody.agentsPath, "Custody agents path"), expectedAgents, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(CanonicalLocalPath(custody.sourcePath, "Custody source path"), expectedSource, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(CanonicalLocalPath(custody.custodyDirectory, "Custody slot directory"), expectedCustodyDir, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(CanonicalLocalPath(custody.custodyPath, "Custody file path"), expectedCustodyPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new Exception("Managed MCP config custody lease path mismatch");
+        }
+        ParseValidatedLeaseDacl(custody.originalDaclBase64, custody.originalDaclSha256, "original");
+        ParseValidatedLeaseDacl(custody.custodyDaclBase64, custody.custodyDaclSha256, "custody");
+    }
+
+    static McpStagingWitness ReadValidatedMcpWitness(McpCustodyRequest request, string cwd, string canonicalState, JavaScriptSerializer serializer)
+    {
+        ValidateMcpCustodyRequest(request);
+        Guid executionGuid = Guid.ParseExact(request.executionId, "D");
+        string witnessDir = Path.Combine(canonicalState, "execution-mcp-witnesses");
+        string witnessPath = Path.Combine(witnessDir, executionGuid.ToString("D").ToLowerInvariant() + ".json");
+        using (var dirPin = new PinnedTarget { grant = new Grant { rights = "read" }, maxFiles = 1 })
+        {
+            ValidatePathComponents(witnessDir, dirPin, false, 1);
+            if (!dirPin.grant.directory) throw new Exception("Managed MCP config staging witness directory is invalid");
+            IntPtr witnessHandle = CreateFile(witnessPath, FileReadData | FileReadAttributes | StandardRightsRead | Synchronize, FileShareRead, IntPtr.Zero, OpenExisting, FileFlagOpenReparsePoint, IntPtr.Zero);
+            if (witnessHandle == InvalidHandle) Check(false, "Open managed MCP config staging witness by handle");
+            try
+            {
+                ByHandleFileInformation witnessInfo;
+                Check(GetFileInformationByHandle(witnessHandle, out witnessInfo), "Inspect managed MCP config staging witness handle");
+                if ((witnessInfo.attributes & (uint)FileAttributes.Directory) != 0 || (witnessInfo.attributes & (uint)FileAttributes.ReparsePoint) != 0)
+                {
+                    throw new Exception("Managed MCP config staging witness is a directory or reparse point");
+                }
+                if (witnessInfo.links != 1) throw new Exception("Managed MCP config staging witness has multiple hard links");
+                ulong witnessSize = ((ulong)witnessInfo.sizeHigh << 32) | witnessInfo.sizeLow;
+                if (witnessSize == 0 || witnessSize > 65536) throw new Exception("Managed MCP config staging witness size is invalid");
+                if (!String.Equals(FinalPathByHandle(witnessHandle), witnessPath, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new Exception("Managed MCP config staging witness handle path mismatch");
+                }
+                byte[] witnessBytes = ReadHandleAllBytes(witnessHandle, 65536, "managed MCP config staging witness");
+                if ((ulong)witnessBytes.Length != witnessSize) throw new Exception("Managed MCP config staging witness byte length mismatch");
+                McpStagingWitness witness = serializer.Deserialize<McpStagingWitness>(Encoding.UTF8.GetString(witnessBytes));
+                if (witness == null || witness.version != 1) throw new Exception("Managed MCP config staging witness is invalid");
+                Guid witnessGuid;
+                if (String.IsNullOrEmpty(witness.executionId) || !Guid.TryParseExact(witness.executionId, "D", out witnessGuid) || !witnessGuid.Equals(executionGuid))
+                {
+                    throw new Exception("Managed MCP config staging witness executionId mismatch");
+                }
+                string fullCwd = CanonicalLocalPath(cwd, "Workspace copy");
+                string expectedAgents = Path.Combine(fullCwd, ".agents");
+                string expectedSource = Path.Combine(expectedAgents, "mcp_config.json");
+                if (String.IsNullOrEmpty(witness.copyDirectory) || String.IsNullOrEmpty(witness.agentsDirectory) || String.IsNullOrEmpty(witness.mcpConfigPath) ||
+                    !String.Equals(CanonicalLocalPath(witness.copyDirectory, "Witness copyDirectory"), fullCwd, StringComparison.OrdinalIgnoreCase) ||
+                    !String.Equals(CanonicalLocalPath(witness.agentsDirectory, "Witness agentsDirectory"), expectedAgents, StringComparison.OrdinalIgnoreCase) ||
+                    !String.Equals(CanonicalLocalPath(witness.mcpConfigPath, "Witness mcpConfigPath"), expectedSource, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new Exception("Managed MCP config staging witness path mismatch");
+                }
+                if (!IsValidUint32(witness.copyVolume) || !IsValidUint32(witness.copyFileIndexHigh) || !IsValidUint32(witness.copyFileIndexLow) ||
+                    !IsValidUint32(witness.agentsVolume) || !IsValidUint32(witness.agentsFileIndexHigh) || !IsValidUint32(witness.agentsFileIndexLow) ||
+                    !IsValidUint32(witness.volume) || !IsValidUint32(witness.fileIndexHigh) || !IsValidUint32(witness.fileIndexLow))
+                {
+                    throw new Exception("Managed MCP config staging witness object identity is incomplete");
+                }
+                if (!witness.bytes.HasValue || witness.bytes.Value != request.bytes || !IsLowerHex(witness.sha256, 64) ||
+                    !String.Equals(witness.sha256, request.sha256, StringComparison.Ordinal))
+                {
+                    throw new Exception("Managed MCP config staging witness digest or size mismatch");
+                }
+                return witness;
+            }
+            finally { CloseHandle(witnessHandle); }
+        }
+    }
+
+    static void PinAndVerifyDirectoryNoReparse(string directoryPath, uint expectedVolume, uint expectedIndexHigh, uint expectedIndexLow, string description, out PinnedTarget pin)
+    {
+        pin = new PinnedTarget { grant = new Grant { rights = "read" }, maxFiles = 1 };
+        try
+        {
+            ValidatePathComponents(directoryPath, pin, false, 1);
+            if (!pin.grant.directory || (GetFileAttributes(pin.grant.path) & (uint)FileAttributes.ReparsePoint) != 0 ||
+                pin.grant.volume != expectedVolume || pin.grant.fileIndexHigh != expectedIndexHigh || pin.grant.fileIndexLow != expectedIndexLow)
+            {
+                throw new Exception(description + " identity or type does not match staging witness");
+            }
+        }
+        catch { pin.Dispose(); pin = null; throw; }
+    }
+
+    static IntPtr OpenCustodyPinnedDirectoryHandle(string directoryPath, uint expectedVolume, uint expectedIndexHigh, uint expectedIndexLow, string description)
+    {
+        IntPtr handle = CreateFile(directoryPath, FileListDirectory, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+        if (handle == InvalidHandle) Check(false, "Pin " + description + " directory handle");
+        try
+        {
+            ByHandleFileInformation info;
+            Check(GetFileInformationByHandle(handle, out info), "Inspect " + description + " directory handle");
+            if ((info.attributes & (uint)FileAttributes.Directory) == 0 || (info.attributes & (uint)FileAttributes.ReparsePoint) != 0)
+            {
+                throw new Exception(description + " handle is not a non-reparse directory");
+            }
+            if (info.volume != expectedVolume || info.indexHigh != expectedIndexHigh || info.indexLow != expectedIndexLow)
+            {
+                throw new Exception(description + " handle identity does not match staging witness");
+            }
+            if (!String.Equals(FinalPathByHandle(handle), directoryPath, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception(description + " handle canonical path mismatch");
+            }
+            return handle;
+        }
+        catch
+        {
+            CloseHandle(handle);
+            throw;
+        }
+    }
+
+    static string EnsureProtectedStateSubdirectory(string canonicalState, string directoryName, SecurityIdentifier controllerUser, string description)
+    {
+        using (var statePin = new PinnedTarget { grant = new Grant { rights = "read" }, maxFiles = 1 })
+        {
+            ValidatePathComponents(canonicalState, statePin, false, 1);
+            if (!statePin.grant.directory) throw new Exception("State directory is not a directory");
+            string protectedDir = Path.Combine(canonicalState, directoryName);
+            CreateDirectoryWithProtectedDacl(protectedDir, controllerUser, true);
+            using (var dirPin = new PinnedTarget { grant = new Grant { rights = "read" }, maxFiles = 1 })
+            {
+                ValidatePathComponents(protectedDir, dirPin, false, 1);
+                if (!dirPin.grant.directory || (GetFileAttributes(protectedDir) & (uint)FileAttributes.ReparsePoint) != 0)
+                {
+                    throw new Exception(description + " is unavailable or linked");
+                }
+            }
+            IntPtr dirHandle = CreateFile(protectedDir, StandardRightsRead | StandardRightsWriteDac, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+            if (dirHandle == InvalidHandle) Check(false, "Open " + description);
+            try
+            {
+                ByHandleFileInformation info;
+                Check(GetFileInformationByHandle(dirHandle, out info), "Inspect " + description);
+                if ((info.attributes & (uint)FileAttributes.Directory) == 0 || (info.attributes & (uint)FileAttributes.ReparsePoint) != 0)
+                {
+                    throw new Exception(description + " is invalid or linked");
+                }
+                if (!String.Equals(FinalPathByHandle(dirHandle), protectedDir, StringComparison.OrdinalIgnoreCase))
+                {
+                    throw new Exception(description + " canonical path mismatch");
+                }
+                RawSecurityDescriptor current = ReadKernelDacl(dirHandle);
+                if (!IsProtectedControllerDacl(current, controllerUser, true))
+                {
+                    EnforceProtectedControllerDaclByHandle(dirHandle, controllerUser, true);
+                }
+            }
+            finally { CloseHandle(dirHandle); }
+            return protectedDir;
+        }
+    }
+
+    static string EnsureProtectedCustodyRoot(string canonicalState, SecurityIdentifier controllerUser)
+    {
+        return EnsureProtectedStateSubdirectory(canonicalState, "windows-lpac-custody", controllerUser, "Protected custody root");
+    }
+
+    static string EnsureProtectedQuarantineRoot(string canonicalState, SecurityIdentifier controllerUser)
+    {
+        return EnsureProtectedStateSubdirectory(canonicalState, "windows-lpac-custody-quarantine", controllerUser, "Protected custody quarantine root");
+    }
+
+    static McpCustodyHold AcquireMcpConfigCustody(
+        McpCustodyRequest request,
+        string cwd,
+        string canonicalState,
+        Guid leaseNonce,
+        ControllerIdentity controller,
+        Lease lease,
+        string leaseFile,
+        ref bool leaseWritten,
+        JavaScriptSerializer serializer)
+    {
+        McpStagingWitness witness = ReadValidatedMcpWitness(request, cwd, canonicalState, serializer);
+        string fullCwd = CanonicalLocalPath(cwd, "Workspace copy");
+        string agentsPath = Path.Combine(fullCwd, ".agents");
+        string sourcePath = Path.Combine(agentsPath, "mcp_config.json");
+        PinnedTarget copyPin = null, agentsPin = null;
+        IntPtr fileHandle = IntPtr.Zero, slotDirHandle = IntPtr.Zero, copyDirHandle = IntPtr.Zero, agentsDirHandle = IntPtr.Zero;
+        string slotDir = null;
+        bool slotCreated = false;
+        try
+        {
+            PinAndVerifyDirectoryNoReparse(fullCwd, (uint)witness.copyVolume.Value, (uint)witness.copyFileIndexHigh.Value, (uint)witness.copyFileIndexLow.Value, "Workspace copy parent", out copyPin);
+            copyDirHandle = OpenCustodyPinnedDirectoryHandle(fullCwd, (uint)witness.copyVolume.Value, (uint)witness.copyFileIndexHigh.Value, (uint)witness.copyFileIndexLow.Value, "Workspace copy parent");
+            PinAndVerifyDirectoryNoReparse(agentsPath, (uint)witness.agentsVolume.Value, (uint)witness.agentsFileIndexHigh.Value, (uint)witness.agentsFileIndexLow.Value, "Managed .agents parent", out agentsPin);
+            agentsDirHandle = OpenCustodyPinnedDirectoryHandle(agentsPath, (uint)witness.agentsVolume.Value, (uint)witness.agentsFileIndexHigh.Value, (uint)witness.agentsFileIndexLow.Value, "Managed .agents parent");
+
+            fileHandle = CreateFile(sourcePath, RequiredCustodyFileAccess, 0, IntPtr.Zero, OpenExisting, FileFlagOpenReparsePoint, IntPtr.Zero);
+            if (fileHandle == InvalidHandle) Check(false, "Open managed MCP config exclusively by handle");
+
+            ByHandleFileInformation info;
+            Check(GetFileInformationByHandle(fileHandle, out info), "Inspect managed MCP config handle");
+            if ((info.attributes & (uint)FileAttributes.Directory) != 0 || (info.attributes & (uint)FileAttributes.ReparsePoint) != 0)
+            {
+                throw new Exception("Managed MCP config is a directory or reparse point");
+            }
+            if (info.links != 1) throw new Exception("Managed MCP config has multiple hard links");
+            if (info.volume != (uint)witness.volume.Value || info.indexHigh != (uint)witness.fileIndexHigh.Value || info.indexLow != (uint)witness.fileIndexLow.Value)
+            {
+                throw new Exception("Managed MCP config object identity does not match staging witness");
+            }
+            ulong actualSize = ((ulong)info.sizeHigh << 32) | info.sizeLow;
+            if (actualSize != (ulong)witness.bytes.Value) throw new Exception("Managed MCP config size does not match staging witness");
+            if (!String.Equals(FinalPathByHandle(fileHandle), sourcePath, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Managed MCP config handle path does not match pinned .agents path");
+            }
+            string actualSha256 = HashHandleContents(fileHandle, witness.bytes.Value);
+            if (!String.Equals(actualSha256, witness.sha256, StringComparison.Ordinal))
+            {
+                throw new Exception("Managed MCP config content hash does not match staging witness");
+            }
+            ByHandleFileInformation recheck;
+            Check(GetFileInformationByHandle(fileHandle, out recheck), "Re-verify managed MCP config handle");
+            if (recheck.links != 1 || recheck.volume != info.volume || recheck.indexHigh != info.indexHigh || recheck.indexLow != info.indexLow ||
+                (((ulong)recheck.sizeHigh << 32) | recheck.sizeLow) != actualSize)
+            {
+                throw new Exception("Managed MCP config changed during verification");
+            }
+
+            // Capture complete original DACL (including flags) by handle and validate monotonic tightening BEFORE any mutation.
+            byte[] originalDaclBytes = ReadKernelDaclBytes(fileHandle);
+            var originalDacl = new RawSecurityDescriptor(originalDaclBytes, 0);
+            ValidateRepresentableDacl(originalDacl, "original");
+            byte[] canonicalOriginalBytes = SerializeDaclBytes(originalDacl);
+            RawSecurityDescriptor tightenedDacl = BuildMonotonicCustodyDacl(originalDacl, controller.user);
+            byte[] canonicalTightenedBytes = SerializeDaclBytes(tightenedDacl);
+
+            string custodyRoot = EnsureProtectedCustodyRoot(canonicalState, controller.user);
+            slotDir = Path.Combine(custodyRoot, leaseNonce.ToString("N"));
+            CreateDirectoryWithProtectedDacl(slotDir, controller.user, false);
+            slotCreated = true;
+
+            slotDirHandle = CreateFile(slotDir, StandardRightsRead | StandardRightsWriteDac, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+            if (slotDirHandle == InvalidHandle) Check(false, "Pin exclusive custody slot directory");
+            ByHandleFileInformation slotInfo;
+            Check(GetFileInformationByHandle(slotDirHandle, out slotInfo), "Inspect exclusive custody slot directory");
+            if ((slotInfo.attributes & (uint)FileAttributes.Directory) == 0 || (slotInfo.attributes & (uint)FileAttributes.ReparsePoint) != 0)
+            {
+                throw new Exception("Exclusive custody slot directory is invalid or linked");
+            }
+            if (!String.Equals(FinalPathByHandle(slotDirHandle), slotDir, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Exclusive custody slot directory canonical path mismatch");
+            }
+            if (!IsProtectedControllerDacl(ReadKernelDacl(slotDirHandle), controller.user, true))
+            {
+                EnforceProtectedControllerDaclByHandle(slotDirHandle, controller.user, true);
+            }
+            if (info.volume != slotInfo.volume)
+            {
+                throw new Exception("Managed MCP config and protected custody directory are on different volumes");
+            }
+
+            string custodyPath = Path.Combine(slotDir, "mcp_config.json");
+            if (GetFileAttributes(custodyPath) != InvalidFileAttributes || Marshal.GetLastWin32Error() != 2)
+            {
+                throw new Exception("Exclusive custody destination already exists or is inaccessible");
+            }
+
+            var custodyLease = new McpCustodyLease
+            {
+                version = 1,
+                executionId = witness.executionId.ToLowerInvariant(),
+                sourcePath = sourcePath,
+                agentsPath = agentsPath,
+                custodyDirectory = slotDir,
+                custodyPath = custodyPath,
+                copyVolume = (uint)witness.copyVolume.Value,
+                copyFileIndexHigh = (uint)witness.copyFileIndexHigh.Value,
+                copyFileIndexLow = (uint)witness.copyFileIndexLow.Value,
+                agentsVolume = (uint)witness.agentsVolume.Value,
+                agentsFileIndexHigh = (uint)witness.agentsFileIndexHigh.Value,
+                agentsFileIndexLow = (uint)witness.agentsFileIndexLow.Value,
+                custodyDirVolume = slotInfo.volume,
+                custodyDirFileIndexHigh = slotInfo.indexHigh,
+                custodyDirFileIndexLow = slotInfo.indexLow,
+                volume = info.volume,
+                fileIndexHigh = info.indexHigh,
+                fileIndexLow = info.indexLow,
+                bytes = witness.bytes.Value,
+                sha256 = witness.sha256,
+                originalDaclBase64 = Convert.ToBase64String(canonicalOriginalBytes),
+                originalDaclSha256 = ComputeSha256Hex(canonicalOriginalBytes),
+                custodyDaclBase64 = Convert.ToBase64String(canonicalTightenedBytes),
+                custodyDaclSha256 = ComputeSha256Hex(canonicalTightenedBytes),
+            };
+
+            lease.mcpCustody = custodyLease;
+            WriteLease(leaseFile, lease, !leaseWritten, serializer);
+            leaseWritten = true;
+
+            // Rename without replace FIRST (into protected custody slot), then monotonically tighten DACL by handle.
+            RenameHandleNoReplace(fileHandle, custodyPath);
+            if (!String.Equals(FinalPathByHandle(fileHandle), custodyPath, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Managed MCP config did not land at pinned custody destination");
+            }
+            if (GetFileAttributes(sourcePath) != InvalidFileAttributes || Marshal.GetLastWin32Error() != 2)
+            {
+                throw new Exception("Managed MCP config still appears at source path after custody move");
+            }
+
+            if (!SameDacl(tightenedDacl, ReadKernelDacl(fileHandle)))
+            {
+                WriteKernelDaclExact(fileHandle, tightenedDacl);
+            }
+            ValidateMonotonicCustodyDacl(originalDacl, ReadKernelDacl(fileHandle), controller.user);
+
+            var hold = new McpCustodyHold
+            {
+                lease = custodyLease,
+                fileHandle = fileHandle,
+                slotDirHandle = slotDirHandle,
+                copyDirHandle = copyDirHandle,
+                agentsDirHandle = agentsDirHandle,
+                copyPin = copyPin,
+                agentsPin = agentsPin,
+            };
+            fileHandle = IntPtr.Zero;
+            slotDirHandle = IntPtr.Zero;
+            copyDirHandle = IntPtr.Zero;
+            agentsDirHandle = IntPtr.Zero;
+            copyPin = null;
+            agentsPin = null;
+            slotCreated = false;
+            return hold;
+        }
+        catch
+        {
+            if (!leaseWritten && lease != null) lease.mcpCustody = null;
+            if (fileHandle != IntPtr.Zero && fileHandle != InvalidHandle) CloseHandle(fileHandle);
+            if (slotDirHandle != IntPtr.Zero && slotDirHandle != InvalidHandle) CloseHandle(slotDirHandle);
+            if (agentsDirHandle != IntPtr.Zero && agentsDirHandle != InvalidHandle) CloseHandle(agentsDirHandle);
+            if (copyDirHandle != IntPtr.Zero && copyDirHandle != InvalidHandle) CloseHandle(copyDirHandle);
+            if (slotCreated && !leaseWritten && slotDir != null)
+            {
+                try { Directory.Delete(slotDir, false); } catch { }
+            }
+            throw;
+        }
+        finally
+        {
+            if (agentsPin != null) agentsPin.Dispose();
+            if (copyPin != null) copyPin.Dispose();
+        }
+    }
+
+    static void DeleteVerifiedEmptyCustodySlot(McpCustodyLease custody, IntPtr existingSlotHandle)
+    {
+        IntPtr slotHandle = existingSlotHandle;
+        try
+        {
+            if (slotHandle == IntPtr.Zero || slotHandle == InvalidHandle)
+            {
+                uint attrs = GetFileAttributes(custody.custodyDirectory);
+                if (attrs == InvalidFileAttributes)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    if (err == 2 || err == 3) return;
+                    throw new Win32Exception(err, "Inspect custody slot directory");
+                }
+                if ((attrs & (uint)FileAttributes.Directory) == 0 || (attrs & (uint)FileAttributes.ReparsePoint) != 0)
+                {
+                    throw new Exception("Custody slot directory is invalid or linked");
+                }
+                slotHandle = CreateFile(custody.custodyDirectory, 0, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+                if (slotHandle == InvalidHandle) Check(false, "Open custody slot directory for cleanup");
+            }
+            ByHandleFileInformation slotInfo;
+            Check(GetFileInformationByHandle(slotHandle, out slotInfo), "Verify custody slot directory identity");
+            if ((slotInfo.attributes & (uint)FileAttributes.Directory) == 0 || (slotInfo.attributes & (uint)FileAttributes.ReparsePoint) != 0 ||
+                slotInfo.volume != custody.custodyDirVolume || slotInfo.indexHigh != custody.custodyDirFileIndexHigh || slotInfo.indexLow != custody.custodyDirFileIndexLow ||
+                !String.Equals(FinalPathByHandle(slotHandle), custody.custodyDirectory, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Custody slot directory identity changed before removal");
+            }
+            CloseHandle(slotHandle);
+            slotHandle = IntPtr.Zero;
+            Directory.Delete(custody.custodyDirectory, false);
+        }
+        finally
+        {
+            if (slotHandle != IntPtr.Zero && slotHandle != InvalidHandle) CloseHandle(slotHandle);
+        }
+    }
+
+    static void VerifyHandleMatchesCustody(IntPtr handle, McpCustodyLease custody, string expectedPath)
+    {
+        ByHandleFileInformation info;
+        Check(GetFileInformationByHandle(handle, out info), "Inspect managed MCP config handle");
+        if ((info.attributes & (uint)FileAttributes.Directory) != 0 || (info.attributes & (uint)FileAttributes.ReparsePoint) != 0)
+        {
+            throw new Exception("Managed MCP config handle is a directory or reparse point");
+        }
+        if (info.links != 1) throw new Exception("Managed MCP config handle has multiple hard links");
+        if (info.volume != custody.volume || info.indexHigh != custody.fileIndexHigh || info.indexLow != custody.fileIndexLow)
+        {
+            throw new Exception("Managed MCP config identity changed in custody");
+        }
+        ulong actualSize = ((ulong)info.sizeHigh << 32) | info.sizeLow;
+        if (actualSize != (ulong)custody.bytes) throw new Exception("Managed MCP config size changed in custody");
+        if (!String.Equals(FinalPathByHandle(handle), expectedPath, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new Exception("Managed MCP config handle path mismatch");
+        }
+        string actualSha = HashHandleContents(handle, custody.bytes);
+        if (!String.Equals(actualSha, custody.sha256, StringComparison.Ordinal))
+        {
+            throw new Exception("Managed MCP config content hash changed in custody");
+        }
+    }
+
+    enum McpCustodyOutcome
+    {
+        Restored,
+        Quarantined,
+    }
+
+    static bool TryInspectDirectoryForRestore(string directoryPath, uint expectedVolume, uint expectedIndexHigh, uint expectedIndexLow, string missingReason, string changedReason, out string conflictReason)
+    {
+        string canonical = CanonicalLocalPath(directoryPath, "Restore parent directory");
+        IntPtr handle = CreateFile(canonical, 0, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+        if (handle == InvalidHandle)
+        {
+            int err = Marshal.GetLastWin32Error();
+            if (err == 2)
+            {
+                conflictReason = missingReason;
+                return false;
+            }
+            throw new Win32Exception(err, "Inspect restore parent directory (Win32 " + err + ")");
+        }
+        try
+        {
+            ByHandleFileInformation info;
+            Check(GetFileInformationByHandle(handle, out info), "Read restore parent directory identity");
+            if ((info.attributes & (uint)FileAttributes.Directory) == 0 ||
+                (info.attributes & (uint)FileAttributes.ReparsePoint) != 0 ||
+                info.volume != expectedVolume ||
+                info.indexHigh != expectedIndexHigh ||
+                info.indexLow != expectedIndexLow ||
+                !String.Equals(FinalPathByHandle(handle), canonical, StringComparison.OrdinalIgnoreCase))
+            {
+                conflictReason = changedReason;
+                return false;
+            }
+            conflictReason = null;
+            return true;
+        }
+        finally { CloseHandle(handle); }
+    }
+
+    static bool IsOwnedCopyPositivelyMissing(Lease lease, string canonicalState)
+    {
+        if (lease == null || String.IsNullOrEmpty(lease.cwd)) return false;
+        string fullCopy, rootKey, metadataPath;
+        if (!IsEarlierLease(lease) && TryGetCanonicalWorkspaceRootKey(lease.cwd, canonicalState, out fullCopy, out rootKey, out metadataPath))
+        {
+            try
+            {
+                using (var statePin = new PinnedTarget { grant = new Grant { rights = "read" }, maxFiles = 1 })
+                {
+                    ValidatePathComponents(canonicalState, statePin, false, 1);
+                    if (!statePin.grant.directory) return false;
+                }
+            }
+            catch { return false; }
+
+            string workspacesDir = Path.Combine(canonicalState, "workspaces");
+            uint workspacesAttrs = GetFileAttributes(workspacesDir);
+            if (workspacesAttrs == InvalidFileAttributes)
+            {
+                return Marshal.GetLastWin32Error() == 2;
+            }
+            if ((workspacesAttrs & (uint)FileAttributes.ReparsePoint) != 0 || (workspacesAttrs & (uint)FileAttributes.Directory) == 0)
+            {
+                return false;
+            }
+            string workspaceDir = Path.Combine(workspacesDir, rootKey);
+            uint workspaceAttrs = GetFileAttributes(workspaceDir);
+            if (workspaceAttrs == InvalidFileAttributes)
+            {
+                return Marshal.GetLastWin32Error() == 2;
+            }
+            if ((workspaceAttrs & (uint)FileAttributes.ReparsePoint) != 0 || (workspaceAttrs & (uint)FileAttributes.Directory) == 0)
+            {
+                return false;
+            }
+            uint copyAttrs = GetFileAttributes(fullCopy);
+            if (copyAttrs == InvalidFileAttributes)
+            {
+                return Marshal.GetLastWin32Error() == 2;
+            }
+            return false;
+        }
+        try
+        {
+            string ownedTemp = OwnedTemporaryPath(lease.cwd, LeasePrefix(lease, "copy"));
+            string tempRoot = Path.GetFullPath(Path.GetTempPath()).TrimEnd(Path.DirectorySeparatorChar);
+            using (var tempPin = new PinnedTarget { grant = new Grant { rights = "read" }, maxFiles = 1 })
+            {
+                ValidatePathComponents(tempRoot, tempPin, false, 1);
+                if (!tempPin.grant.directory) return false;
+            }
+            uint attrs = GetFileAttributes(ownedTemp);
+            if (attrs == InvalidFileAttributes)
+            {
+                return Marshal.GetLastWin32Error() == 2;
+            }
+            return false;
+        }
+        catch { return false; }
+    }
+
+    static bool IsWorkspaceMetadataPositivelyMissing(Lease lease, string canonicalState)
+    {
+        string fullCopy, rootKey, metadataPath;
+        if (!TryGetCanonicalWorkspaceRootKey(lease.cwd, canonicalState, out fullCopy, out rootKey, out metadataPath)) return false;
+        uint attrs = GetFileAttributes(metadataPath);
+        if (attrs != InvalidFileAttributes) return false;
+        int err = Marshal.GetLastWin32Error();
+        return err == 2 || err == 3;
+    }
+
+    static void ValidateCommittedLeaseMetadataFile(Lease lease, string stateDirectory, string canonicalState, JavaScriptSerializer serializer)
+    {
+        Guid capNonce;
+        if (lease == null || String.IsNullOrEmpty(lease.capabilityNonce) || !Guid.TryParseExact(lease.capabilityNonce, "D", out capNonce) ||
+            lease.grants == null || lease.grants.Length != 1 || lease.grants[0] == null || !IsLowerHex(lease.nativeDaclSha256, 64))
+        {
+            throw new Exception("Committed workspace initialization lease is incomplete");
+        }
+        string fullCopy, rootKey, metadataPath;
+        if (!TryGetCanonicalWorkspaceRootKey(lease.cwd, stateDirectory, out fullCopy, out rootKey, out metadataPath))
+        {
+            throw new Exception("Committed workspace initialization lease target is not canonical");
+        }
+        if (IsWorkspaceMetadataPositivelyMissing(lease, canonicalState))
+        {
+            if (IsOwnedCopyPositivelyMissing(lease, canonicalState)) return;
+            throw new Exception("Committed workspace metadata is missing while canonical copy still exists");
+        }
+        uint metaAttrs = GetFileAttributes(metadataPath);
+        if (metaAttrs == InvalidFileAttributes || (metaAttrs & (uint)FileAttributes.ReparsePoint) != 0 || (metaAttrs & (uint)FileAttributes.Directory) != 0)
+        {
+            throw new Exception("Committed canonical workspace metadata is unavailable or linked");
+        }
+        var metaInfo = new FileInfo(metadataPath);
+        if (metaInfo.Length <= 0 || metaInfo.Length > 1024 * 1024)
+        {
+            throw new Exception("Committed canonical workspace metadata size is invalid");
+        }
+        WorkspaceMeta meta = serializer.Deserialize<WorkspaceMeta>(File.ReadAllText(metadataPath, Encoding.UTF8));
+        if (meta == null || meta.version != 1 || String.IsNullOrEmpty(meta.sourceDirectory) ||
+            !String.Equals(meta.rootKey, rootKey, StringComparison.Ordinal) ||
+            !String.Equals(ComputeWorkspaceRootKey(meta.sourceDirectory), rootKey, StringComparison.Ordinal))
+        {
+            throw new Exception("Committed canonical workspace metadata identity mismatch");
+        }
+        WorkspaceLpacMeta lpac = meta.windowsLpac;
+        if (lpac == null || lpac.version != 1 || String.IsNullOrEmpty(lpac.capabilityNonce) ||
+            !String.Equals(lpac.capabilityNonce, lease.capabilityNonce, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(lpac.readCapabilitySid, lease.readCapabilitySid, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(lpac.modifyCapabilitySid, lease.modifyCapabilitySid, StringComparison.OrdinalIgnoreCase) ||
+            !IsValidUint32(lpac.volume) || !IsValidUint32(lpac.fileIndexHigh) || !IsValidUint32(lpac.fileIndexLow) ||
+            (uint)lpac.volume.Value != lease.grants[0].volume ||
+            (uint)lpac.fileIndexHigh.Value != lease.grants[0].fileIndexHigh ||
+            (uint)lpac.fileIndexLow.Value != lease.grants[0].fileIndexLow ||
+            !String.Equals(lpac.nativeDaclSha256, lease.nativeDaclSha256, StringComparison.Ordinal))
+        {
+            throw new Exception("Committed canonical workspace metadata does not match initialization lease");
+        }
+    }
+
+    static void WriteQuarantineEvidenceFile(string evidenceFile, Lease lease, McpCustodyLease custody, string quarantineFile, string reason, JavaScriptSerializer serializer)
+    {
+        var evidence = new Dictionary<string, object>();
+        evidence["version"] = 1;
+        evidence["reason"] = reason;
+        evidence["quarantinedAt"] = DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture);
+        evidence["leaseVersion"] = lease.version;
+        evidence["leaseNonce"] = lease.nonce;
+        evidence["leasePhase"] = lease.phase;
+        evidence["executionId"] = custody.executionId;
+        evidence["originalCopyPath"] = lease.cwd;
+        evidence["originalSourcePath"] = custody.sourcePath;
+        evidence["quarantinedPath"] = quarantineFile;
+        evidence["volume"] = custody.volume;
+        evidence["fileIndexHigh"] = custody.fileIndexHigh;
+        evidence["fileIndexLow"] = custody.fileIndexLow;
+        evidence["bytes"] = custody.bytes;
+        evidence["sha256"] = custody.sha256;
+        evidence["originalDaclBase64"] = custody.originalDaclBase64;
+        evidence["originalDaclSha256"] = custody.originalDaclSha256;
+        evidence["custodyDaclSha256"] = custody.custodyDaclSha256;
+        byte[] evidenceBytes = new UTF8Encoding(false).GetBytes(serializer.Serialize(evidence));
+        using (var stream = new FileStream(evidenceFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
+        {
+            stream.Write(evidenceBytes, 0, evidenceBytes.Length);
+            stream.Flush(true);
+        }
+    }
+
+    static void QuarantineVerifiedMcpCustody(Lease lease, string canonicalState, SecurityIdentifier controllerUser, McpCustodyHold hold, string reason, JavaScriptSerializer serializer)
+    {
+        McpCustodyLease custody = lease.mcpCustody;
+        if (custody == null) return;
+        RawSecurityDescriptor originalDacl = ParseValidatedLeaseDacl(custody.originalDaclBase64, custody.originalDaclSha256, "original");
+        RawSecurityDescriptor custodyDacl = ParseValidatedLeaseDacl(custody.custodyDaclBase64, custody.custodyDaclSha256, "custody");
+        ValidateMonotonicCustodyDacl(originalDacl, custodyDacl, controllerUser);
+
+        Guid leaseNonce = Guid.ParseExact(lease.nonce, "D");
+        string quarantineRoot = EnsureProtectedQuarantineRoot(canonicalState, controllerUser);
+        string quarantineSlot = Path.Combine(quarantineRoot, leaseNonce.ToString("N"));
+        string quarantineFile = Path.Combine(quarantineSlot, "mcp_config.json");
+        string evidenceFile = Path.Combine(quarantineSlot, "evidence.json");
+
+        PinnedTarget slotPin = null;
+        IntPtr fileHandle = hold != null ? hold.fileHandle : IntPtr.Zero;
+        IntPtr quarantineSlotHandle = IntPtr.Zero;
+        bool openedFileHere = false;
+        bool quarantineSlotCreated = false;
+        try
+        {
+            PinAndVerifyDirectoryNoReparse(custody.custodyDirectory, custody.custodyDirVolume, custody.custodyDirFileIndexHigh, custody.custodyDirFileIndexLow, "Custody slot directory", out slotPin);
+            if (fileHandle == IntPtr.Zero || fileHandle == InvalidHandle)
+            {
+                fileHandle = CreateFile(custody.custodyPath, RequiredCustodyFileAccess, 0, IntPtr.Zero, OpenExisting, FileFlagOpenReparsePoint, IntPtr.Zero);
+                if (fileHandle == InvalidHandle) Check(false, "Open held managed MCP config exclusively for quarantine");
+                openedFileHere = true;
+            }
+
+            VerifyHandleMatchesCustody(fileHandle, custody, custody.custodyPath);
+            RawSecurityDescriptor heldDacl = ReadKernelDacl(fileHandle);
+            if (SameDacl(originalDacl, heldDacl) && !SameDacl(custodyDacl, heldDacl))
+            {
+                WriteKernelDaclExact(fileHandle, custodyDacl);
+            }
+            else if (!SameDacl(custodyDacl, heldDacl))
+            {
+                throw new Exception("Held managed MCP config DACL does not match recorded custody DACL");
+            }
+            ValidateMonotonicCustodyDacl(originalDacl, ReadKernelDacl(fileHandle), controllerUser);
+
+            CreateDirectoryWithProtectedDacl(quarantineSlot, controllerUser, false);
+            quarantineSlotCreated = true;
+            quarantineSlotHandle = CreateFile(quarantineSlot, StandardRightsRead | StandardRightsWriteDac, FileShareRead | FileShareWrite, IntPtr.Zero, OpenExisting, FileFlagBackupSemantics | FileFlagOpenReparsePoint, IntPtr.Zero);
+            if (quarantineSlotHandle == InvalidHandle) Check(false, "Pin exclusive quarantine slot directory");
+            ByHandleFileInformation qInfo;
+            Check(GetFileInformationByHandle(quarantineSlotHandle, out qInfo), "Inspect exclusive quarantine slot directory");
+            if ((qInfo.attributes & (uint)FileAttributes.Directory) == 0 || (qInfo.attributes & (uint)FileAttributes.ReparsePoint) != 0)
+            {
+                throw new Exception("Exclusive quarantine slot directory is invalid or linked");
+            }
+            if (!String.Equals(FinalPathByHandle(quarantineSlotHandle), quarantineSlot, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Exclusive quarantine slot directory canonical path mismatch");
+            }
+            if (!IsProtectedControllerDacl(ReadKernelDacl(quarantineSlotHandle), controllerUser, true))
+            {
+                EnforceProtectedControllerDaclByHandle(quarantineSlotHandle, controllerUser, true);
+            }
+            if (qInfo.volume != custody.volume)
+            {
+                throw new Exception("Managed MCP config custody file and quarantine directory are on different volumes");
+            }
+            if (GetFileAttributes(quarantineFile) != InvalidFileAttributes || Marshal.GetLastWin32Error() != 2)
+            {
+                throw new Exception("Quarantine destination already exists or is inaccessible");
+            }
+
+            RenameHandleNoReplace(fileHandle, quarantineFile);
+            if (!String.Equals(FinalPathByHandle(fileHandle), quarantineFile, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Quarantined managed MCP config did not land at expected destination");
+            }
+            quarantineSlotCreated = false;
+            WriteQuarantineEvidenceFile(evidenceFile, lease, custody, quarantineFile, reason, serializer);
+
+            if (openedFileHere)
+            {
+                CloseHandle(fileHandle);
+                fileHandle = IntPtr.Zero;
+                openedFileHere = false;
+            }
+            else if (hold != null)
+            {
+                CloseHandle(hold.fileHandle);
+                hold.fileHandle = IntPtr.Zero;
+                fileHandle = IntPtr.Zero;
+            }
+            CloseHandle(quarantineSlotHandle);
+            quarantineSlotHandle = IntPtr.Zero;
+            if (slotPin != null) { slotPin.Dispose(); slotPin = null; }
+            if (hold != null)
+            {
+                IntPtr ownedSlot = hold.slotDirHandle;
+                hold.slotDirHandle = IntPtr.Zero;
+                DeleteVerifiedEmptyCustodySlot(custody, ownedSlot);
+            }
+            else
+            {
+                DeleteVerifiedEmptyCustodySlot(custody, IntPtr.Zero);
+            }
+        }
+        finally
+        {
+            if (openedFileHere && fileHandle != IntPtr.Zero && fileHandle != InvalidHandle) CloseHandle(fileHandle);
+            if (quarantineSlotHandle != IntPtr.Zero && quarantineSlotHandle != InvalidHandle) CloseHandle(quarantineSlotHandle);
+            if (quarantineSlotCreated) { try { Directory.Delete(quarantineSlot, false); } catch { } }
+            if (slotPin != null) slotPin.Dispose();
+            if (hold != null) hold.Dispose();
+        }
+    }
+
+    static McpCustodyOutcome RestoreOrQuarantineMcpConfigCustody(Lease lease, string canonicalState, SecurityIdentifier controllerUser, McpCustodyHold hold, JavaScriptSerializer serializer, out string quarantineReason)
+    {
+        quarantineReason = null;
+        if (lease == null || lease.mcpCustody == null) return McpCustodyOutcome.Restored;
+        McpCustodyLease custody = lease.mcpCustody;
+        RawSecurityDescriptor originalDacl = ParseValidatedLeaseDacl(custody.originalDaclBase64, custody.originalDaclSha256, "original");
+        RawSecurityDescriptor custodyDacl = ParseValidatedLeaseDacl(custody.custodyDaclBase64, custody.custodyDaclSha256, "custody");
+        ValidateMonotonicCustodyDacl(originalDacl, custodyDacl, controllerUser);
+
+        string fullCwd = CanonicalLocalPath(lease.cwd, "Workspace copy");
+        Guid leaseNonce = Guid.ParseExact(lease.nonce, "D");
+        PinnedTarget localCopyPin = null, localAgentsPin = null, slotPin = null;
+        IntPtr localCopyDirHandle = IntPtr.Zero, localAgentsDirHandle = IntPtr.Zero;
+        IntPtr fileHandle = hold != null ? hold.fileHandle : IntPtr.Zero;
+        bool openedFileHere = false;
+        try
+        {
+            // Crash reconciliation when the held file is no longer at custodyPath (already quarantined or never moved / already restored).
+            if (fileHandle == IntPtr.Zero || fileHandle == InvalidHandle)
+            {
+                uint custodyAttrs = GetFileAttributes(custody.custodyPath);
+                if (custodyAttrs == InvalidFileAttributes)
+                {
+                    int err = Marshal.GetLastWin32Error();
+                    if (err == 2 || err == 3)
+                    {
+                        string quarantineSlot = Path.Combine(Path.Combine(canonicalState, "windows-lpac-custody-quarantine"), leaseNonce.ToString("N"));
+                        string quarantineFile = Path.Combine(quarantineSlot, "mcp_config.json");
+                        string evidenceFile = Path.Combine(quarantineSlot, "evidence.json");
+                        if (GetFileAttributes(quarantineFile) != InvalidFileAttributes)
+                        {
+                            IntPtr existingQuarantine = CreateFile(quarantineFile, RequiredCustodyFileAccess, 0, IntPtr.Zero, OpenExisting, FileFlagOpenReparsePoint, IntPtr.Zero);
+                            if (existingQuarantine == InvalidHandle) Check(false, "Open previously quarantined managed MCP config");
+                            try
+                            {
+                                VerifyHandleMatchesCustody(existingQuarantine, custody, quarantineFile);
+                                if (!SameDacl(custodyDacl, ReadKernelDacl(existingQuarantine)))
+                                {
+                                    throw new Exception("Quarantined managed MCP config DACL mismatch");
+                                }
+                            }
+                            finally { CloseHandle(existingQuarantine); }
+                            uint evidenceAttrs = GetFileAttributes(evidenceFile);
+                            if (evidenceAttrs == InvalidFileAttributes)
+                            {
+                                if (Marshal.GetLastWin32Error() != 2) throw new Exception("Quarantined managed MCP config evidence manifest is inaccessible");
+                                WriteQuarantineEvidenceFile(evidenceFile, lease, custody, quarantineFile, "previously-quarantined", serializer);
+                            }
+                            else if ((evidenceAttrs & (uint)FileAttributes.ReparsePoint) != 0 || (evidenceAttrs & (uint)FileAttributes.Directory) != 0)
+                            {
+                                throw new Exception("Quarantined managed MCP config evidence manifest is invalid or linked");
+                            }
+                            DeleteVerifiedEmptyCustodySlot(custody, IntPtr.Zero);
+                            quarantineReason = "previously-quarantined";
+                            return McpCustodyOutcome.Quarantined;
+                        }
+
+                        PinAndVerifyDirectoryNoReparse(fullCwd, custody.copyVolume, custody.copyFileIndexHigh, custody.copyFileIndexLow, "Workspace copy parent", out localCopyPin);
+                        localCopyDirHandle = OpenCustodyPinnedDirectoryHandle(fullCwd, custody.copyVolume, custody.copyFileIndexHigh, custody.copyFileIndexLow, "Workspace copy parent");
+                        PinAndVerifyDirectoryNoReparse(custody.agentsPath, custody.agentsVolume, custody.agentsFileIndexHigh, custody.agentsFileIndexLow, "Managed .agents parent", out localAgentsPin);
+                        localAgentsDirHandle = OpenCustodyPinnedDirectoryHandle(custody.agentsPath, custody.agentsVolume, custody.agentsFileIndexHigh, custody.agentsFileIndexLow, "Managed .agents parent");
+                        IntPtr srcHandle = CreateFile(custody.sourcePath, RequiredCustodyFileAccess, 0, IntPtr.Zero, OpenExisting, FileFlagOpenReparsePoint, IntPtr.Zero);
+                        if (srcHandle == InvalidHandle) throw new Exception("Managed MCP config is missing from custody, quarantine, and workspace");
+                        try
+                        {
+                            VerifyHandleMatchesCustody(srcHandle, custody, custody.sourcePath);
+                            RawSecurityDescriptor currentSrcDacl = ReadKernelDacl(srcHandle);
+                            if (SameDacl(custodyDacl, currentSrcDacl) && !SameDacl(originalDacl, currentSrcDacl))
+                            {
+                                WriteKernelDaclExact(srcHandle, originalDacl);
+                            }
+                            else if (!SameDacl(originalDacl, currentSrcDacl))
+                            {
+                                throw new Exception("Managed MCP config DACL at workspace path does not match recorded original or custody DACL");
+                            }
+                        }
+                        finally { CloseHandle(srcHandle); }
+                        DeleteVerifiedEmptyCustodySlot(custody, IntPtr.Zero);
+                        return McpCustodyOutcome.Restored;
+                    }
+                    throw new Win32Exception(err, "Inspect held managed MCP config");
+                }
+            }
+
+            // Positively classify missing owned copy, changed/missing parent, or occupied restore destination.
+            // Uncertain Win32 errors (e.g., access denied, linked ancestors) throw and fail closed.
+            if (IsOwnedCopyPositivelyMissing(lease, canonicalState))
+            {
+                QuarantineVerifiedMcpCustody(lease, canonicalState, controllerUser, hold, "owned-copy-missing", serializer);
+                hold = null;
+                quarantineReason = "owned-copy-missing";
+                return McpCustodyOutcome.Quarantined;
+            }
+
+            string copyParentDir = Path.GetDirectoryName(fullCwd);
+            if (!String.IsNullOrEmpty(copyParentDir))
+            {
+                using (var ancestorPin = new PinnedTarget { grant = new Grant { rights = "read" }, maxFiles = 1 })
+                {
+                    ValidatePathComponents(copyParentDir, ancestorPin, false, 1);
+                    if (!ancestorPin.grant.directory) throw new Exception("Workspace copy ancestor is not a directory");
+                }
+            }
+
+            string conflictReason;
+            if (!TryInspectDirectoryForRestore(fullCwd, custody.copyVolume, custody.copyFileIndexHigh, custody.copyFileIndexLow, "owned-copy-missing", "copy-parent-changed", out conflictReason))
+            {
+                if (conflictReason == "owned-copy-missing" && !IsOwnedCopyPositivelyMissing(lease, canonicalState))
+                {
+                    throw new Exception("Unable to positively verify missing owned workspace copy");
+                }
+                QuarantineVerifiedMcpCustody(lease, canonicalState, controllerUser, hold, conflictReason, serializer);
+                hold = null;
+                quarantineReason = conflictReason;
+                return McpCustodyOutcome.Quarantined;
+            }
+            if (hold == null || hold.copyPin == null)
+            {
+                PinAndVerifyDirectoryNoReparse(fullCwd, custody.copyVolume, custody.copyFileIndexHigh, custody.copyFileIndexLow, "Workspace copy parent", out localCopyPin);
+            }
+            if (hold == null || hold.copyDirHandle == IntPtr.Zero || hold.copyDirHandle == InvalidHandle)
+            {
+                localCopyDirHandle = OpenCustodyPinnedDirectoryHandle(fullCwd, custody.copyVolume, custody.copyFileIndexHigh, custody.copyFileIndexLow, "Workspace copy parent");
+            }
+
+            if (!TryInspectDirectoryForRestore(custody.agentsPath, custody.agentsVolume, custody.agentsFileIndexHigh, custody.agentsFileIndexLow, "agents-parent-missing", "agents-parent-changed", out conflictReason))
+            {
+                QuarantineVerifiedMcpCustody(lease, canonicalState, controllerUser, hold, conflictReason, serializer);
+                hold = null;
+                quarantineReason = conflictReason;
+                return McpCustodyOutcome.Quarantined;
+            }
+            if (hold == null || hold.agentsPin == null)
+            {
+                PinAndVerifyDirectoryNoReparse(custody.agentsPath, custody.agentsVolume, custody.agentsFileIndexHigh, custody.agentsFileIndexLow, "Managed .agents parent", out localAgentsPin);
+            }
+            if (hold == null || hold.agentsDirHandle == IntPtr.Zero || hold.agentsDirHandle == InvalidHandle)
+            {
+                localAgentsDirHandle = OpenCustodyPinnedDirectoryHandle(custody.agentsPath, custody.agentsVolume, custody.agentsFileIndexHigh, custody.agentsFileIndexLow, "Managed .agents parent");
+            }
+
+            uint dstAttrs = GetFileAttributes(custody.sourcePath);
+            if (dstAttrs != InvalidFileAttributes)
+            {
+                QuarantineVerifiedMcpCustody(lease, canonicalState, controllerUser, hold, "restore-destination-occupied", serializer);
+                hold = null;
+                quarantineReason = "restore-destination-occupied";
+                return McpCustodyOutcome.Quarantined;
+            }
+            int dstErr = Marshal.GetLastWin32Error();
+            if (dstErr != 2)
+            {
+                throw new Win32Exception(dstErr, "Inspect managed MCP config restore destination");
+            }
+
+            PinAndVerifyDirectoryNoReparse(custody.custodyDirectory, custody.custodyDirVolume, custody.custodyDirFileIndexHigh, custody.custodyDirFileIndexLow, "Custody slot directory", out slotPin);
+            if (fileHandle == IntPtr.Zero || fileHandle == InvalidHandle)
+            {
+                fileHandle = CreateFile(custody.custodyPath, RequiredCustodyFileAccess, 0, IntPtr.Zero, OpenExisting, FileFlagOpenReparsePoint, IntPtr.Zero);
+                if (fileHandle == InvalidHandle) Check(false, "Open held managed MCP config exclusively by handle");
+                openedFileHere = true;
+            }
+
+            VerifyHandleMatchesCustody(fileHandle, custody, custody.custodyPath);
+            RawSecurityDescriptor heldDacl = ReadKernelDacl(fileHandle);
+            bool validHeldDacl = SameDacl(custodyDacl, heldDacl) || (hold == null && SameDacl(originalDacl, heldDacl));
+            if (!validHeldDacl)
+            {
+                throw new Exception("Managed MCP config DACL in custody does not match recorded tightened DACL");
+            }
+
+            try
+            {
+                RenameHandleNoReplace(fileHandle, custody.sourcePath);
+            }
+            catch (Win32Exception renameErr)
+            {
+                if (renameErr.NativeErrorCode == 183 || renameErr.NativeErrorCode == 80)
+                {
+                    if (openedFileHere)
+                    {
+                        CloseHandle(fileHandle);
+                        fileHandle = IntPtr.Zero;
+                        openedFileHere = false;
+                    }
+                    if (slotPin != null) { slotPin.Dispose(); slotPin = null; }
+                    QuarantineVerifiedMcpCustody(lease, canonicalState, controllerUser, hold, "restore-destination-occupied", serializer);
+                    hold = null;
+                    quarantineReason = "restore-destination-occupied";
+                    return McpCustodyOutcome.Quarantined;
+                }
+                throw;
+            }
+            if (!String.Equals(FinalPathByHandle(fileHandle), custody.sourcePath, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Managed MCP config restore did not land at expected workspace path");
+            }
+            if (!SameDacl(originalDacl, ReadKernelDacl(fileHandle)))
+            {
+                WriteKernelDaclExact(fileHandle, originalDacl);
+            }
+            if (!SameDacl(originalDacl, ReadKernelDacl(fileHandle)))
+            {
+                throw new Exception("Managed MCP config original DACL confirmation by handle failed");
+            }
+
+            if (openedFileHere)
+            {
+                CloseHandle(fileHandle);
+                fileHandle = IntPtr.Zero;
+                openedFileHere = false;
+            }
+            else if (hold != null)
+            {
+                CloseHandle(hold.fileHandle);
+                hold.fileHandle = IntPtr.Zero;
+                fileHandle = IntPtr.Zero;
+            }
+
+            if (slotPin != null) { slotPin.Dispose(); slotPin = null; }
+            if (hold != null)
+            {
+                IntPtr ownedSlot = hold.slotDirHandle;
+                hold.slotDirHandle = IntPtr.Zero;
+                DeleteVerifiedEmptyCustodySlot(custody, ownedSlot);
+            }
+            else
+            {
+                DeleteVerifiedEmptyCustodySlot(custody, IntPtr.Zero);
+            }
+            return McpCustodyOutcome.Restored;
+        }
+        finally
+        {
+            if (openedFileHere && fileHandle != IntPtr.Zero && fileHandle != InvalidHandle) CloseHandle(fileHandle);
+            if (slotPin != null) slotPin.Dispose();
+            if (localAgentsDirHandle != IntPtr.Zero && localAgentsDirHandle != InvalidHandle) CloseHandle(localAgentsDirHandle);
+            if (localCopyDirHandle != IntPtr.Zero && localCopyDirHandle != InvalidHandle) CloseHandle(localCopyDirHandle);
+            if (localAgentsPin != null) localAgentsPin.Dispose();
+            if (localCopyPin != null) localCopyPin.Dispose();
+            if (hold != null) hold.Dispose();
+        }
+    }
+
+    static void InitWorkspace(Request request, Dictionary<string, object> result, JavaScriptSerializer serializer)
+    {
+        Guid nonce; if (!Guid.TryParseExact(request.nonce, "D", out nonce)) throw new Exception("Invalid nonce");
+        Guid capNonce; if (String.IsNullOrEmpty(request.capabilityNonce) || !Guid.TryParseExact(request.capabilityNonce, "D", out capNonce)) throw new Exception("Invalid capability nonce");
+        if (request.maxFiles < 1 || request.maxFiles > 1000000) throw new Exception("Invalid maxFiles");
+        if (request.ownerPid < 0) throw new Exception("Invalid workspace initialization owner PID");
+        ValidateMcpCustodyRequest(request.mcpCustody);
+        long ownerStarted = 0;
+        if (request.ownerPid > 0)
+        {
+            ownerStarted = ActiveProcessStart(request.ownerPid, "workspace initialization owner");
+            if (ownerStarted <= 0) throw new Exception("Invalid workspace initialization owner start time");
+        }
+        result["nonce"] = request.nonce;
+        CanonicalWorkspaceInfo ws = ValidateCanonicalWorkspaceCopy(request.cwd, request.stateDirectory, serializer, false);
+        if (ws.meta.windowsLpac != null && !String.IsNullOrEmpty(ws.meta.windowsLpac.capabilityNonce))
+        {
+            throw new Exception("Canonical workspace LPAC permissions are already initialized");
+        }
+        SecurityIdentifier readSid = DeriveNamedCapabilitySid(WorkspaceCapabilityName(ws.rootKey, capNonce, false));
+        SecurityIdentifier modifySid = DeriveNamedCapabilitySid(WorkspaceCapabilityName(ws.rootKey, capNonce, true));
+        if (readSid.Equals(modifySid)) throw new Exception("Derived workspace capability SIDs must be distinct");
+
+        string canonicalState = CanonicalLocalPath(request.stateDirectory, "State directory");
+        string leaseDir = StateLeaseDirectory(request.stateDirectory);
+        string leaseFile = Path.Combine(leaseDir, nonce.ToString("N") + ".json");
+        ControllerIdentity controller = CurrentControllerIdentity();
+        PinnedTarget readPin = null, modifyPin = null;
+        McpCustodyHold initHold = null;
+        Lease lease = null;
+        bool readApplied = false, modifyApplied = false, holdCreated = false, leaseWritten = false;
+        try
+        {
+            readPin = PinGrant(new Grant { path = ws.copyPath, rights = "read" }, request.maxFiles);
+            modifyPin = PinGrant(new Grant { path = ws.copyPath, rights = "modify" }, request.maxFiles);
+            if (!SameIdentity(readPin.grant, modifyPin.grant)) throw new Exception("Canonical workspace identity changed during initialization");
+
+            lease = new Lease
+            {
+                version = request.mcpCustody != null ? 6 : 4,
+                nonce = request.nonce,
+                phase = "init-workspace",
+                controllerPid = Process.GetCurrentProcess().Id,
+                controllerStarted = CurrentProcessStart(),
+                ownerPid = request.ownerPid,
+                ownerStarted = ownerStarted,
+                cwd = ws.copyPath,
+                grants = new Grant[] { readPin.grant },
+                capabilityNonce = capNonce.ToString("D"),
+                readCapabilitySid = readSid.Value,
+                modifyCapabilitySid = modifySid.Value,
+            };
+
+            if (request.mcpCustody != null)
+            {
+                initHold = AcquireMcpConfigCustody(request.mcpCustody, ws.copyPath, canonicalState, nonce, controller, lease, leaseFile, ref leaseWritten, serializer);
+            }
+
+            ValidateCanonicalWorkspaceDacl(readPin, null, null, null, false, request.maxFiles);
+
+            if (!leaseWritten)
+            {
+                WriteLease(leaseFile, lease, true, serializer);
+                leaseWritten = true;
+            }
+
+            readApplied = true;
+            Access(readPin, readSid, true);
+            modifyApplied = true;
+            Access(modifyPin, modifySid, true);
+
+            string nativeDigest = ValidateCanonicalWorkspaceDacl(readPin, readSid, modifySid, null, true, request.maxFiles);
+            if (lease.ownerPid > 0)
+            {
+                CreateLeaseHold(leaseFile);
+                holdCreated = true;
+            }
+            lease.phase = "prepared";
+            lease.nativeDaclSha256 = nativeDigest;
+            WriteLease(leaseFile, lease, false, serializer);
+
+            result["volume"] = readPin.grant.volume;
+            result["fileIndexHigh"] = readPin.grant.fileIndexHigh;
+            result["fileIndexLow"] = readPin.grant.fileIndexLow;
+            result["readCapabilitySid"] = readSid.Value;
+            result["modifyCapabilitySid"] = modifySid.Value;
+            result["nativeDaclSha256"] = nativeDigest;
+        }
+        catch (Exception error)
+        {
+            var cleanupFailures = new List<string>();
+            if (holdCreated && leaseFile != null)
+            {
+                try { DeleteLeaseHoldIfPresent(leaseFile); }
+                catch (Exception holdError) { cleanupFailures.Add("Hold: " + holdError.Message); }
+            }
+            if (modifyApplied && modifyPin != null)
+            {
+                try { Access(modifyPin, modifySid, false); }
+                catch (Exception revokeError) { cleanupFailures.Add("Modify capability revoke: " + revokeError.Message); }
+            }
+            if (readApplied && readPin != null)
+            {
+                try { Access(readPin, readSid, false); }
+                catch (Exception revokeError) { cleanupFailures.Add("Read capability revoke: " + revokeError.Message); }
+            }
+            if (cleanupFailures.Count == 0 && leaseWritten && lease != null && lease.mcpCustody != null)
+            {
+                try
+                {
+                    string qReason;
+                    McpCustodyOutcome outcome = RestoreOrQuarantineMcpConfigCustody(lease, canonicalState, controller.user, initHold, serializer, out qReason);
+                    initHold = null;
+                    if (outcome == McpCustodyOutcome.Quarantined)
+                    {
+                        error = new Exception(CombineDiagnostic(error.Message, "MCP config restore conflict (" + qReason + "); verified original preserved in secure bridge quarantine"));
+                    }
+                }
+                catch (Exception restoreError) { cleanupFailures.Add("MCP config custody: " + restoreError.Message); }
+            }
+            if (initHold != null) { initHold.Dispose(); initHold = null; }
+            if (leaseWritten && leaseFile != null)
+            {
+                if (cleanupFailures.Count == 0)
+                {
+                    try { File.Delete(leaseFile); }
+                    catch (Exception deleteError) { cleanupFailures.Add("Lease: " + deleteError.Message); }
+                }
+                else if (lease != null)
+                {
+                    try { lease.phase = "cleanup-failed"; WriteLease(leaseFile, lease, false, serializer); }
+                    catch (Exception writeError) { cleanupFailures.Add("Lease: " + writeError.Message); }
+                }
+            }
+            string combined = cleanupFailures.Count == 0 ? error.Message : CombineDiagnostic(error.Message, "Rollback failed: " + String.Join("; ", cleanupFailures.ToArray()));
+            throw new Exception(combined);
+        }
+        finally
+        {
+            if (initHold != null) { initHold.Dispose(); initHold = null; }
+            if (modifyPin != null) modifyPin.Dispose();
+            if (readPin != null) readPin.Dispose();
+        }
+    }
+
+    enum WorkspaceInitCommitState
+    {
+        NotCommitted,
+        Committed,
+        Inconclusive,
+    }
+
+    static string LeaseHoldFile(string leaseFile)
+    {
+        return Path.ChangeExtension(leaseFile, ".hold");
+    }
+
+    static void CreateLeaseHold(string leaseFile)
+    {
+        string holdFile = LeaseHoldFile(leaseFile);
+        using (var stream = new FileStream(holdFile, FileMode.CreateNew, FileAccess.Write, FileShare.None, 4096, FileOptions.WriteThrough))
+        {
+            stream.Flush(true);
+        }
+    }
+
+    static void DeleteLeaseHoldIfPresent(string leaseFile)
+    {
+        string holdFile = LeaseHoldFile(leaseFile);
+        uint attrs = GetFileAttributes(holdFile);
+        if (attrs == InvalidFileAttributes)
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 2 || error == 3) return;
+            throw new Win32Exception(error, "Inspect workspace initialization hold");
+        }
+        if ((attrs & (uint)FileAttributes.ReparsePoint) != 0 || (attrs & (uint)FileAttributes.Directory) != 0)
+        {
+            throw new Exception("Workspace initialization hold is linked or invalid");
+        }
+        File.Delete(holdFile);
+    }
+
+    static bool LeaseFileExists(string leaseFile)
+    {
+        uint attrs = GetFileAttributes(leaseFile);
+        if (attrs != InvalidFileAttributes) return true;
+        int error = Marshal.GetLastWin32Error();
+        if (error == 2 || error == 3) return false;
+        throw new Win32Exception(error, "Inspect lease file");
+    }
+
+    static bool ReferencesLeaseGrant(WorkspaceLpacMeta lpac, Lease lease)
+    {
+        if (lpac == null) return false;
+        if (!String.IsNullOrEmpty(lpac.capabilityNonce) &&
+            String.Equals(lpac.capabilityNonce, lease.capabilityNonce, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+        if (!String.IsNullOrEmpty(lpac.readCapabilitySid) &&
+            (String.Equals(lpac.readCapabilitySid, lease.readCapabilitySid, StringComparison.OrdinalIgnoreCase) ||
+             String.Equals(lpac.readCapabilitySid, lease.modifyCapabilitySid, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+        if (!String.IsNullOrEmpty(lpac.modifyCapabilitySid) &&
+            (String.Equals(lpac.modifyCapabilitySid, lease.modifyCapabilitySid, StringComparison.OrdinalIgnoreCase) ||
+             String.Equals(lpac.modifyCapabilitySid, lease.readCapabilitySid, StringComparison.OrdinalIgnoreCase)))
+        {
+            return true;
+        }
+        return false;
+    }
+
+    static CanonicalWorkspaceInfo ValidateCommittedWorkspaceMetadata(Lease lease, string stateDirectory, JavaScriptSerializer serializer)
+    {
+        Guid capNonce;
+        if (lease == null || String.IsNullOrEmpty(lease.capabilityNonce) || !Guid.TryParseExact(lease.capabilityNonce, "D", out capNonce) ||
+            lease.grants == null || lease.grants.Length != 1 || lease.grants[0] == null || !IsLowerHex(lease.nativeDaclSha256, 64))
+        {
+            throw new Exception("Committed workspace initialization lease is incomplete");
+        }
+        CanonicalWorkspaceInfo ws = ValidateCanonicalWorkspaceCopy(lease.cwd, stateDirectory, serializer, true);
+        if (!ws.capabilityNonce.Equals(capNonce))
+        {
+            throw new Exception("Canonical workspace LPAC capability nonce mismatch");
+        }
+        if (!String.Equals(ws.readSid.Value, lease.readCapabilitySid, StringComparison.OrdinalIgnoreCase) ||
+            !String.Equals(ws.modifySid.Value, lease.modifyCapabilitySid, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new Exception("Canonical workspace LPAC capability SID mismatch");
+        }
+        if ((uint)ws.meta.windowsLpac.volume.Value != lease.grants[0].volume ||
+            (uint)ws.meta.windowsLpac.fileIndexHigh.Value != lease.grants[0].fileIndexHigh ||
+            (uint)ws.meta.windowsLpac.fileIndexLow.Value != lease.grants[0].fileIndexLow ||
+            !String.Equals(ws.meta.windowsLpac.nativeDaclSha256, lease.nativeDaclSha256, StringComparison.Ordinal))
+        {
+            throw new Exception("Canonical workspace LPAC pin identity or DACL digest mismatch");
+        }
+        return ws;
+    }
+
+    static WorkspaceInitCommitState InspectWorkspaceInitCommit(Lease lease, string stateDirectory, JavaScriptSerializer serializer, out string reason)
+    {
+        reason = null;
+        if (lease == null || !IsInitLeaseVersion(lease.version) || lease.phase != "prepared")
+        {
+            reason = "Lease is not a prepared workspace initialization lease";
+            return WorkspaceInitCommitState.NotCommitted;
+        }
+        Guid capNonce;
+        if (String.IsNullOrEmpty(lease.capabilityNonce) || !Guid.TryParseExact(lease.capabilityNonce, "D", out capNonce) ||
+            !IsLowerHex(lease.nativeDaclSha256, 64) ||
+            lease.grants == null || lease.grants.Length != 1 || lease.grants[0] == null)
+        {
+            reason = "Prepared workspace initialization lease is incomplete";
+            return WorkspaceInitCommitState.Inconclusive;
+        }
+        string fullCopy, rootKey, metadataPath;
+        if (!TryGetCanonicalWorkspaceRootKey(lease.cwd, stateDirectory, out fullCopy, out rootKey, out metadataPath))
+        {
+            reason = "Prepared workspace lease target is not a canonical workspace copy";
+            return WorkspaceInitCommitState.Inconclusive;
+        }
+        uint metaAttrs = GetFileAttributes(metadataPath);
+        if (metaAttrs == InvalidFileAttributes)
+        {
+            int metaError = Marshal.GetLastWin32Error();
+            if (metaError == 2 || metaError == 3)
+            {
+                return WorkspaceInitCommitState.NotCommitted;
+            }
+            reason = "Unable to inspect workspace metadata (Win32 " + metaError.ToString() + ")";
+            return WorkspaceInitCommitState.Inconclusive;
+        }
+        if ((metaAttrs & (uint)FileAttributes.ReparsePoint) != 0 || (metaAttrs & (uint)FileAttributes.Directory) != 0)
+        {
+            reason = "Canonical workspace metadata is linked or not a file";
+            return WorkspaceInitCommitState.Inconclusive;
+        }
+        WorkspaceMeta meta;
+        try
+        {
+            var metaInfo = new FileInfo(metadataPath);
+            if (metaInfo.Length <= 0 || metaInfo.Length > 1024 * 1024)
+            {
+                reason = "Canonical workspace metadata size is invalid";
+                return WorkspaceInitCommitState.Inconclusive;
+            }
+            meta = serializer.Deserialize<WorkspaceMeta>(File.ReadAllText(metadataPath, Encoding.UTF8));
+        }
+        catch (FileNotFoundException)
+        {
+            return WorkspaceInitCommitState.NotCommitted;
+        }
+        catch (DirectoryNotFoundException)
+        {
+            return WorkspaceInitCommitState.NotCommitted;
+        }
+        catch (Exception error)
+        {
+            reason = "Unable to read canonical workspace metadata: " + error.Message;
+            return WorkspaceInitCommitState.Inconclusive;
+        }
+        if (meta == null || meta.version != 1 || String.IsNullOrEmpty(meta.sourceDirectory) ||
+            !String.Equals(meta.rootKey, rootKey, StringComparison.Ordinal))
+        {
+            reason = "Canonical workspace metadata identity mismatch";
+            return WorkspaceInitCommitState.Inconclusive;
+        }
+        try
+        {
+            if (!String.Equals(ComputeWorkspaceRootKey(meta.sourceDirectory), rootKey, StringComparison.Ordinal))
+            {
+                reason = "Canonical workspace rootKey does not match sourceDirectory";
+                return WorkspaceInitCommitState.Inconclusive;
+            }
+        }
+        catch (Exception error)
+        {
+            reason = "Unable to validate canonical workspace rootKey: " + error.Message;
+            return WorkspaceInitCommitState.Inconclusive;
+        }
+
+        WorkspaceLpacMeta lpac = meta.windowsLpac;
+        if (lpac == null)
+        {
+            return WorkspaceInitCommitState.NotCommitted;
+        }
+        if (!ReferencesLeaseGrant(lpac, lease))
+        {
+            if (lpac.version != 1)
+            {
+                reason = "Canonical workspace LPAC metadata version is invalid";
+                return WorkspaceInitCommitState.Inconclusive;
+            }
+            if (!String.IsNullOrEmpty(lpac.capabilityNonce))
+            {
+                Guid otherNonce;
+                if (!Guid.TryParseExact(lpac.capabilityNonce, "D", out otherNonce))
+                {
+                    reason = "Canonical workspace LPAC capability nonce is invalid";
+                    return WorkspaceInitCommitState.Inconclusive;
+                }
+            }
+            return WorkspaceInitCommitState.NotCommitted;
+        }
+
+        try
+        {
+            CanonicalWorkspaceInfo ws = ValidateCommittedWorkspaceMetadata(lease, stateDirectory, serializer);
+            using (PinnedTarget pin = PinGrant(new Grant { path = ws.copyPath, rights = "read" }, RevokeFileBudget))
+            {
+                if (!SameIdentity(lease.grants[0], pin.grant))
+                {
+                    reason = "Canonical workspace copy identity changed";
+                    return WorkspaceInitCommitState.Inconclusive;
+                }
+                ValidateCanonicalWorkspaceDacl(pin, ws.readSid, ws.modifySid, lease.nativeDaclSha256, true, RevokeFileBudget);
+            }
+            return WorkspaceInitCommitState.Committed;
+        }
+        catch (Exception error)
+        {
+            reason = error.Message;
+            return WorkspaceInitCommitState.Inconclusive;
+        }
+    }
+
+    static void CommitWorkspaceLease(Request request, Dictionary<string, object> result, JavaScriptSerializer serializer)
+    {
+        Guid nonce; if (!Guid.TryParseExact(request.nonce, "D", out nonce)) throw new Exception("Invalid nonce");
+        ValidateMcpCustodyRequest(request.mcpCustody);
+        result["nonce"] = request.nonce;
+        string canonicalState = CanonicalLocalPath(request.stateDirectory, "State directory");
+        string leaseDir = StateLeaseDirectory(request.stateDirectory);
+        string leaseFile = Path.Combine(leaseDir, nonce.ToString("N") + ".json");
+        if (!File.Exists(leaseFile) || (File.GetAttributes(leaseFile) & FileAttributes.ReparsePoint) != 0)
+        {
+            throw new Exception("Workspace initialization lease is missing or linked");
+        }
+        Lease lease = serializer.Deserialize<Lease>(File.ReadAllText(leaseFile, Encoding.UTF8));
+        ValidateLease(lease, leaseFile, request.stateDirectory);
+        if (!IsInitLeaseVersion(lease.version) || (lease.phase != "prepared" && lease.phase != "committed"))
+        {
+            throw new Exception("Workspace initialization lease is not in prepared state");
+        }
+        if (lease.phase == "committed" && lease.version != 6)
+        {
+            throw new Exception("Only version 6 custody workspace initialization leases may enter committed phase");
+        }
+        string fullCopy, rootKey, metadataPath;
+        if (!TryGetCanonicalWorkspaceRootKey(request.cwd, request.stateDirectory, out fullCopy, out rootKey, out metadataPath) ||
+            !String.Equals(lease.cwd, fullCopy, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new Exception("Workspace initialization lease target mismatch");
+        }
+        if ((request.mcpCustody == null) != (lease.mcpCustody == null))
+        {
+            throw new Exception("Workspace initialization lease MCP custody presence mismatch");
+        }
+        if (request.mcpCustody != null && lease.mcpCustody != null)
+        {
+            if (!String.Equals(request.mcpCustody.executionId, lease.mcpCustody.executionId, StringComparison.OrdinalIgnoreCase) ||
+                !String.Equals(request.mcpCustody.sha256, lease.mcpCustody.sha256, StringComparison.Ordinal) ||
+                request.mcpCustody.bytes != lease.mcpCustody.bytes)
+            {
+                throw new Exception("Workspace initialization lease MCP custody identity mismatch");
+            }
+        }
+        if (lease.phase == "prepared")
+        {
+            string commitReason;
+            if (InspectWorkspaceInitCommit(lease, request.stateDirectory, serializer, out commitReason) != WorkspaceInitCommitState.Committed)
+            {
+                throw new Exception("Workspace LPAC pin is not durably committed or does not match prepared lease" + (String.IsNullOrEmpty(commitReason) ? "" : ": " + commitReason));
+            }
+            if (lease.mcpCustody != null)
+            {
+                lease.phase = "committed";
+                WriteLease(leaseFile, lease, false, serializer);
+            }
+        }
+        else
+        {
+            ValidateCommittedLeaseMetadataFile(lease, request.stateDirectory, canonicalState, serializer);
+        }
+        if (lease.mcpCustody != null)
+        {
+            ControllerIdentity controller = CurrentControllerIdentity();
+            string qReason;
+            McpCustodyOutcome outcome = RestoreOrQuarantineMcpConfigCustody(lease, canonicalState, controller.user, null, serializer, out qReason);
+            File.Delete(leaseFile);
+            DeleteLeaseHoldIfPresent(leaseFile);
+            if (outcome == McpCustodyOutcome.Quarantined)
+            {
+                throw new Exception("Managed MCP config restore conflict (" + qReason + "); verified original preserved in secure bridge quarantine");
+            }
+            result["mcpConfigCustodyRestored"] = true;
+            result["committed"] = true;
+            return;
+        }
+        File.Delete(leaseFile);
+        DeleteLeaseHoldIfPresent(leaseFile);
+        result["committed"] = true;
     }
 
     // Cloud Files placeholders keep their path identity; links and unknown tags remain forbidden.
@@ -1228,7 +3517,7 @@ internal static class WindowsTestRunner
     }
 
     // A lease written before the rename is settled under the names it recorded; the private lease file is the proof of ownership.
-    static bool IsEarlierLease(Lease lease) { return lease.profile.StartsWith("agy.test.", StringComparison.Ordinal); }
+    static bool IsEarlierLease(Lease lease) { return !String.IsNullOrEmpty(lease.profile) && lease.profile.StartsWith("agy.test.", StringComparison.Ordinal); }
 
     static string LeasePrefix(Lease lease, string kind)
     {
@@ -1321,18 +3610,74 @@ internal static class WindowsTestRunner
         finally { if (File.Exists(temporary)) File.Delete(temporary); }
     }
 
-    static void ValidateLease(Lease lease, string expectedFile)
+    static void ValidateLease(Lease lease, string expectedFile, string stateDirectory)
     {
         Guid nonce;
-        if (lease == null || (lease.version != 1 && lease.version != 2 && lease.version != 3) || !Guid.TryParseExact(lease.nonce, "D", out nonce) || String.IsNullOrEmpty(lease.profile) ||
-            (!String.Equals(lease.profile, "black-gravity.test." + nonce.ToString("N"), StringComparison.Ordinal) && !String.Equals(lease.profile, "agy.test." + nonce.ToString("N"), StringComparison.Ordinal)) || Path.GetFileName(expectedFile) != nonce.ToString("N") + ".json" ||
+        string canonicalState = CanonicalLocalPath(stateDirectory, "State directory");
+        if (lease != null && IsInitLeaseVersion(lease.version))
+        {
+            Guid capNonce;
+            bool validInitPhase = lease.phase == "init-workspace" || lease.phase == "prepared" || lease.phase == "cleanup-failed" ||
+                (lease.version == 6 && lease.phase == "committed");
+            if (!Guid.TryParseExact(lease.nonce, "D", out nonce) || Path.GetFileName(expectedFile) != nonce.ToString("N") + ".json" ||
+                lease.controllerPid <= 0 || lease.controllerStarted <= 0 || lease.grants == null || lease.grants.Length != 1 ||
+                !validInitPhase ||
+                String.IsNullOrEmpty(lease.capabilityNonce) || !Guid.TryParseExact(lease.capabilityNonce, "D", out capNonce))
+            {
+                throw new Exception("Invalid Windows LPAC workspace initialization lease");
+            }
+            if ((lease.phase == "prepared" || lease.phase == "committed") && !IsLowerHex(lease.nativeDaclSha256, 64))
+            {
+                throw new Exception("Prepared Windows LPAC workspace initialization lease is missing DACL digest");
+            }
+            if ((lease.ownerPid != 0 || lease.ownerStarted != 0) && (lease.ownerPid <= 0 || lease.ownerStarted <= 0))
+            {
+                throw new Exception("Invalid workspace initialization owner in lease");
+            }
+            string fullCopy, rootKey, metadataPath;
+            if (!TryGetCanonicalWorkspaceRootKey(lease.cwd, stateDirectory, out fullCopy, out rootKey, out metadataPath) ||
+                lease.grants[0] == null || !String.Equals(lease.grants[0].path, fullCopy, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new Exception("Invalid canonical workspace target in initialization lease");
+            }
+            SecurityIdentifier expectedRead = DeriveNamedCapabilitySid(WorkspaceCapabilityName(rootKey, capNonce, false));
+            SecurityIdentifier expectedModify = DeriveNamedCapabilitySid(WorkspaceCapabilityName(rootKey, capNonce, true));
+            if (String.IsNullOrEmpty(lease.readCapabilitySid) || String.IsNullOrEmpty(lease.modifyCapabilitySid) ||
+                !expectedRead.Equals(new SecurityIdentifier(lease.readCapabilitySid)) ||
+                !expectedModify.Equals(new SecurityIdentifier(lease.modifyCapabilitySid)))
+            {
+                throw new Exception("Invalid workspace capability SID in initialization lease");
+            }
+            if (lease.version == 4 && lease.mcpCustody != null)
+            {
+                throw new Exception("Version 4 workspace initialization lease cannot declare MCP custody");
+            }
+            if (lease.version == 6)
+            {
+                if (lease.mcpCustody == null) throw new Exception("Version 6 workspace initialization lease requires MCP custody");
+                ValidateMcpCustodyLease(lease.mcpCustody, fullCopy, canonicalState, nonce);
+            }
+            return;
+        }
+        if (lease == null || (lease.version != 1 && lease.version != 2 && lease.version != 3 && lease.version != 5) || !Guid.TryParseExact(lease.nonce, "D", out nonce) || String.IsNullOrEmpty(lease.profile) ||
+            (!String.Equals(lease.profile, "black-gravity.test." + nonce.ToString("N"), StringComparison.Ordinal) && !(lease.version <= 3 && String.Equals(lease.profile, "agy.test." + nonce.ToString("N"), StringComparison.Ordinal))) || Path.GetFileName(expectedFile) != nonce.ToString("N") + ".json" ||
             lease.controllerPid <= 0 || lease.controllerStarted <= 0 || lease.grants == null || (lease.phase != "creating" && lease.phase != "active" && lease.phase != "cleanup-failed")) throw new Exception("Invalid Windows LPAC lease");
         if (lease.phase != "creating" && String.IsNullOrEmpty(lease.sid)) throw new Exception("Lease has no profile identity");
-        OwnedTemporaryPath(lease.cwd, LeasePrefix(lease, "copy")); OwnedTemporaryPath(lease.runtime, LeasePrefix(lease, "runtime")); OwnedTemporaryPath(lease.scratch, LeasePrefix(lease, "scratch"));
-        if (lease.version == 2 || lease.version == 3) ValidateLeaseAliases(lease, nonce);
-        if (lease.version < 3 && (lease.nullDeviceGrant || lease.jobCreated == true)) throw new Exception("Legacy lease cannot declare Null device grant or named job");
-        if (lease.version == 3 && !lease.jobCreated.HasValue) throw new Exception("Lease has no job creation state");
+        string canonicalCopy, canonicalRootKey, canonicalMeta;
+        bool isCanonicalCopy = IsRunLeaseWithJobVersion(lease.version) && !IsEarlierLease(lease) &&
+            TryGetCanonicalWorkspaceRootKey(lease.cwd, stateDirectory, out canonicalCopy, out canonicalRootKey, out canonicalMeta);
+        if (!isCanonicalCopy)
+        {
+            OwnedTemporaryPath(lease.cwd, LeasePrefix(lease, "copy"));
+        }
+        OwnedTemporaryPath(lease.runtime, LeasePrefix(lease, "runtime")); OwnedTemporaryPath(lease.scratch, LeasePrefix(lease, "scratch"));
+        if (lease.version < 3 && (lease.nullDeviceGrant || lease.jobCreated == true || lease.mcpCustody != null)) throw new Exception("Legacy lease cannot declare Null device grant, named job, or MCP custody");
+        if (lease.version == 3 && lease.mcpCustody != null) throw new Exception("Version 3 lease cannot declare MCP custody");
+        if (lease.version == 5 && lease.mcpCustody == null) throw new Exception("Version 5 lease requires MCP custody");
+        if (lease.version == 2 || IsRunLeaseWithJobVersion(lease.version)) ValidateLeaseAliases(lease, nonce);
+        if (IsRunLeaseWithJobVersion(lease.version) && !lease.jobCreated.HasValue) throw new Exception("Lease has no job creation state");
         if ((lease.nullDeviceGrant || lease.jobCreated == true) && (lease.phase == "creating" || String.IsNullOrEmpty(lease.sid))) throw new Exception("Lease has no verified execution identity");
+        if (lease.version == 5) ValidateMcpCustodyLease(lease.mcpCustody, lease.cwd, canonicalState, nonce);
     }
 
     static void ValidateLeaseAliases(Lease lease, Guid nonce)
@@ -1349,25 +3694,93 @@ internal static class WindowsTestRunner
         }
     }
 
-    static bool ControllerIsActive(Lease lease)
+    static long ActiveProcessStart(int pid, string description)
     {
-        IntPtr process = OpenProcess(ProcessQueryLimitedInformation | Synchronize, false, (uint)lease.controllerPid);
+        if (pid <= 0) throw new Exception("Invalid " + description + " PID");
+        IntPtr process = OpenProcess(ProcessQueryLimitedInformation | Synchronize, false, (uint)pid);
         if (process == IntPtr.Zero)
         {
-            int error = Marshal.GetLastWin32Error();
-            if (error == 87 || error == 1168) return false;
-            throw new Win32Exception(error, "Cannot verify lease controller");
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Open " + description);
         }
         try
         {
             FileTime created, exited, kernel, user;
-            Check(GetProcessTimes(process, out created, out exited, out kernel, out user), "Verify lease controller start time");
+            Check(GetProcessTimes(process, out created, out exited, out kernel, out user), "Read " + description + " start time");
             uint state = WaitForSingleObject(process, 0);
-            if (state == WaitTimeout) return FileTimeValue(created) == lease.controllerStarted;
-            if (state == WaitObject0) return false;
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "Verify lease controller state");
+            if (state == WaitTimeout) return FileTimeValue(created);
+            if (state == WaitObject0) throw new Exception(description + " has already exited");
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Verify " + description + " state");
         }
         finally { CloseHandle(process); }
+    }
+
+    static bool ProcessIsActive(int pid, long started, string description)
+    {
+        IntPtr process = OpenProcess(ProcessQueryLimitedInformation | Synchronize, false, (uint)pid);
+        if (process == IntPtr.Zero)
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 87 || error == 1168) return false;
+            throw new Win32Exception(error, "Cannot verify " + description);
+        }
+        try
+        {
+            FileTime created, exited, kernel, user;
+            Check(GetProcessTimes(process, out created, out exited, out kernel, out user), "Verify " + description + " start time");
+            uint state = WaitForSingleObject(process, 0);
+            if (state == WaitTimeout) return FileTimeValue(created) == started;
+            if (state == WaitObject0) return false;
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Verify " + description + " state");
+        }
+        finally { CloseHandle(process); }
+    }
+
+    static bool ControllerIsActive(Lease lease)
+    {
+        return ProcessIsActive(lease.controllerPid, lease.controllerStarted, "lease controller");
+    }
+
+    static bool HasActivePreparedOwnerHold(Lease lease, string leaseFile)
+    {
+        if (lease == null || !IsInitLeaseVersion(lease.version) || (lease.phase != "prepared" && lease.phase != "committed")) return false;
+        if (lease.ownerPid <= 0 || lease.ownerStarted <= 0) return false;
+        string holdFile = LeaseHoldFile(leaseFile);
+        uint attrs = GetFileAttributes(holdFile);
+        if (attrs == InvalidFileAttributes)
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 2 || error == 3) return false;
+            throw new Win32Exception(error, "Cannot inspect workspace initialization hold");
+        }
+        if ((attrs & (uint)FileAttributes.ReparsePoint) != 0 || (attrs & (uint)FileAttributes.Directory) != 0)
+        {
+            throw new Exception("Workspace initialization hold is linked or invalid");
+        }
+        if (ProcessIsActive(lease.ownerPid, lease.ownerStarted, "workspace initialization owner"))
+        {
+            return true;
+        }
+        DeleteLeaseHoldIfPresent(leaseFile);
+        return false;
+    }
+
+    static bool TryReadValidatedLease(string file, string stateDirectory, JavaScriptSerializer serializer, out Lease lease)
+    {
+        lease = null;
+        uint attrs = GetFileAttributes(file);
+        if (attrs == InvalidFileAttributes)
+        {
+            int error = Marshal.GetLastWin32Error();
+            if (error == 2 || error == 3) return false;
+            throw new Win32Exception(error, "Inspect lease file");
+        }
+        if ((attrs & (uint)FileAttributes.ReparsePoint) != 0) throw new Exception("Lease file is linked");
+        string content;
+        try { content = File.ReadAllText(file, Encoding.UTF8); }
+        catch (FileNotFoundException) { return false; }
+        lease = serializer.Deserialize<Lease>(content);
+        ValidateLease(lease, file, stateDirectory);
+        return true;
     }
 
     static SecurityIdentifier LeaseIdentity(Lease lease)
@@ -1388,11 +3801,21 @@ internal static class WindowsTestRunner
         return identity;
     }
 
-    static bool IsMissingOwnedTemporaryGrant(Lease lease, Grant grant)
+    static bool IsMissingOwnedTemporaryGrant(Lease lease, Grant grant, string stateDirectory)
     {
         if (grant == null || !grant.directory) return false;
         string directory = null, prefix = null;
-        if (String.Equals(grant.path, lease.cwd, StringComparison.OrdinalIgnoreCase)) { directory = lease.cwd; prefix = LeasePrefix(lease, "copy"); }
+        if (String.Equals(grant.path, lease.cwd, StringComparison.OrdinalIgnoreCase))
+        {
+            string fullCopy, rootKey, metadataPath;
+            if (lease.version >= 3 && !IsEarlierLease(lease) && TryGetCanonicalWorkspaceRootKey(lease.cwd, stateDirectory, out fullCopy, out rootKey, out metadataPath))
+            {
+                if (GetFileAttributes(fullCopy) != InvalidFileAttributes) return false;
+                int canonicalError = Marshal.GetLastWin32Error();
+                return canonicalError == 2 || canonicalError == 3;
+            }
+            directory = lease.cwd; prefix = LeasePrefix(lease, "copy");
+        }
         else if (String.Equals(grant.path, lease.runtime, StringComparison.OrdinalIgnoreCase)) { directory = lease.runtime; prefix = LeasePrefix(lease, "runtime"); }
         else if (String.Equals(grant.path, lease.scratch, StringComparison.OrdinalIgnoreCase)) { directory = lease.scratch; prefix = LeasePrefix(lease, "scratch"); }
         else return false;
@@ -1410,25 +3833,103 @@ internal static class WindowsTestRunner
 
     static void Recover(string stateDirectory, Dictionary<string, object> result, JavaScriptSerializer serializer)
     {
+        string canonicalState = CanonicalLocalPath(stateDirectory, "State directory");
         string directory = StateLeaseDirectory(stateDirectory); var failures = new List<string>(); int recovered = 0, active = 0;
         foreach (string file in Directory.GetFiles(directory, "*.json", SearchOption.TopDirectoryOnly))
         {
             try
             {
-                if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0) throw new Exception("Lease file is linked");
-                Lease lease = serializer.Deserialize<Lease>(File.ReadAllText(file, Encoding.UTF8)); ValidateLease(lease, file);
+                Lease lease;
+                if (!TryReadValidatedLease(file, stateDirectory, serializer, out lease)) continue;
                 if (ControllerIsActive(lease)) { active++; continue; }
-                SecurityIdentifier identity = LeaseIdentity(lease); VerifyRecoveryJobEnded(lease); var pins = new List<PinnedTarget>(); var cleanupFailures = new List<string>();
-                try
+                if (!TryReadValidatedLease(file, stateDirectory, serializer, out lease)) continue;
+                if (ControllerIsActive(lease)) { active++; continue; }
+                if (IsInitLeaseVersion(lease.version))
                 {
-                    if (lease.version == 2 || lease.version == 3)
+                    if (lease.phase == "committed")
+                    {
+                        if (HasActivePreparedOwnerHold(lease, file)) { active++; continue; }
+                        if (!LeaseFileExists(file)) continue;
+                        ValidateCommittedLeaseMetadataFile(lease, stateDirectory, canonicalState, serializer);
+                        if (lease.mcpCustody != null)
+                        {
+                            ControllerIdentity initController = CurrentControllerIdentity();
+                            string qReason;
+                            RestoreOrQuarantineMcpConfigCustody(lease, canonicalState, initController.user, null, serializer, out qReason);
+                        }
+                        File.Delete(file);
+                        DeleteLeaseHoldIfPresent(file);
+                        recovered++;
+                        continue;
+                    }
+                    if (lease.phase == "prepared")
+                    {
+                        if (HasActivePreparedOwnerHold(lease, file)) { active++; continue; }
+                        if (!LeaseFileExists(file)) continue;
+                        string commitReason;
+                        WorkspaceInitCommitState commitState = InspectWorkspaceInitCommit(lease, stateDirectory, serializer, out commitReason);
+                        if (commitState == WorkspaceInitCommitState.Committed)
+                        {
+                            if (lease.mcpCustody != null)
+                            {
+                                lease.phase = "committed";
+                                WriteLease(file, lease, false, serializer);
+                                ControllerIdentity initController = CurrentControllerIdentity();
+                                string qReason;
+                                RestoreOrQuarantineMcpConfigCustody(lease, canonicalState, initController.user, null, serializer, out qReason);
+                            }
+                            File.Delete(file);
+                            DeleteLeaseHoldIfPresent(file);
+                            recovered++;
+                            continue;
+                        }
+                        if (commitState == WorkspaceInitCommitState.Inconclusive)
+                        {
+                            if (!LeaseFileExists(file)) continue;
+                            throw new Exception("Prepared workspace initialization commit check was inconclusive; skipping revocation" + (String.IsNullOrEmpty(commitReason) ? "" : ": " + commitReason));
+                        }
+                    }
+                    var initFailures = new List<string>();
+                    if (!IsMissingOwnedTemporaryGrant(lease, lease.grants[0], stateDirectory))
+                    {
+                        try { Access(new PinnedTarget { grant = lease.grants[0] }, new SecurityIdentifier(lease.modifyCapabilitySid), false); }
+                        catch (Exception error) { initFailures.Add("Modify capability ACL: " + error.Message); }
+                        try { Access(new PinnedTarget { grant = lease.grants[0] }, new SecurityIdentifier(lease.readCapabilitySid), false); }
+                        catch (Exception error) { initFailures.Add("Read capability ACL: " + error.Message); }
+                    }
+                    if (initFailures.Count == 0 && lease.mcpCustody != null)
                     {
                         try
                         {
-                            ControllerIdentity controller = CurrentControllerIdentity();
-                            if (String.Equals(controller.logon, lease.logon, StringComparison.Ordinal))
+                            ControllerIdentity initController = CurrentControllerIdentity();
+                            string qReason;
+                            RestoreOrQuarantineMcpConfigCustody(lease, canonicalState, initController.user, null, serializer, out qReason);
+                        }
+                        catch (Exception error) { initFailures.Add("MCP config custody: " + error.Message); }
+                    }
+                    if (initFailures.Count != 0)
+                    {
+                        lease.phase = "cleanup-failed";
+                        try { WriteLease(file, lease, false, serializer); } catch (Exception update) { initFailures.Add("Lease: " + update.Message); }
+                        throw new Exception(String.Join("; ", initFailures.ToArray()));
+                    }
+                    File.Delete(file);
+                    DeleteLeaseHoldIfPresent(file);
+                    recovered++;
+                    continue;
+                }
+                SecurityIdentifier identity = LeaseIdentity(lease); VerifyRecoveryJobEnded(lease); var pins = new List<PinnedTarget>(); var cleanupFailures = new List<string>();
+                ControllerIdentity recoveryController = null;
+                try
+                {
+                    if (lease.version == 2 || IsRunLeaseWithJobVersion(lease.version))
+                    {
+                        try
+                        {
+                            recoveryController = CurrentControllerIdentity();
+                            if (String.Equals(recoveryController.logon, lease.logon, StringComparison.Ordinal))
                             {
-                                AcquireRecoveryAliasGates(lease.aliases, controller, lease.logon);
+                                AcquireRecoveryAliasGates(lease.aliases, recoveryController, lease.logon);
                                 try { RemoveAliases(lease.aliases); }
                                 finally { ReleaseAliasGates(lease.aliases); }
                             }
@@ -1436,7 +3937,7 @@ internal static class WindowsTestRunner
                         }
                         catch (Exception error) { cleanupFailures.Add("DOS aliases: " + error.Message); }
                     }
-                    if (lease.version == 3 && lease.nullDeviceGrant && identity != null)
+                    if (IsRunLeaseWithJobVersion(lease.version) && lease.nullDeviceGrant && identity != null)
                     {
                         try { ReconcileRecoveryNullDeviceGrant(identity); }
                         catch (Exception error) { cleanupFailures.Add("Null device: " + error.Message); }
@@ -1445,12 +3946,22 @@ internal static class WindowsTestRunner
                     {
                         for (int index = lease.grants.Length - 1; index >= 0; index--)
                         {
-                            if (IsMissingOwnedTemporaryGrant(lease, lease.grants[index])) continue;
+                            if (IsMissingOwnedTemporaryGrant(lease, lease.grants[index], stateDirectory)) continue;
                             try { Access(new PinnedTarget { grant = lease.grants[index] }, identity, false); }
                             catch (Exception error) { cleanupFailures.Add("ACL " + index.ToString() + ": " + error.Message); }
                         }
                     }
                     try { DeleteProfile(lease.profile); } catch (Exception error) { cleanupFailures.Add("Profile: " + error.Message); }
+                    if (cleanupFailures.Count == 0 && lease.mcpCustody != null)
+                    {
+                        try
+                        {
+                            if (recoveryController == null) recoveryController = CurrentControllerIdentity();
+                            string qReason;
+                            RestoreOrQuarantineMcpConfigCustody(lease, canonicalState, recoveryController.user, null, serializer, out qReason);
+                        }
+                        catch (Exception error) { cleanupFailures.Add("MCP config custody: " + error.Message); }
+                    }
                 }
                 finally { for (int index = pins.Count - 1; index >= 0; index--) pins[index].Dispose(); }
                 if (cleanupFailures.Count != 0)
@@ -1526,12 +4037,13 @@ internal static class WindowsTestRunner
         Console.OutputEncoding = new UTF8Encoding(false);
         var serializer = new JavaScriptSerializer { MaxJsonLength = 2 * 1024 * 1024 };
         var result = new Dictionary<string, object>();
-        string profile = null, leaseFile = null, cwd = null, runtime = null, scratch = null;
+        string profile = null, leaseFile = null, cwd = null, runtime = null, scratch = null, canonicalState = null;
         SecurityIdentifier identity = null; Lease lease = null;
         ControllerIdentity controller = null; AliasPlan[] aliases = null;
+        McpCustodyHold mcpHold = null;
         IntPtr sid = IntPtr.Zero, job = IntPtr.Zero, attributes = IntPtr.Zero, capabilityData = IntPtr.Zero, lpacData = IntPtr.Zero, handleData = IntPtr.Zero, jobData = IntPtr.Zero, envData = IntPtr.Zero, capabilityList = IntPtr.Zero;
         IntPtr read = IntPtr.Zero, write = IntPtr.Zero, inputRead = IntPtr.Zero, inputWrite = IntPtr.Zero;
-        ProcessInfo child = new ProcessInfo(); bool attributesInitialized = false, profileCreated = false, nullDeviceGranted = false;
+        ProcessInfo child = new ProcessInfo(); bool attributesInitialized = false, profileCreated = false, nullDeviceGranted = false, leaseWritten = false;
         var pins = new List<PinnedTarget>(); var applied = new List<PinnedTarget>();
         var capabilitySids = new List<IntPtr>();
         var output = new StringBuilder(); bool truncated = false; Thread reader = null; object jobGate = new object(); int cancellation = 0;
@@ -1545,6 +4057,16 @@ internal static class WindowsTestRunner
                 Recover(request.stateDirectory, result, serializer); result["output"] = ""; result["truncated"] = false;
                 Console.WriteLine(serializer.Serialize(result)); return result.ContainsKey("error") ? 1 : 0;
             }
+            if (request.action == "init-workspace")
+            {
+                InitWorkspace(request, result, serializer); result["output"] = ""; result["truncated"] = false;
+                Console.WriteLine(serializer.Serialize(result)); return result.ContainsKey("error") ? 1 : 0;
+            }
+            if (request.action == "commit-workspace-lease")
+            {
+                CommitWorkspaceLease(request, result, serializer); result["output"] = ""; result["truncated"] = false;
+                Console.WriteLine(serializer.Serialize(result)); return result.ContainsKey("error") ? 1 : 0;
+            }
             if (request.action != "write" && request.action != "read-only") throw new Exception("Invalid controller action");
             Guid nonce; if (!Guid.TryParseExact(request.nonce, "D", out nonce)) throw new Exception("Invalid nonce");
             if (!String.Equals(request.profile, "black-gravity.test." + nonce.ToString("N"), StringComparison.Ordinal)) throw new Exception("Invalid deterministic profile name");
@@ -1552,7 +4074,21 @@ internal static class WindowsTestRunner
             if (request.timeoutSeconds < 1 || request.timeoutSeconds > 86400 || request.maxFiles < 1 || request.maxFiles > 1000000 || request.maxOutputChars < 256 || request.maxOutputChars > 64000 || request.args == null || request.environment == null || request.grants == null) throw new Exception("Invalid request");
             if (request.args.Length > 50) throw new Exception("Too many command arguments");
             foreach (string argument in request.args) if (argument == null || argument.Length > 4000 || argument.IndexOf('\0') >= 0) throw new Exception("Invalid command argument");
-            cwd = OwnedDirectory(request.cwd, CopyPrefix(request.cwd)); runtime = OwnedDirectory(request.runtime, "black-gravity-runtime-"); scratch = OwnedDirectory(request.scratch, "black-gravity-scratch-");
+            ValidateMcpCustodyRequest(request.mcpCustody);
+            string state = StateLeaseDirectory(request.stateDirectory);
+            canonicalState = Path.GetFullPath(request.stateDirectory).TrimEnd(Path.DirectorySeparatorChar);
+            CanonicalWorkspaceInfo canonicalWorkspace = null;
+            string canonicalCopyPath, canonicalRootKey, canonicalMetaPath;
+            if (TryGetCanonicalWorkspaceRootKey(request.cwd, canonicalState, out canonicalCopyPath, out canonicalRootKey, out canonicalMetaPath))
+            {
+                canonicalWorkspace = ValidateCanonicalWorkspaceCopy(request.cwd, canonicalState, serializer, true);
+                cwd = canonicalWorkspace.copyPath;
+            }
+            else
+            {
+                cwd = OwnedDirectory(request.cwd, CopyPrefix(request.cwd));
+            }
+            runtime = OwnedDirectory(request.runtime, "black-gravity-runtime-"); scratch = OwnedDirectory(request.scratch, "black-gravity-scratch-");
             string executable = Path.GetFullPath(request.executable);
             if (!executable.StartsWith(runtime + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) || !File.Exists(executable) || (File.GetAttributes(executable) & FileAttributes.ReparsePoint) != 0) throw new Exception("Executable must be staged inside the runtime");
             var requestedGrants = new List<Grant>();
@@ -1560,31 +4096,58 @@ internal static class WindowsTestRunner
             AddGrant(requestedGrants, runtime, "read"); AddGrant(requestedGrants, scratch, "modify");
             foreach (Grant grant in request.grants)
             {
-                if (grant == null || IsBridgeOwnedTemporaryPath(grant.path)) throw new Exception("External permission grant targets bridge-owned temporary storage");
+                if (grant == null) throw new Exception("Invalid permission grant");
+                RequireLocalAbsolutePath(grant.path, "External permission grant");
+                if (IsBridgeOwnedTemporaryPath(grant.path) || OverlapsPath(grant.path, canonicalState)) throw new Exception("External permission grant targets bridge-owned storage");
                 AddGrant(requestedGrants, grant.path, grant.rights);
             }
             if (requestedGrants.Count > 23) throw new Exception("Too many permission grants");
             foreach (Grant grant in requestedGrants) pins.Add(PinGrant(grant, request.maxFiles));
-            string state = StateLeaseDirectory(request.stateDirectory);
             profile = request.profile; leaseFile = Path.Combine(state, nonce.ToString("N") + ".json");
             controller = CurrentControllerIdentity(); aliases = CreateAliasPlan(nonce, controller, new PinnedTarget[] { pins[0], pins[1], pins[2] });
             result["pathMappings"] = PathMappings(aliases);
-            lease = new Lease { version = 3, nonce = request.nonce, profile = profile, phase = "creating", controllerPid = Process.GetCurrentProcess().Id, controllerStarted = CurrentProcessStart(), cwd = cwd, runtime = runtime, scratch = scratch, grants = new Grant[0], logon = controller.logon, aliases = aliases, nullDeviceGrant = false, jobCreated = false };
-            WriteLease(leaseFile, lease, true, serializer);
+            lease = new Lease { version = request.mcpCustody != null ? 5 : 3, nonce = request.nonce, profile = profile, phase = "creating", controllerPid = Process.GetCurrentProcess().Id, controllerStarted = CurrentProcessStart(), cwd = cwd, runtime = runtime, scratch = scratch, grants = new Grant[0], logon = controller.logon, aliases = aliases, nullDeviceGrant = false, jobCreated = false };
+            if (request.mcpCustody != null)
+            {
+                mcpHold = AcquireMcpConfigCustody(request.mcpCustody, cwd, canonicalState, nonce, controller, lease, leaseFile, ref leaseWritten, serializer);
+            }
+            if (canonicalWorkspace != null)
+            {
+                if (pins[0].grant.volume != (uint)canonicalWorkspace.meta.windowsLpac.volume.Value ||
+                    pins[0].grant.fileIndexHigh != (uint)canonicalWorkspace.meta.windowsLpac.fileIndexHigh.Value ||
+                    pins[0].grant.fileIndexLow != (uint)canonicalWorkspace.meta.windowsLpac.fileIndexLow.Value)
+                {
+                    throw new Exception("Canonical workspace folder identity changed since LPAC baseline was pinned");
+                }
+                ValidateCanonicalWorkspaceDacl(
+                    pins[0],
+                    canonicalWorkspace.readSid,
+                    canonicalWorkspace.modifySid,
+                    canonicalWorkspace.meta.windowsLpac.nativeDaclSha256,
+                    true,
+                    request.maxFiles);
+                result["workspaceLpacValidated"] = true;
+            }
+            int ephemeralGrantStart = canonicalWorkspace != null ? 1 : 0;
+            if (!leaseWritten)
+            {
+                WriteLease(leaseFile, lease, true, serializer);
+                leaseWritten = true;
+            }
             CheckHr(CreateAppContainerProfile(profile, profile, "Isolated test process", IntPtr.Zero, 0, out sid), "CreateAppContainerProfile");
             profileCreated = true; identity = new SecurityIdentifier(sid);
             lease.sid = identity.Value; WriteLease(leaseFile, lease, false, serializer);
             Directory.CreateDirectory(Path.Combine(scratch, "Packages", profile, "AC", "Temp"));
             Directory.CreateDirectory(Path.Combine(scratch, "Packages", profile, "AC", "Local"));
             bool needNullGrant = request.environment.ContainsKey("GIT_EXEC_PATH") && NullDeviceRequiresGrant(identity);
-            var recorded = new List<Grant>(); foreach (PinnedTarget pin in pins) recorded.Add(pin.grant);
+            var recorded = new List<Grant>(); for (int index = ephemeralGrantStart; index < pins.Count; index++) recorded.Add(pins[index].grant);
             lease.sid = identity.Value; lease.grants = recorded.ToArray(); lease.nullDeviceGrant = needNullGrant; lease.phase = "active"; WriteLease(leaseFile, lease, false, serializer);
             if (needNullGrant)
             {
                 nullDeviceGranted = true;
                 ApplyNullDeviceGrant(identity);
             }
-            foreach (PinnedTarget pin in pins) { applied.Add(pin); Access(pin, identity, true); }
+            for (int index = ephemeralGrantStart; index < pins.Count; index++) { applied.Add(pins[index]); Access(pins[index], identity, true); }
             ApplyAliases(aliases); result["pathMappings"] = PathMappings(aliases);
 
             var inheritable = new SecurityAttributes { length = Marshal.SizeOf(typeof(SecurityAttributes)), inherit = 1 };
@@ -1596,6 +4159,13 @@ internal static class WindowsTestRunner
             try { Marshal.StructureToPtr(limits, limitData, false); Check(SetInformationJobObject(job, (int)JobObjectExtendedLimitInformation, limitData, (uint)Marshal.SizeOf(limits)), "Require job cleanup"); Marshal.DestroyStructure(limitData, typeof(ExtendedLimits)); Check(QueryInformationJobObject(job, (int)JobObjectExtendedLimitInformation, limitData, (uint)Marshal.SizeOf(limits), IntPtr.Zero), "Verify job limits"); var observed = (ExtendedLimits)Marshal.PtrToStructure(limitData, typeof(ExtendedLimits)); if ((observed.basic.flags & JobObjectLimitKillOnJobClose) == 0 || (observed.basic.flags & (JobObjectLimitBreakawayOk | JobObjectLimitSilentBreakawayOk)) != 0 || (!request.childProcesses && ((observed.basic.flags & JobObjectLimitActiveProcess) == 0 || observed.basic.activeProcesses != 1))) throw new Exception("Job limits were not applied"); }
             finally { Marshal.FreeHGlobal(limitData); }
             DeriveCapability("registryRead", capabilitySids);
+            if (canonicalWorkspace != null)
+            {
+                bool isModify = request.action == "write";
+                IntPtr workspaceCap = DeriveCapability(WorkspaceCapabilityName(canonicalWorkspace.rootKey, canonicalWorkspace.capabilityNonce, isModify), capabilitySids);
+                SecurityIdentifier expectedCap = isModify ? canonicalWorkspace.modifySid : canonicalWorkspace.readSid;
+                if (!expectedCap.Equals(new SecurityIdentifier(workspaceCap))) throw new Exception("Derived workspace capability SID mismatch");
+            }
             if (request.network) { DeriveCapability("internetClient", capabilitySids); DeriveCapability("privateNetworkClientServer", capabilitySids); }
                 int sidAndAttributesSize = Marshal.SizeOf(typeof(SidAndAttributes)); capabilityList = Marshal.AllocHGlobal(sidAndAttributesSize * capabilitySids.Count);
                 for (int index = 0; index < capabilitySids.Count; index++) Marshal.StructureToPtr(new SidAndAttributes { sid = capabilitySids[index], attributes = 4 }, IntPtr.Add(capabilityList, index * sidAndAttributesSize), false);
@@ -1675,13 +4245,34 @@ internal static class WindowsTestRunner
                 if (nullDeviceGranted) try { ReconcileRecoveryNullDeviceGrant(identity); } catch (Exception error) { failures.Add("Null device: " + error.Message); }
                 for (int index = applied.Count - 1; index >= 0; index--) try { Access(applied[index], identity, false); } catch (Exception error) { failures.Add("ACL " + index.ToString() + ": " + error.Message); }
                 if (profileCreated) try { DeleteProfile(profile); result["profileDeleted"] = true; } catch (Exception error) { failures.Add("Profile: " + error.Message); }
+                if (failures.Count == 0 && leaseWritten && lease != null && lease.mcpCustody != null)
+                {
+                    try
+                    {
+                        string qReason;
+                        McpCustodyOutcome outcome = RestoreOrQuarantineMcpConfigCustody(lease, canonicalState, controller.user, mcpHold, serializer, out qReason);
+                        mcpHold = null;
+                        if (outcome == McpCustodyOutcome.Restored)
+                        {
+                            result["mcpConfigCustodyRestored"] = true;
+                        }
+                        else
+                        {
+                            result["error"] = CombineDiagnostic(
+                                result.ContainsKey("error") && result["error"] != null ? result["error"].ToString() : null,
+                                "Managed MCP config restore conflict (" + qReason + "); verified original preserved in secure bridge quarantine");
+                        }
+                    }
+                    catch (Exception error) { failures.Add("MCP config custody: " + error.Message); }
+                }
             }
             else if (aliases != null) ReleaseAliasGates(aliases);
+            if (mcpHold != null) { mcpHold.Dispose(); mcpHold = null; }
             for (int index = pins.Count - 1; index >= 0; index--) pins[index].Dispose();
             if (sid != IntPtr.Zero) FreeSid(sid);
-            if (leaseFile != null)
+            if (leaseFile != null && leaseWritten)
             {
-                if (failures.Count == 0 && profileCreated) { try { File.Delete(leaseFile); } catch (Exception error) { failures.Add("Lease: " + error.Message); } }
+                if (failures.Count == 0 && (profileCreated || (lease != null && lease.mcpCustody != null))) { try { File.Delete(leaseFile); } catch (Exception error) { failures.Add("Lease: " + error.Message); } }
                 if (failures.Count != 0) try { if (lease != null && !String.IsNullOrEmpty(lease.sid)) { lease.phase = "cleanup-failed"; WriteLease(leaseFile, lease, false, serializer); } } catch (Exception error) { failures.Add("Lease: " + error.Message); }
             }
             if (failures.Count != 0)

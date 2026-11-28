@@ -8,7 +8,7 @@ import path from 'node:path';
 import { stageProvidedSkills, verifyProvidedSkills, type ProvidedSkill, type StagedSkill } from './skills.js';
 import { BridgeError } from './types.js';
 import { checkIntegratedText, decodeUtf16, renderLines, replaceInsideRoot, type LfConversion } from './line-endings.js';
-import { stageExecutionPolicy, verifyExecutionPolicy, discardExecutionPolicy, EXECUTION_POLICY_PATHS, type StagedExecutionPolicy } from './execution-policy.js';
+import { stageExecutionPolicy, handoffExecutionPolicyWithProvenMcpConfig, verifyExecutionPolicy, discardExecutionPolicy, EXECUTION_POLICY_PATHS, type StagedExecutionPolicy } from './execution-policy.js';
 import type { ResolvedAgentPolicy, McpCatalogEntry } from './agent-policy.js';
 import { DEFAULT_PROJECT_LIMITS, assertSecretExclusionsUsable, type ProjectLimits } from './config.js';
 import {
@@ -25,6 +25,17 @@ import { normalizeSecretExceptionsPolicy } from './hardening-policy.js';
 import { PROCESS_CONTAINMENT_LEVELS, type ProcessContainment } from './execution-contract.js';
 import { hasOwnedPrefix } from './state-migration.js';
 import {
+  assertNoLinkAncestryAsync,
+  canonicalWorkspacePaths,
+  emptyDirectoryContents,
+  ensureFixedWorkspaceLpacPermissions,
+  invalidateWorkspaceOccupant,
+  isOwnedWorkspacePath,
+  readWorkspaceMetadata,
+  verifyPreparedScopeAgainstOriginal,
+  writeWorkspaceMetadata,
+} from './workspace-paths.js';
+import {
   AGENT_GUARD_PATHS,
   assertNoProtectedPatchPaths,
   buildAgentGuardFiles,
@@ -40,6 +51,10 @@ export interface ExecutionPolicyRequest { policy: ResolvedAgentPolicy; catalog: 
 export interface ProjectCopy {
   executionPolicy?: StagedExecutionPolicy;
   executionStateDirectory?: string;
+  workspaceStateDirectory?: string;
+  lineageId?: string;
+  archivedAt?: string;
+  archiveSha256?: string;
   providedSkills?: readonly StagedSkill[];
   sourceDirectory: string;
   copyDirectory: string;
@@ -48,6 +63,13 @@ export interface ProjectCopy {
   includedFiles: string[];
   blockedFiles?: BlockedPath[];
   modelProofFailure?: string;
+}
+
+export interface FixedWorkspaceOptions {
+  stateDirectory: string;
+  lineageId: string;
+  taskId: string;
+  onPrepared?: (metrics: { preparationMs: number; scopeSha256: string }) => void;
 }
 
 export interface ChangePreview {
@@ -107,8 +129,7 @@ export async function writeLineEndingConversions(project: ProjectCopy, conversio
     { encoding: 'utf8', flag: 'wx', mode: 0o600, flush: true });
 }
 
-export async function readLineEndingConversions(project: ProjectCopy): Promise<LineEndingConversions | undefined> {
-  await assertManagedCopyPresent(project);
+export async function readLineEndingConversionsMarker(project: { gitDirectory: string }): Promise<LineEndingConversions | undefined> {
   const marker = path.join(project.gitDirectory, LINE_ENDINGS_MARKER_NAME);
   let text: string;
   try {
@@ -131,13 +152,18 @@ export async function readLineEndingConversions(project: ProjectCopy): Promise<L
     existingBefore: existingBefore as string[] };
 }
 
-export async function assertLineEndingsRestored(project: ProjectCopy): Promise<void> {
+export async function readLineEndingConversions(project: Pick<ProjectCopy, 'copyDirectory' | 'gitDirectory'>): Promise<LineEndingConversions | undefined> {
+  await assertManagedCopyPresent(project);
+  return readLineEndingConversionsMarker(project);
+}
+
+export async function assertLineEndingsRestored(project: Pick<ProjectCopy, 'copyDirectory' | 'gitDirectory'>): Promise<void> {
   if (await readLineEndingConversions(project)) {
     throw new BridgeError('LINE_ENDINGS_UNRESTORED', 'Files converted to LF for the CLI have not regained their original line endings; this happens once its processes are confirmed to have ended');
   }
 }
 
-export async function clearLineEndingConversions(project: ProjectCopy): Promise<void> {
+export async function clearLineEndingConversions(project: { gitDirectory: string }): Promise<void> {
   await rm(path.join(project.gitDirectory, LINE_ENDINGS_MARKER_NAME), { force: true });
 }
 
@@ -284,7 +310,7 @@ async function lstatManagedEntry(target: string, kind: 'dir' | 'file', missingMe
   }
 }
 
-export async function assertManagedCopyPresent(project: ProjectCopy): Promise<void> {
+export async function assertManagedCopyPresent(project: Pick<ProjectCopy, 'copyDirectory' | 'gitDirectory'>): Promise<void> {
   await lstatManagedEntry(project.copyDirectory, 'dir', COPY_MISSING_MESSAGE);
   await lstatManagedEntry(project.gitDirectory, 'dir', BASELINE_MISSING_MESSAGE);
   await lstatManagedEntry(path.join(project.gitDirectory, 'HEAD'), 'file', BASELINE_MISSING_MESSAGE);
@@ -326,25 +352,69 @@ export async function stageProjectExecutionPolicy(project: ProjectCopy, request:
   project.executionStateDirectory = request.stateDirectory;
 }
 
+export async function handoffProjectExecutionPolicyWithProvenMcpConfig(project: ProjectCopy, request: ExecutionPolicyRequest, limits: ProjectLimits): Promise<void> {
+  if (!project.executionPolicy || !project.executionStateDirectory) {
+    throw new BridgeError('EXECUTION_POLICY_VERIFICATION_FAILED', 'Existing execution policy binding is required for proven MCP config handoff');
+  }
+  const snapshot = await snapshotCopyFiles(project, limits);
+  let bytes = 0;
+  for (const file of snapshot.keys()) bytes += (await lstat(await checkedPath(project.copyDirectory, file, true))).size;
+  project.executionPolicy = await handoffExecutionPolicyWithProvenMcpConfig(
+    project.copyDirectory,
+    { ...request, skillFiles: (project.providedSkills ?? []).flatMap(skill => skill.files.map(file => file.path)) },
+    { ...limits, maxCopyFiles: limits.maxCopyFiles - snapshot.size, maxCopyBytes: limits.maxCopyBytes - bytes },
+    project.executionPolicy,
+    project.executionStateDirectory,
+  );
+  project.executionStateDirectory = request.stateDirectory;
+}
+
 export async function discardProjectCopy(project: ProjectCopy): Promise<void> {
   await checkFenceMarker(project);
-  const root = await realpath(os.tmpdir());
   const targets: Array<[string, 'copy' | 'baseline']> = [
     [project.copyDirectory, 'copy'],
     [project.gitDirectory, 'baseline'],
   ];
-  for (const [directory, kind] of targets) {
-    const absolute = path.resolve(directory!);
-    if (path.relative(root, await realpath(path.dirname(absolute))) !== '' || !hasOwnedPrefix(path.basename(absolute), kind)) {
-      throw new BridgeError('UNSAFE_PROJECT_PATH', 'Refusing to delete a directory outside bridge temporary storage');
+  let ownedWorkspaceDir: string | undefined;
+  if (project.workspaceStateDirectory) {
+    const canonicalState = await realpath(project.workspaceStateDirectory);
+    for (const [directory, kind] of targets) {
+      const absolute = path.resolve(directory);
+      if (!isOwnedWorkspacePath(absolute, kind, [canonicalState], project.sourceDirectory)) {
+        throw new BridgeError('UNSAFE_PROJECT_PATH', 'Refusing to delete a directory outside bridge temporary storage');
+      }
+      await assertNoLinkAncestryAsync(absolute, canonicalState);
+      const info = await lstat(absolute).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw error;
+      });
+      if (info && (!info.isDirectory() || info.isSymbolicLink())) {
+        throw new BridgeError('UNSAFE_PROJECT_PATH', 'Refusing to delete a replaced copy directory');
+      }
     }
-    const info = await lstat(absolute).catch(error => {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-      throw error;
-    });
-    if (info && (!info.isDirectory() || info.isSymbolicLink())) throw new BridgeError('UNSAFE_PROJECT_PATH', 'Refusing to delete a replaced copy directory');
+    ownedWorkspaceDir = path.dirname(path.resolve(project.copyDirectory));
+  } else {
+    const root = await realpath(os.tmpdir());
+    for (const [directory, kind] of targets) {
+      const absolute = path.resolve(directory!);
+      if (path.relative(root, await realpath(path.dirname(absolute))) !== '' || !hasOwnedPrefix(path.basename(absolute), kind)) {
+        throw new BridgeError('UNSAFE_PROJECT_PATH', 'Refusing to delete a directory outside bridge temporary storage');
+      }
+      const info = await lstat(absolute).catch(error => {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw error;
+      });
+      if (info && (!info.isDirectory() || info.isSymbolicLink())) throw new BridgeError('UNSAFE_PROJECT_PATH', 'Refusing to delete a replaced copy directory');
+    }
   }
-  for (const [directory] of targets) await rm(path.resolve(directory!), { recursive: true, force: true });
+  for (const [directory] of targets) await rm(path.resolve(directory!), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  if (ownedWorkspaceDir) {
+    await rm(path.join(ownedWorkspaceDir, 'workspace.json'), { force: true }).catch(() => {});
+    const remaining = await readdir(ownedWorkspaceDir).catch(() => []);
+    if (remaining.length === 0) {
+      await rm(ownedWorkspaceDir, { recursive: true, force: true }).catch(() => {});
+    }
+  }
   if (project.executionPolicy) {
     if (!project.executionStateDirectory) throw new BridgeError('INVALID_AGENT_POLICY', 'Private execution storage binding is missing');
     await discardExecutionPolicy(project.executionPolicy, project.executionStateDirectory);
@@ -586,7 +656,16 @@ export async function copyVerifiedFile(
   }
 }
 
-export async function createProjectCopy(sourceDirectory: string, includePaths?: string[], onCreated?: (project: ProjectCopy) => void, limits: ProjectLimits = DEFAULT_PROJECT_LIMITS, skills: readonly ProvidedSkill[] = [], execution?: ExecutionPolicyRequest): Promise<ProjectCopy> {
+export async function createProjectCopy(
+  sourceDirectory: string,
+  includePaths?: string[],
+  onCreated?: (project: ProjectCopy) => void,
+  limits: ProjectLimits = DEFAULT_PROJECT_LIMITS,
+  skills: readonly ProvidedSkill[] = [],
+  execution?: ExecutionPolicyRequest,
+  workspace?: FixedWorkspaceOptions,
+): Promise<ProjectCopy> {
+  const prepareStartMs = performance.now();
   const unignored = await enumerateGitCandidates(sourceDirectory);
 
   let candidatesToScan: string[];
@@ -639,11 +718,68 @@ export async function createProjectCopy(sourceDirectory: string, includePaths?: 
     if (totalBytes > limits.maxCopyBytes) throw new BridgeError('COPY_LIMIT_EXCEEDED', `Copy exceeds ${limits.maxCopyBytes} bytes. Narrow includePaths.`);
   }
 
-  const copyDirectory = await mkdtemp(path.join(os.tmpdir(), 'black-gravity-copy-'));
-  const gitDirectory = await mkdtemp(path.join(os.tmpdir(), 'black-gravity-baseline-'));
+  const fixedWorkspace = workspace ? canonicalWorkspacePaths(workspace.stateDirectory, sourceDirectory) : undefined;
+  let copyDirectory: string;
+  let gitDirectory: string;
+  let existingCopy: Awaited<ReturnType<typeof lstat>> | undefined;
+  if (fixedWorkspace) {
+    await assertNoLinkAncestryAsync(fixedWorkspace.copyDirectory, fixedWorkspace.stateDirectory);
+    await assertNoLinkAncestryAsync(fixedWorkspace.gitDirectory, fixedWorkspace.stateDirectory);
+    const existingGit = await lstat(fixedWorkspace.gitDirectory).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (existingGit) {
+      if (!existingGit.isDirectory() || existingGit.isSymbolicLink()) {
+        throw new BridgeError('UNSAFE_PROJECT_PATH', 'Workspace baseline directory was replaced or linked');
+      }
+      await checkFenceMarker(fixedWorkspace);
+      const cleanupMarker = readProcessCleanupMarkerSync(fixedWorkspace);
+      if (cleanupMarker && cleanupMarker.entries.length > 0) {
+        throw new BridgeError('PROCESS_CLEANUP_UNVERIFIED', 'Cannot clean workspace while an unverified process cleanup marker is present');
+      }
+      if (await readLineEndingConversionsMarker(fixedWorkspace)) {
+        throw new BridgeError('LINE_ENDINGS_UNRESTORED', 'Cannot clean workspace while line endings remain unrestored');
+      }
+    }
+    existingCopy = await lstat(fixedWorkspace.copyDirectory).catch(error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    });
+    if (existingCopy) {
+      if (!existingCopy.isDirectory() || existingCopy.isSymbolicLink()) {
+        throw new BridgeError('UNSAFE_PROJECT_PATH', 'Workspace copy directory was replaced or linked');
+      }
+      await ensureFixedWorkspaceLpacPermissions(fixedWorkspace, sourceDirectory);
+    }
+    // Validate existing metadata before any destructive step; corrupted metadata fails closed before mutating bytes.
+    readWorkspaceMetadata(fixedWorkspace.metadataPath);
+    copyDirectory = fixedWorkspace.copyDirectory;
+    gitDirectory = fixedWorkspace.gitDirectory;
+  } else {
+    copyDirectory = await mkdtemp(path.join(os.tmpdir(), 'black-gravity-copy-'));
+    gitDirectory = await mkdtemp(path.join(os.tmpdir(), 'black-gravity-baseline-'));
+  }
   const baseline = new Map<string, string>();
-  const project: ProjectCopy = { sourceDirectory, copyDirectory, gitDirectory, baseline, includedFiles: selected, blockedFiles: preflight.blocked };
+  const project: ProjectCopy = {
+    sourceDirectory,
+    copyDirectory,
+    gitDirectory,
+    ...(fixedWorkspace ? { workspaceStateDirectory: fixedWorkspace.stateDirectory, lineageId: workspace!.lineageId } : {}),
+    baseline,
+    includedFiles: selected,
+    blockedFiles: preflight.blocked,
+  };
   try {
+    if (fixedWorkspace) {
+      // Atomically fence the previous occupant before the first destructive filesystem mutation.
+      invalidateWorkspaceOccupant(fixedWorkspace, sourceDirectory, 'prepare');
+      await emptyDirectoryContents(fixedWorkspace.copyDirectory, fixedWorkspace.stateDirectory);
+      await emptyDirectoryContents(fixedWorkspace.gitDirectory, fixedWorkspace.stateDirectory);
+      if (!existingCopy) {
+        await ensureFixedWorkspaceLpacPermissions(fixedWorkspace, sourceDirectory);
+      }
+    }
     onCreated?.(project);
     const budget = { remainingBytes: limits.maxCopyBytes };
     for (const relative of selected) {
@@ -668,6 +804,7 @@ export async function createProjectCopy(sourceDirectory: string, includePaths?: 
       }
     }
     await verifyManagedCopy(project);
+    const { scopeSha256 } = await verifyPreparedScopeAgainstOriginal(copyDirectory, baseline, managedAuxiliarySet(project));
     const scope = ['--git-dir=' + gitDirectory, '--work-tree=' + copyDirectory];
     await copyGit(project, [...scope, 'add', '-A', '-f', '--', '.', ...managedExclusions(project)]);
     await copyGit(project, [...scope,
@@ -675,12 +812,36 @@ export async function createProjectCopy(sourceDirectory: string, includePaths?: 
       '-c', 'user.email=bridge@invalid.local',
       'commit', '--quiet', '--allow-empty', '-m', 'baseline',
     ]);
+    const preparationMs = Math.round((performance.now() - prepareStartMs) * 1000) / 1000;
+    if (fixedWorkspace && workspace) {
+      const existingMeta = readWorkspaceMetadata(fixedWorkspace.metadataPath);
+      writeWorkspaceMetadata(fixedWorkspace.metadataPath, {
+        version: 1,
+        sourceDirectory,
+        rootKey: fixedWorkspace.rootKey,
+        currentTaskId: workspace.taskId,
+        currentLineageId: workspace.lineageId,
+        updatedAt: new Date().toISOString(),
+        lastPreparedDurationMs: preparationMs,
+        ...(existingMeta?.windowsLpac ? { windowsLpac: existingMeta.windowsLpac } : {}),
+      });
+      workspace.onPrepared?.({ preparationMs, scopeSha256 });
+    }
     return project;
   } catch (error) {
     if (error instanceof BridgeError && error.code === 'GIT_CLEANUP_UNVERIFIED') {
       throw error;
     }
-    await discardProjectCopy(project);
+    if (fixedWorkspace) {
+      await emptyDirectoryContents(fixedWorkspace.copyDirectory, fixedWorkspace.stateDirectory).catch(() => {});
+      await emptyDirectoryContents(fixedWorkspace.gitDirectory, fixedWorkspace.stateDirectory).catch(() => {});
+      if (project.executionPolicy && project.executionStateDirectory) {
+        await discardExecutionPolicy(project.executionPolicy, project.executionStateDirectory).catch(() => {});
+      }
+      invalidateWorkspaceOccupant(fixedWorkspace, sourceDirectory, 'prepare');
+    } else {
+      await discardProjectCopy(project);
+    }
     throw error;
   }
 }
@@ -1167,7 +1328,7 @@ export async function verifyReadOnlyCopy(project: ProjectCopy, baseline: Readonl
   }
 }
 
-function extractFilePatch(preview: ChangePreview, file: string): string {
+export function extractFilePatch(preview: ChangePreview, file: string): string {
   const index = preview.files.findIndex(change => change.path === file);
   if (index < 0) return '';
   // Both outputs come from the same Git diff and preserve its file order.

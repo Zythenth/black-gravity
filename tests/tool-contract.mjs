@@ -147,7 +147,10 @@ export const toolCases = [
   {
     name: 'black_gravity_handoff',
     args: c => ({ sourceTaskId: c.task, expectedContextSha256: c.context, prompt: 'Review the contract file.', role: 'reviewer' }),
-    check: async (result, c) => { await settle(c.client, result.task.taskId); },
+    check: async (result, c) => {
+      c.reviewer = result.task.taskId;
+      await settle(c.client, c.reviewer);
+    },
   },
   {
     name: 'black_gravity_compare',
@@ -182,7 +185,18 @@ export const toolCases = [
     },
   },
   { name: 'black_gravity_set_delivery_mode', args: c => ({ taskId: c.task, deliveryMode: 'messages' }) },
-  { name: 'black_gravity_send_message', args: c => ({ taskId: c.task, messageId: randomUUID(), text: 'Contract message.' }) },
+  {
+    name: 'black_gravity_send_message',
+    args: c => ({ taskId: c.reviewer, messageId: randomUUID(), text: 'Contract message.' }),
+    check: async (result, c) => {
+      assert.equal(result.receipt.taskId, c.reviewer, `[${c.scenario}] black_gravity_send_message: receipt taskId mismatch`);
+      assert.equal(result.receipt.state, 'sent', `[${c.scenario}] black_gravity_send_message: receipt state mismatch`);
+      assert.equal(typeof result.receipt.continuationTaskId, 'string', `[${c.scenario}] black_gravity_send_message: missing continuationTaskId`);
+      const continuation = await settle(c.client, result.receipt.continuationTaskId);
+      assert.equal(continuation.status, 'completed', `[${c.scenario}] black_gravity_send_message: ${JSON.stringify(continuation.error)}`);
+      assert.equal(continuation.parentTaskId, c.reviewer, `[${c.scenario}] black_gravity_send_message: continuation parentTaskId mismatch`);
+    },
+  },
   { name: 'black_gravity_integrate', args: c => ({ taskId: c.testTask, expectedSha256: c.sha }) },
   { name: 'black_gravity_cancel', args: c => ({ taskId: c.task }) },
   {

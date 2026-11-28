@@ -162,13 +162,13 @@ test('modified hook blocks success even when CLI result says SUCCESS', async () 
     assert.equal(task.status, 'failed'); assert.equal(task.error?.code, 'EXECUTION_POLICY_VERIFICATION_FAILED');
   });
 });
-test('handoff restages controls for a separate copy and preserves context tree hash', async () => {
+test('handoff restages controls on the canonical workspace with distinct receipts and preserves context tree hash', async () => {
   await fixture(async ({ source, tasks, config }) => {
     const first = await end(tasks, await tasks.run({ prompt: 'Write fixture.', workingDirectory: source, allowedTools: ['view_file', 'write_to_file'] })); assert.equal(first.status, 'completed');
     const context = await tasks.context(first.taskId); const next = await end(tasks, await tasks.run({ prompt: 'Review fixture.', workingDirectory: source, contextTaskId: first.taskId, expectedContextSha256: context.treeSha256, role: 'reviewer' }));
-    assert.equal(next.status, 'completed', JSON.stringify(next.error)); assert.notEqual(next.copyDirectory, first.copyDirectory); assert.deepEqual(next.agentPolicy!.nativeTools, ['view_file', 'finish']);
+    assert.equal(next.status, 'completed', JSON.stringify(next.error)); assert.equal(next.copyDirectory, first.copyDirectory); assert.deepEqual(next.agentPolicy!.nativeTools, ['view_file', 'finish']);
     const saved = new StateStore(config.stateDirectory).load(), a = saved.find(t => t.record.taskId === first.taskId)!.project!, b = saved.find(t => t.record.taskId === next.taskId)!.project!;
-    assert.equal(await fingerprintProjectCopy(a, config), await fingerprintProjectCopy(b, config)); assert.notEqual(a.executionPolicy!.receiptPath, b.executionPolicy!.receiptPath);
+    assert.equal((await tasks.context(next.taskId)).treeSha256, context.treeSha256); assert.equal((await tasks.context(first.taskId)).treeSha256, await fingerprintProjectCopy(b, config)); assert.notEqual(a.executionPolicy!.receiptPath, b.executionPolicy!.receiptPath);
   });
 });
 test('restart honors policy snapshot and rejects a revoked human ceiling before provider execution', async () => {

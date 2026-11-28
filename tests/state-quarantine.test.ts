@@ -113,6 +113,8 @@ test('A: copy-outside-temporary-directory quarantines only bad task, refuses ope
     const badFile = path.join(fixture.stateDirectory, `${bad.taskId}.json`);
     const badSnapshot = JSON.parse(await readFile(badFile, 'utf8')) as SnapshotFile;
     badSnapshot.project!.copyDirectory = decoyCopy;
+    badSnapshot.project!.gitDirectory = path.join(decoyParent, 'black-gravity-baseline-decoy');
+    badSnapshot.record.copyDirectory = decoyCopy;
     await writeFile(badFile, JSON.stringify(badSnapshot));
 
     const recovered = new TaskManager(fixture.adapter, fixture.config);

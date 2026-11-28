@@ -192,6 +192,31 @@ const MCP_PERMISSION_RE = /no output produced[^\r\n]{0,200}["']mcp["'][^\r\n]{0,
 const SOFT_DENIAL_RE = /permission check failed|tool(?:\s+call|\s+execution)?\s+(?:was\s+)?denied|(?:soft\s+)?tool\s+denial|(?:action|command|operation)\s+(?:was\s+)?denied\s+(?:by\s+(?:the\s+)?(?:pre-?tool\s+hook|execution\s+policy|hook|policy|sandbox|security|user|headless|agy|\bmcp\b|permission\s+(?:check|policy))|in\s+(?:headless|non-?interactive)\s+mode)|(?:headless|non-?interactive|agy|pre-?tool\s+hook|execution\s+policy|sandbox|\bmcp\b)[^\r\n]{0,200}(?:confirmation|approval|permission)\s+(?:required|denied|rejected)|(?:confirmation|approval|permission)\s+(?:required|denied|rejected)[^\r\n]{0,200}(?:headless|non-?interactive|pre-?tool\s+hook|execution\s+policy|sandbox|agy|\bmcp\b)|headless\s+mode\s+cannot\s+(?:prompt|request)\s+(?:for\s+)?(?:permission|approval|confirmation)|user\s+denied\s+(?:permission|the\s+tool|tool\s+execution)|denied\s+by\s+(?:the\s+)?(?:pre-?tool\s+hook|execution\s+policy|hook|policy|sandbox|security|user|headless|agy|\bmcp\b|permission\s+(?:check|policy))|(?:not\s+allowed|blocked)\s+by\s+(?:the\s+)?(?:bridge\s+)?(?:pre-?tool\s+hook|execution\s+policy|hook|policy|sandbox|security|headless|agy|\bmcp\b)|failed to prompt user for /i;
 const SOFT_TOOL_STATES = new Set(['DENIED', 'BLOCKED', 'REJECTED', 'CANCELED', 'CANCELLED']);
 const HOOK_READ_DENIAL_RE = /^(?:tool (?:call|execution) )?denied by (?:the )?pre-?tool hook: ([^\r\n\u0085\u2028\u2029]*)$/i;
+const NON_ABSENT_PROVIDER_ERROR_RE = /\b(?:unauthenticated|unauthorized|authentication|not\s+logged\s+in|login\s+required|invalid\s+credentials?|token\s+expired|access\s+denied|forbidden|permission\s+denied|quota|rate\s*limit|too\s+many\s+requests|429|401|403|500|502|503|504|internal\s+server\s+error|service\s+unavailable|bad\s+gateway|timed?\s*out|econnrefused|enotfound|network\s+error)\b/i;
+
+function escapeRegexLiteral(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+export function classifyConversationNotFound(text: string, expectedConversationId: string): BridgeError | undefined {
+  const trimmed = text.trim();
+  const expected = expectedConversationId.trim();
+  if (!trimmed || !expected) return undefined;
+  if (CliAdapter.authError(trimmed) || classifyCliTextError(trimmed, 'stderr') !== undefined || NON_ABSENT_PROVIDER_ERROR_RE.test(trimmed)) {
+    return undefined;
+  }
+  const escapedId = escapeRegexLiteral(expected);
+  const idToken = `(?<![a-zA-Z0-9_-])${escapedId}(?![a-zA-Z0-9_-])`;
+  const patterns = [
+    new RegExp(`\\bconversation\\s+(?:id\\s+)?['"\`]?${idToken}['"\`]?\\s+(?:not\\s+found|does\\s+not\\s+exist|was\\s+not\\s+found|no\\s+longer\\s+exists?|cannot\\s+be\\s+found|could\\s+not\\s+be\\s+found|is\\s+missing|is\\s+unavailable|expired|deleted)\\b`, 'i'),
+    new RegExp(`\\b(?:no\\s+such|unknown|missing|cannot\\s+find|could\\s+not\\s+find|failed\\s+to\\s+(?:find|load|resume))\\s+conversation(?:\\s+id)?[\\s:]+['"\`]?${idToken}['"\`]?`, 'i'),
+    new RegExp(`\\bconversation\\s+(?:not\\s+found|does\\s+not\\s+exist|was\\s+not\\s+found|no\\s+longer\\s+exists?|unknown|missing|expired|deleted)\\s*[:(]\\s*(?:id\\s*[:=]?\\s*)?['"\`]?${idToken}['"\`]?`, 'i'),
+  ];
+  if (!patterns.some(pattern => pattern.test(trimmed))) return undefined;
+  // Verify exact case-sensitive occurrence of the requested conversation ID.
+  if (!new RegExp(idToken).test(trimmed)) return undefined;
+  return new BridgeError('AGY_CONVERSATION_NOT_FOUND', redactDiagnostic(trimmed).slice(0, 1000));
+}
 
 function isSoleHookDenial(text: string): boolean {
   const match = HOOK_READ_DENIAL_RE.exec(text.trim());
@@ -526,6 +551,9 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
     let observedDenial: BridgeError | undefined;
     let deniedReadTotal = 0;
     const deniedReadItems: DeniedRead[] = [];
+    let anyStepEvent = false;
+    let anyToolStep = false;
+    let anyResponseText = false;
     const redactor = new ResponseRedactor();
 
     const recordHookFailure = (error: unknown) => {
@@ -583,6 +611,7 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
         return;
       }
       if (sourceType === 'step_update' && raw.step_update && typeof raw.step_update === 'object') {
+        anyStepEvent = true;
         const step = raw.step_update as Record<string, unknown>;
         const sourceStep = source.step_update as Record<string, unknown>;
         if (typeof step.step_index === 'number') {
@@ -591,6 +620,7 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
         if (step.step_type === 'agent_response' && Number.isSafeInteger(step.step_index)) {
           const index = step.step_index as number;
           if (typeof sourceStep.text_delta === 'string') {
+            if (sourceStep.text_delta.length > 0) anyResponseText = true;
             hooks?.onRawResponseDelta?.(index, sourceStep.text_delta);
             const released = redactor.releaseDelta(index, sourceStep.text_delta, step.state === 'DONE', (stepIdx, maxPendingChars) => {
               hooks?.onEvent?.('response.truncated', { step_index: stepIdx, maxPendingChars });
@@ -607,6 +637,7 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
         let type = 'step.update';
         let eventData: Record<string, unknown> = step;
         if (step.step_type === 'tool') {
+          anyToolStep = true;
           const result = this.handleToolStep(step, hooks);
           type = result.type;
           eventData = result.eventData;
@@ -873,13 +904,52 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
       };
     }
 
+    const requestedSessionId = request.session?.id;
+    const hasResultOutput = Boolean(
+      resultFrame &&
+      ((typeof resultFrame.response === 'string' && resultFrame.response.trim().length > 0) ||
+        resultFrame.structured_output !== undefined),
+    );
+    const combinedDiagnostic = [
+      stderr,
+      explicitNonEmptyString(resultFrame?.error) ?? '',
+      explicitNonEmptyString(resultFrame?.reason) ?? '',
+    ].filter(Boolean).join('\n');
+    const hasHigherPriorityError = Boolean(
+      observedDenial ||
+      (combinedDiagnostic && (
+        CliAdapter.authError(combinedDiagnostic) ||
+        classifyCliTextError(combinedDiagnostic, 'stderr') !== undefined ||
+        NON_ABSENT_PROVIDER_ERROR_RE.test(combinedDiagnostic)
+      )),
+    );
+    const canClassifyAbsentConversation = Boolean(
+      requestedSessionId &&
+      !anyStepEvent &&
+      !anyToolStep &&
+      !anyResponseText &&
+      !hasResultOutput &&
+      parseErrors === 0 &&
+      !uninspectedStdoutLoss &&
+      !uninspectedStderrLoss &&
+      !hasHigherPriorityError &&
+      (sessionId === undefined || sessionId === requestedSessionId),
+    );
+
     if (resultFrame && explicitNonEmptyString(resultFrame.error)) {
       const errText = explicitNonEmptyString(resultFrame.error)!;
       const classified = classifyCliTextError(errText, 'result');
+      const absentConversation = !classified && canClassifyAbsentConversation && requestedSessionId
+        ? classifyConversationNotFound(errText, requestedSessionId)
+        : undefined;
       return {
         ...common,
         status: 'failed',
-        error: classified ? toResultError(classified) : { code: 'AGY_PROCESS_FAILED', message: redactDiagnostic(errText) },
+        error: classified
+          ? toResultError(classified)
+          : absentConversation
+            ? toResultError(absentConversation)
+            : { code: 'AGY_PROCESS_FAILED', message: redactDiagnostic(errText) },
       };
     }
 
@@ -888,8 +958,19 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
     }
 
     if (!resultFrame) {
-      const fallbackMessage = stderr.trim()
-        ? redactDiagnostic(stderr.trim())
+      const stderrText = stderr.trim();
+      const absentConversation = canClassifyAbsentConversation && requestedSessionId && stderrText
+        ? classifyConversationNotFound(stderrText, requestedSessionId)
+        : undefined;
+      if (absentConversation) {
+        return {
+          ...common,
+          status: 'failed',
+          error: toResultError(absentConversation),
+        };
+      }
+      const fallbackMessage = stderrText
+        ? redactDiagnostic(stderrText)
         : `agy exited with code ${exitCode} without emitting a result event`;
       return {
         ...common,
@@ -900,6 +981,16 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
 
     if (exactStatus !== 'SUCCESS') {
       const extraReason = explicitNonEmptyString(resultFrame.reason) ?? explicitNonEmptyString(stderr);
+      const absentConversation = canClassifyAbsentConversation && requestedSessionId && extraReason
+        ? classifyConversationNotFound(extraReason, requestedSessionId)
+        : undefined;
+      if (absentConversation) {
+        return {
+          ...common,
+          status: 'failed',
+          error: toResultError(absentConversation),
+        };
+      }
       const message = extraReason
         ? `CLI ended with non-SUCCESS status ${statusLabel}: ${redactDiagnostic(extraReason)}`
         : `CLI ended with non-SUCCESS status ${statusLabel}`;
@@ -914,6 +1005,16 @@ export class AgyExecutionAdapter implements ExecutionAdapter {
     }
 
     if (exitCode !== 0) {
+      const absentConversation = canClassifyAbsentConversation && requestedSessionId && detailReason
+        ? classifyConversationNotFound(detailReason, requestedSessionId)
+        : undefined;
+      if (absentConversation) {
+        return {
+          ...common,
+          status: 'failed',
+          error: toResultError(absentConversation),
+        };
+      }
       return {
         ...common,
         status: 'failed',

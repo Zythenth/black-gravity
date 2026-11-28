@@ -149,7 +149,7 @@ test('resume and handoff preserve exact snapshots after memory replacement, dele
     assert.equal(adapter.calls[1]!.options.memorySnapshots![0]!.text, 'ORIGINAL_SNAPSHOT_74B');
     const context = await resumed.context(next.taskId);
     const handoff = await finished(resumed, await resumed.run({ prompt: 'Transfer.', workingDirectory: source, mode: 'read-only', contextTaskId: next.taskId, expectedContextSha256: context.treeSha256 }));
-    assert.notEqual(handoff.copyDirectory, next.copyDirectory);
+    assert.equal(handoff.copyDirectory, next.copyDirectory);
     assert.deepEqual(handoff.memory, first.memory);
     assert.equal(adapter.calls[2]!.options.memorySnapshots![0]!.text, 'ORIGINAL_SNAPSHOT_74B');
     const nextContext = await resumed.context(handoff.taskId);

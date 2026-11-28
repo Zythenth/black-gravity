@@ -145,7 +145,21 @@ export interface TestEvidence {
   portableNode?: PortableNodeIdentity;
 }
 
+export interface ResumeContext {
+  hasConversation: boolean;
+  previousTaskId: string;
+  previousStatus: TaskStatus;
+  knownCause?: string;
+  doneFiles?: string[];
+  remainingSummary?: string;
+}
+
 export interface RunOptions extends AgentPolicySelection {
+  resumeContext?: ResumeContext;
+  resumeFromTaskId?: string;
+  parentCheckpointTaskId?: string;
+  parentArchiveSha256?: string;
+  handoffArchiveSha256?: string;
   peerContext?: PeerContext;
   peerOrigin?: PeerOrigin;
   groupAdmission?: GroupAdmission;

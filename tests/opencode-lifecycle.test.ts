@@ -1744,10 +1744,12 @@ test('L15) repairs and later launches cannot confirm over an earlier unverified 
     },
   };
 
-  const tasks2 = ws.track(new TaskManager(cli, ws.config, multiLaunchAdapter));
+  const ws2 = createWorkspace(t);
+  const cli2 = new OpenCodeTestCliAdapter(ws2.config);
+  const tasks2 = ws2.track(new TaskManager(cli2, ws2.config, multiLaunchAdapter));
   const multiQueued = await tasks2.run({
     prompt: 'Two launches in one execution',
-    workingDirectory: ws.repoDir,
+    workingDirectory: ws2.repoDir,
     mode: 'write',
     model: 'opencode-go/mock-flash',
   });
@@ -1755,10 +1757,11 @@ test('L15) repairs and later launches cannot confirm over an earlier unverified 
   assert.equal(second.status, 'completed');
   assert.equal(second.processCleanup?.verified, true);
 
-  const storedSecond = new StateStore(ws.stateDir).load().find(item => item.record.taskId === second.taskId);
+  const storedSecond = new StateStore(ws2.stateDir).load().find(item => item.record.taskId === second.taskId);
   assert.ok(storedSecond?.project?.gitDirectory);
   const secondMarkerFile = path.join(storedSecond.project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME);
   assert.equal(existsSync(secondMarkerFile), true);
+  assert.equal(existsSync(markerFile), true);
 
   await assert.rejects(
     () => tasks2.preview(second.taskId),
@@ -1916,15 +1919,20 @@ test('L17) QUEUE_FULL caused by unconfirmed cleanup names the task and says disc
       && err.message.includes('discard'),
   );
 
-  await tasks2.discard(first.taskId);
-  const secondQueued = await tasks2.run({
-    prompt: 'Accepted after discard',
-    workingDirectory: ws.repoDir,
-    mode: 'read-only',
-    model: 'opencode-go/mock-flash',
-  });
-  const second = await waitForTask(tasks2, secondQueued.taskId);
-  assert.equal(second.status, 'completed');
+  const storedFirst = new StateStore(ws.stateDir).load().find(item => item.record.taskId === first.taskId);
+  assert.ok(storedFirst?.project?.gitDirectory);
+  const markerFile = path.join(storedFirst.project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME);
+  const markerBefore = readFileSync(markerFile, 'utf8');
+  const snapshotBefore = readFileSync(path.join(ws.stateDir, `${first.taskId}.json`), 'utf8');
+
+  await assert.rejects(
+    () => tasks2.discard(first.taskId),
+    err => err instanceof BridgeError && err.code === 'PROCESS_CLEANUP_UNVERIFIED',
+  );
+  assert.equal(readFileSync(markerFile, 'utf8'), markerBefore);
+  assert.equal(readFileSync(path.join(ws.stateDir, `${first.taskId}.json`), 'utf8'), snapshotBefore);
+  assert.equal(tasks2.status(first.taskId).discardedAt, undefined);
+  assert.equal(existsSync(first.copyDirectory!), true);
 });
 
 test('L18) cancel during resume session list stops the tracked tree and records cleanup', async t => {
@@ -2324,6 +2332,7 @@ test('L22) a marker written by another bridge instance under the copy lock block
 
   const B = ws.track(new TaskManager(cli, ws.config, createUnverifiedResumeAdapter(first.sessionId, 940_022)));
   let bDone = false;
+  let secondTaskId: string | undefined;
   const aInternal = A as unknown as {
     withProject: (project: unknown, operation: () => Promise<unknown>, options?: unknown) => Promise<unknown>;
   };
@@ -2336,6 +2345,7 @@ test('L22) a marker written by another bridge instance under the copy lock block
         first.taskId,
       );
       const second = await waitForTask(B, secondQueued.taskId);
+      secondTaskId = second.taskId;
       assert.equal(second.status, 'completed');
       assert.equal(second.processCleanup?.verified, false);
     }
@@ -2347,6 +2357,7 @@ test('L22) a marker written by another bridge instance under the copy lock block
     err => err instanceof BridgeError && err.code === 'PROCESS_CLEANUP_UNVERIFIED',
   );
   assert.equal(bDone, true);
+  assert.ok(secondTaskId);
   assert.equal(readFileSync(path.join(ws.repoDir, 'README.md'), 'utf8'), 'hello\n');
 
   await assert.rejects(
@@ -2358,8 +2369,24 @@ test('L22) a marker written by another bridge instance under the copy lock block
     err => err instanceof BridgeError && err.code === 'PROCESS_CLEANUP_UNVERIFIED',
   );
 
-  const discarded = await A.discard(first.taskId);
-  assert.ok(discarded.discardedAt);
+  const storedFirst = new StateStore(ws.stateDir).load().find(item => item.record.taskId === first.taskId);
+  assert.ok(storedFirst?.project?.gitDirectory);
+  const markerFile = path.join(storedFirst.project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME);
+  const markerBefore = readFileSync(markerFile, 'utf8');
+  const firstSnapshotBefore = readFileSync(path.join(ws.stateDir, `${first.taskId}.json`), 'utf8');
+  const secondSnapshotBefore = readFileSync(path.join(ws.stateDir, `${secondTaskId}.json`), 'utf8');
+  const copyBytesBefore = readFileSync(path.join(first.copyDirectory, 'README.md'), 'utf8');
+
+  await assert.rejects(
+    () => A.discard(first.taskId),
+    err => err instanceof BridgeError && err.code === 'PROCESS_CLEANUP_UNVERIFIED',
+  );
+  assert.equal(readFileSync(markerFile, 'utf8'), markerBefore);
+  assert.equal(readFileSync(path.join(ws.stateDir, `${first.taskId}.json`), 'utf8'), firstSnapshotBefore);
+  assert.equal(readFileSync(path.join(ws.stateDir, `${secondTaskId}.json`), 'utf8'), secondSnapshotBefore);
+  assert.equal(readFileSync(path.join(first.copyDirectory, 'README.md'), 'utf8'), copyBytesBefore);
+  assert.equal(A.status(first.taskId).discardedAt, undefined);
+  assert.equal(A.status(secondTaskId).discardedAt, undefined);
 });
 
 test('L23) a confirmed agy reconciliation marks the record verified and frees the retention slot', async t => {
@@ -2535,7 +2562,7 @@ test('L25) retention eviction rereads the marker under the copy lock and keeps a
   }
 });
 
-test('L26) automatic cleanup discards an agy-only copy whose cleanup was not confirmed', async t => {
+test('L26) incomplete tracked cleanup retains state and blocks reuse until valid reconciliation releases the root', async t => {
   const ws = createWorkspace(t);
   const cli = new CliAdapter(ws.config, [MOCK_AGY]);
   const discovery = await cli.discover();
@@ -2555,7 +2582,7 @@ test('L26) automatic cleanup discards an agy-only copy whose cleanup was not con
     record: TaskRecord;
     project: { gitDirectory: string };
   };
-  snapshot1.record.processCleanup = { verified: false, spawnedAt: now1, checkedAt: now1, remaining: 0 };
+  snapshot1.record.processCleanup = { verified: false, spawnedAt: now1, checkedAt: now1, remaining: 0, containment: 'tracked' };
   delete snapshot1.record.pid;
   writeFileSync(snapshotPath1, JSON.stringify(snapshot1), 'utf8');
   upsertProcessCleanupMarkerEntrySync(snapshot1.project, {
@@ -2563,13 +2590,24 @@ test('L26) automatic cleanup discards an agy-only copy whose cleanup was not con
     taskId: completed1.taskId,
     provider: 'agy',
     spawnedAt: now1,
+    containment: 'tracked',
   });
+  const marker1Path = path.join(snapshot1.project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME);
+  const bytes1Before = readFileSync(path.join(completed1.copyDirectory, 'BLACK_GRAVITY_TEST.md'), 'utf8');
 
   const tasks2 = ws.track(new TaskManager(cli, ws.config));
   const cleaned1 = await tasks2.cleanup(Date.now() + 365 * 24 * 3600_000);
-  assert.equal(cleaned1.discardedTaskIds.includes(completed1.taskId), true);
-  assert.equal(existsSync(completed1.copyDirectory), false);
-  assert.equal(typeof tasks2.status(completed1.taskId).discardedAt, 'string');
+  assert.equal(cleaned1.discardedTaskIds.includes(completed1.taskId), false);
+  assert.equal(existsSync(completed1.copyDirectory), true);
+  assert.equal(existsSync(marker1Path), true);
+  assert.equal(readFileSync(path.join(completed1.copyDirectory, 'BLACK_GRAVITY_TEST.md'), 'utf8'), bytes1Before);
+  assert.equal(tasks2.status(completed1.taskId).discardedAt, undefined);
+  const tasksBeforeRefused1 = tasks2.list().length;
+  await assert.rejects(
+    () => tasks2.run({ prompt: 'write:l26-blocked-1', workingDirectory: ws.repoDir, mode: 'write' }),
+    err => err instanceof BridgeError && err.code === 'PROCESS_CLEANUP_UNVERIFIED',
+  );
+  assert.equal(tasks2.list().length, tasksBeforeRefused1);
   await tasks2.shutdown();
 
   const sleeper = spawn(process.execPath, ['-e', 'setTimeout(()=>{},60000)'], {
@@ -2595,7 +2633,7 @@ test('L26) automatic cleanup discards an agy-only copy whose cleanup was not con
       project: { gitDirectory: string };
     };
     snapshot.record.pid = pid;
-    snapshot.record.processCleanup = { verified: false, spawnedAt, checkedAt: spawnedAt, remaining: 1 };
+    snapshot.record.processCleanup = { verified: false, spawnedAt, checkedAt: spawnedAt, remaining: 1, containment: 'tracked' };
     writeFileSync(snapshotPath, JSON.stringify(snapshot), 'utf8');
     upsertProcessCleanupMarkerEntrySync(snapshot.project, {
       launchId,
@@ -2603,56 +2641,68 @@ test('L26) automatic cleanup discards an agy-only copy whose cleanup was not con
       provider: 'agy',
       pid,
       spawnedAt,
+      containment: 'tracked',
     });
   };
 
-  const tasks3 = ws.track(new TaskManager(cli, ws.config));
-  const queued2 = await tasks3.run({ prompt: 'write:l26', workingDirectory: ws.repoDir, mode: 'write' });
+  const wsLive = createWorkspace(t);
+  const cliLive = new CliAdapter(wsLive.config, [MOCK_AGY]);
+  assert.equal((await cliLive.discover()).installed, true);
+  const tasks3 = wsLive.track(new TaskManager(cliLive, wsLive.config));
+  const queued2 = await tasks3.run({ prompt: 'write:l26', workingDirectory: wsLive.repoDir, mode: 'write' });
   const completed2 = await waitForTask(tasks3, queued2.taskId);
   assert.equal(completed2.status, 'completed');
   assert.equal(completed2.execution?.provider, 'agy');
   assert.ok(completed2.copyDirectory);
   await tasks3.shutdown();
 
-  markUnverifiedWithPid(ws.stateDir, completed2.taskId, sleeperPid, 'l26-launch-live-pid');
+  markUnverifiedWithPid(wsLive.stateDir, completed2.taskId, sleeperPid, 'l26-launch-live-pid');
+  const bytes2Before = readFileSync(path.join(completed2.copyDirectory, 'BLACK_GRAVITY_TEST.md'), 'utf8');
 
-  const tasks4 = ws.track(new TaskManager(cli, ws.config));
+  const tasks4 = wsLive.track(new TaskManager(cliLive, wsLive.config));
   const cleaned2 = await tasks4.cleanup(Date.now() + 365 * 24 * 3600_000);
-  assert.equal(cleaned2.discardedTaskIds.includes(completed2.taskId), true);
-  assert.equal(existsSync(completed2.copyDirectory), false);
-  assert.equal(typeof tasks4.status(completed2.taskId).discardedAt, 'string');
+  assert.equal(cleaned2.discardedTaskIds.includes(completed2.taskId), false);
+  assert.equal(existsSync(completed2.copyDirectory), true);
+  assert.equal(readFileSync(path.join(completed2.copyDirectory, 'BLACK_GRAVITY_TEST.md'), 'utf8'), bytes2Before);
+  assert.equal(tasks4.status(completed2.taskId).discardedAt, undefined);
+  assert.doesNotThrow(() => process.kill(process.platform === 'win32' ? sleeperPid : -sleeperPid, 0));
+  const tasksBeforeRefused2 = tasks4.list().length;
+  await assert.rejects(
+    () => tasks4.run({ prompt: 'write:l26-blocked-2', workingDirectory: wsLive.repoDir, mode: 'write' }),
+    err => err instanceof BridgeError && err.code === 'PROCESS_CLEANUP_UNVERIFIED',
+  );
+  assert.equal(tasks4.list().length, tasksBeforeRefused2);
   assert.doesNotThrow(() => process.kill(process.platform === 'win32' ? sleeperPid : -sleeperPid, 0));
   await tasks4.shutdown();
 
-  const ws2 = createWorkspace(t);
-  const cli2 = new CliAdapter(ws2.config, [MOCK_AGY]);
-  const discovery2 = await cli2.discover();
-  assert.equal(discovery2.installed, true, discovery2.error ?? 'mock agy was not discovered');
+  // Valid reconciliation releases the root, after which a new task is accepted.
+  const ended = spawnSync(process.execPath, ['-e', ''], { stdio: 'ignore' });
+  assert.ok(ended.pid && ended.pid > 0);
+  const snapLivePath = path.join(wsLive.stateDir, `${completed2.taskId}.json`);
+  const snapLive = JSON.parse(readFileSync(snapLivePath, 'utf8')) as {
+    record: TaskRecord;
+    project: { gitDirectory: string };
+  };
+  const endedSpawnedAt = new Date(Date.now() - 1_000).toISOString();
+  snapLive.record.pid = ended.pid;
+  snapLive.record.processCleanup = { verified: false, spawnedAt: endedSpawnedAt, checkedAt: endedSpawnedAt, remaining: 1, containment: 'tracked' };
+  writeFileSync(snapLivePath, JSON.stringify(snapLive), 'utf8');
+  writeFileSync(
+    path.join(snapLive.project.gitDirectory, PROCESS_CLEANUP_MARKER_NAME),
+    JSON.stringify({
+      version: 1,
+      entries: [{ launchId: 'l26-launch-reconcilable', taskId: completed2.taskId, provider: 'agy', pid: ended.pid, spawnedAt: endedSpawnedAt, containment: 'tracked' }],
+    }),
+    'utf8',
+  );
 
-  const tasks5 = ws2.track(new TaskManager(cli2, ws2.config));
-  const retainedQueued = await tasks5.run({ prompt: 'write:l26-retained', workingDirectory: ws2.repoDir, mode: 'write' });
-  const retained = await waitForTask(tasks5, retainedQueued.taskId);
-  assert.equal(retained.status, 'completed');
-  assert.equal(retained.execution?.provider, 'agy');
-  assert.ok(retained.copyDirectory);
-  await tasks5.shutdown();
-
-  markUnverifiedWithPid(ws2.stateDir, retained.taskId, sleeperPid, 'l26-launch-retained-pid');
-
-  const limitedConfig = loadConfig({
-    BRIDGE_STATE_DIRECTORY: ws2.stateDir,
-    BRIDGE_TEST_EXECUTOR: 'agy',
-    AGY_PATH: process.execPath,
-    MAX_RETAINED_TASKS: '1',
-  });
-  const limitedCli = new CliAdapter(limitedConfig, [MOCK_AGY]);
-  assert.equal((await limitedCli.discover()).installed, true);
-  const tasks6 = ws2.track(new TaskManager(limitedCli, limitedConfig));
-  const nextQueued = await tasks6.run({ prompt: 'write:l26-next', workingDirectory: ws2.repoDir, mode: 'write' });
-  const next = await waitForTask(tasks6, nextQueued.taskId);
+  const tasks5 = wsLive.track(new TaskManager(cliLive, wsLive.config));
+  const released = await tasks5.cleanup(Date.now() + 365 * 24 * 3600_000);
+  assert.equal(released.discardedTaskIds.includes(completed2.taskId), true);
+  assert.equal(existsSync(completed2.copyDirectory), false);
+  const nextQueued = await tasks5.run({ prompt: 'write:l26-next', workingDirectory: wsLive.repoDir, mode: 'write' });
+  const next = await waitForTask(tasks5, nextQueued.taskId);
   assert.equal(next.status, 'completed');
-  assert.equal(tasks6.list().some(task => task.taskId === retained.taskId), false);
-  assert.equal(existsSync(retained.copyDirectory), false);
   assert.doesNotThrow(() => process.kill(process.platform === 'win32' ? sleeperPid : -sleeperPid, 0));
 });
 

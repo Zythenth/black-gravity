@@ -508,9 +508,11 @@ internal static class WindowsNullHarness
 
                     string tempDir = Path.GetTempPath().TrimEnd(Path.DirectorySeparatorChar);
                     string fixtureId = Guid.NewGuid().ToString("N");
+                    string stateDir = Path.Combine(tempDir, "black-gravity-state-null-" + fixtureId);
                     string cwd = Path.Combine(tempDir, "black-gravity-copy-null-" + fixtureId);
                     string runtime = Path.Combine(tempDir, "black-gravity-runtime-null-" + fixtureId);
                     string scratch = Path.Combine(tempDir, "black-gravity-scratch-null-" + fixtureId);
+                    Directory.CreateDirectory(stateDir);
                     Directory.CreateDirectory(cwd);
                     Directory.CreateDirectory(runtime);
                     Directory.CreateDirectory(scratch);
@@ -535,7 +537,7 @@ internal static class WindowsNullHarness
                         Array emptyGrants = Array.CreateInstance(grantType, 0);
                         leaseType.GetField("grants").SetValue(leaseV1, emptyGrants);
 
-                        validateLease.Invoke(null, new object[] { leaseV1, leaseFileName });
+                        validateLease.Invoke(null, new object[] { leaseV1, leaseFileName, stateDir });
 
                         // Version 2 lease with nullDeviceGrant = true must be rejected
                         leaseType.GetField("version").SetValue(leaseV1, 2);
@@ -563,7 +565,7 @@ internal static class WindowsNullHarness
                         bool legacyWithGrantRejected = false;
                         try
                         {
-                            validateLease.Invoke(null, new object[] { leaseV1, leaseFileName });
+                            validateLease.Invoke(null, new object[] { leaseV1, leaseFileName, stateDir });
                         }
                         catch (TargetInvocationException ex)
                         {
@@ -575,17 +577,18 @@ internal static class WindowsNullHarness
                         // Version 3 lease with nullDeviceGrant = true must be accepted
                         leaseType.GetField("jobCreated").SetValue(leaseV1, false);
                         leaseType.GetField("version").SetValue(leaseV1, 3);
-                        validateLease.Invoke(null, new object[] { leaseV1, leaseFileName });
+                        validateLease.Invoke(null, new object[] { leaseV1, leaseFileName, stateDir });
 
                         // Version 3 lease with nullDeviceGrant = false must be accepted
                         leaseType.GetField("nullDeviceGrant").SetValue(leaseV1, false);
-                        validateLease.Invoke(null, new object[] { leaseV1, leaseFileName });
+                        validateLease.Invoke(null, new object[] { leaseV1, leaseFileName, stateDir });
                     }
                     finally
                     {
                         try { Directory.Delete(cwd); } catch {}
                         try { Directory.Delete(runtime); } catch {}
                         try { Directory.Delete(scratch); } catch {}
+                        try { Directory.Delete(stateDir); } catch {}
                     }
 
                     Console.WriteLine("pass:lease-validation");

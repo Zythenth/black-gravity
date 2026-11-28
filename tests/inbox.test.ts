@@ -48,7 +48,13 @@ async function fixture(hold = true, configOverrides: Record<string, string> = {}
     await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
   } };
 }
-async function until(check: () => boolean) { const deadline = Date.now() + 15000; while (!check()) { if (Date.now() >= deadline) throw new Error('Condition was not reached'); await delay(10); } }
+async function until(check: () => boolean, diagnostics?: () => unknown) {
+  const deadline = Date.now() + 15000;
+  while (!check()) {
+    if (Date.now() >= deadline) throw new Error('Condition was not reached' + (diagnostics ? ': ' + JSON.stringify(diagnostics()) : ''));
+    await delay(10);
+  }
+}
 async function runFirst(f: Awaited<ReturnType<typeof fixture>>, mode: 'write' | 'read-only' = 'read-only') {
   const task = await f.tasks.run({ workingDirectory: f.source, prompt: 'initial request', mode, deliveryMode: 'messages',
     skills: [{ name: 'inbox-style', content: '---\nname: inbox-style\n---\nPublic fixture skill' }],
@@ -67,7 +73,15 @@ test('active inputs are scoped and idempotent, and two inputs resume sequentiall
     assert.equal(f.adapter.calls.length, 1); assert.equal(f.tasks.inbox(id).length, 2);
     assert.equal('inbox' in clientTask(f.tasks.status(id)), false);
     f.adapter.releaseFirst!();
-    await until(() => f.adapter.calls.length === 3 && f.adapter.active === 0 && f.tasks.inbox(id).every(row => row.receipt.state === 'sent' && Boolean(row.receipt.continuationTaskId) && f.tasks.status(row.receipt.continuationTaskId!).status === 'completed'));
+    await until(() => f.adapter.calls.length === 3 && f.adapter.active === 0 && f.tasks.inbox(id).every(row => row.receipt.state === 'sent' && Boolean(row.receipt.continuationTaskId) && f.tasks.status(row.receipt.continuationTaskId!).status === 'completed'), () => {
+      const inbox = f.tasks.inbox(id);
+      return { taskId: id, calls: f.adapter.calls.length, active: f.adapter.active, maxActive: f.adapter.maxActive,
+        receipts: [one, two].map(messageId => {
+          const receipt = inbox.find(row => row.receipt.messageId === messageId)?.receipt;
+          const taskId = receipt?.continuationTaskId;
+          return { messageId, state: receipt?.state ?? 'missing', continuation: taskId ? { taskId, status: f.tasks.status(taskId).status } : null };
+        }) };
+    });
     assert.deepEqual(f.adapter.calls.map(call => call.options.prompt), ['initial request', 'first reply', 'second reply']);
     assert.equal(f.adapter.maxActive, 1);
     assert.equal(new Set(f.adapter.calls.map(call => call.directory)).size, 1);

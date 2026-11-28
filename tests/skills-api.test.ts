@@ -134,13 +134,25 @@ test('tamper fails preview, context, resume and integration while discard remain
 test('read-only CLI cannot modify a supplied skill and existing project skills cannot be replaced', async () => {
   const f = await fixture();
   try {
+    const spawnTask = f.adapter.spawnTask.bind(f.adapter);
+    let spawns = 0;
+    f.adapter.spawnTask = (...args) => { spawns += 1; return spawnTask(...args); };
     const run = await f.tasks.run({ prompt: 'skills-tamper:test', workingDirectory: f.source, skills, mode: 'read-only' });
     const end = await finished(f.tasks, run.taskId);
     assert.equal(end.status, 'failed');
     assert.equal(end.error?.code, 'SKILL_VERIFICATION_FAILED');
     await assert.rejects(f.tasks.preview(run.taskId), { code: 'SKILL_VERIFICATION_FAILED' });
-    await writeFile(path.join(f.source, '.gitignore'), '.agents/\n');
-    const legacy = await f.tasks.run({ prompt: 'split:legacy', workingDirectory: f.source, mode: 'read-only' });
+    const tamperedPath = path.join(end.copyDirectory!, '.agents/skills/presentations/SKILL.md');
+    const tamperedBefore = await readFile(tamperedPath, 'utf8');
+    const spawnsBefore = spawns;
+    await assert.rejects(f.tasks.run({ prompt: 'split:blocked', workingDirectory: f.source, mode: 'read-only' }), { code: 'TASK_NOT_READY' });
+    assert.equal(spawns, spawnsBefore);
+    assert.equal(await readFile(tamperedPath, 'utf8'), tamperedBefore);
+    const cleanSource = path.join(path.dirname(f.source), 'clean-source');
+    execFileSync('git', ['init', '--quiet', cleanSource]);
+    await writeFile(path.join(cleanSource, 'source.txt'), 'source');
+    await writeFile(path.join(cleanSource, '.gitignore'), '.agents/\n');
+    const legacy = await f.tasks.run({ prompt: 'split:legacy', workingDirectory: cleanSource, mode: 'read-only' });
     const legacyEnd = await finished(f.tasks, legacy.taskId);
     assert.equal(legacyEnd.status, 'completed');
     assert.deepEqual(legacyEnd.providedSkills?.map(skill => skill.name), ['anti-ai-code', 'anti-ai-security']);

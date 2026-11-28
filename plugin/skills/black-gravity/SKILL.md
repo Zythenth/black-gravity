@@ -14,7 +14,7 @@ Open a reference only when the table below matches; search `references/` for oth
 Check `black_gravity_health`:
 - **Tool profile** (`black_gravity_health.toolProfile`): `query` and `review` are read-only (never request missing tools or bypass it); `full` and `implementation` allow the full flow. Change via `BRIDGE_TOOL_PROFILE` in server env and MCP restart.
 - **Approval mode**: MUST follow `health.approvalMode` (and `health.integrationApproval.mode`):
-  - **`auto` (default if unset)**: skips interactive MCP confirmation forms for `black_gravity_integrate` and validated `black_gravity_set_sandbox_policy` updates. **Never require extra manual caller authorization in `auto`**. `agy` delegates never choose, authorize or grant permissions.
+  - **`auto` (default)**: skips MCP confirmation forms for `black_gravity_integrate` and validated `black_gravity_set_sandbox_policy` updates; **never require extra manual caller authorization in `auto`**. `agy` delegates never choose or grant permissions.
   - **`ask` (strict opt-in)**: ALWAYS requires human MCP form confirmation.
   - **Limits**: no mode allows automatic host fallback or alters caller/`agy` permissions. Integrate only via MCP; approval NEVER replaces tests and code review. Never loosen SHA-256 hashes, criteria, review, current observed tests, source-lock, CAS or path protection.
 
@@ -25,16 +25,16 @@ Check `black_gravity_health`:
 - Switch executor or model only when the user asks: `provider` in `black_gravity_dispatch`, or `black_gravity_handoff` with `provider` to continue another executor's completed copy.
 - On `AGY_AUTH_REQUIRED`, `OPENCODE_AUTH_REQUIRED`, `OPENCODE_QUOTA_EXCEEDED` or `OPENCODE_REGION_UNAVAILABLE`, offer the user the other executor, either as a new `black_gravity_dispatch` or as `black_gravity_handoff` (with `provider`) from the latest completed task of that copy; never switch on your own.
 - Cancellation: call `black_gravity_cancel` with `taskId` and confirm status; it stops the local process and partial changes may remain.
-- Continue a conversation: call `black_gravity_resume` with the prior `taskId` (recover after restart via `black_gravity_tasks`), never a `sessionId` or provisional value.
+- Continue: call `black_gravity_resume` with prior `taskId` (recover via `black_gravity_tasks`), never `sessionId`. Failed/timed-out tasks with intact checkpoints and proven cleanup also resume by `taskId`; cancelled IDs stay refused.
 
 ## Delegation and tracking
 
-Before delegating, confirm the `black_gravity_*` tools are exposed in this session and pass prompt, contract and references as structured tool arguments; never create request files (`req*.json`, `prompt.txt`), wrappers or scripts to pass a request, never start tasks through the shell, a separately started bridge server or an ad hoc MCP client, and never run `agy` from the shell (running the bridge's `waitCommand` in step 3 stays allowed). If the tools are missing or a new build is not yet loaded, follow [MCP tools unavailable or a build not yet loaded](references/copy-and-execution.md#mcp-tools-unavailable-or-a-build-not-yet-loaded).
+Before delegating, confirm `black_gravity_*` tools are exposed and pass prompt, contract and references as structured arguments; never create request files (`req*.json`, `prompt.txt`), wrappers or scripts, never start tasks through the shell, a separately started bridge server or an ad hoc MCP client, and never run `agy` in the shell (step 3's `waitCommand` stays allowed). If tools are missing or a build is unloaded, see [MCP tools unavailable or a build not yet loaded](references/copy-and-execution.md#mcp-tools-unavailable-or-a-build-not-yet-loaded).
 
 1. Identify the absolute Git root; before writing the task, read the relevant instructions and files and note existing Git changes. Never include secrets or private documents in the prompt. Use `black_gravity_list_project_files` to see copyable files.
-2. Use `mode: "read-only"` for a query, review, diagnosis or second opinion (`agy --mode plan`, checks for edits at end, no integration) or `mode: "write"` (default) for implementation. Start a new task with `black_gravity_dispatch` and `provider` set to a schema-listed value (`agy` or `opencode`), passing the same fields as `black_gravity_run` (which remains equivalent), with a concrete instruction and verifiable criterion. Prefer `deliveryMode: "messages"` for ordinary delegations; define `acceptanceCriteria` before implementation covering every explicit requirement.
+2. Use `mode: "read-only"` for queries/reviews/diagnosis (`agy --mode plan`, no edits/integration) or `mode: "write"` (default) for implementation. Start a new task with `black_gravity_dispatch` and `provider` (`agy` or `opencode`, same fields as `black_gravity_run`), concrete instructions and verifiable criteria. Prefer `deliveryMode: "messages"`; define `acceptanceCriteria` covering every explicit requirement first.
    - The bridge requires `agy --sandbox` and works in a copy; use `includePaths` (no ignored files) when only specific files or folders are needed.
-   - With `includePaths`, the prompt MUST list those exact file paths, scope edits/queries strictly to them and tell the delegate to report missing dependencies as unverifiable and finish without widening scope or retrying refused disk searches. On `COPY_LIMIT_EXCEEDED`, narrow `includePaths`; on `CHANGE_LIMIT_EXCEEDED`, review task size with the user without bypassing the limit.
+   - With `includePaths`, list those exact paths in the prompt, scope strictly to them and instruct the delegate to report missing dependencies as unverifiable and finish without widening scope or retrying refused searches. On `COPY_LIMIT_EXCEEDED`, narrow `includePaths`; on `CHANGE_LIMIT_EXCEEDED`, review size with the user without bypassing it.
    - For `agy`, check `black_gravity_get_agent_policy` before delegating when available; if no terminal is needed, restrict `allowedTools` to file tools and `finish`, stating what the coordinator will build and test on the host. OpenCode uses fixed file tools: omit `allowedTools` and `mcpServers`.
 3. Keep `taskId` and `waitCommand` (`{ argv, sh, recommendedMode, reason }`) from `black_gravity_dispatch`, `black_gravity_run`, `black_gravity_resume`, `black_gravity_handoff`, `black_gravity_compare`, `black_gravity_group_start` or `black_gravity_wait_many`. Follow `waitCommand.recommendedMode` strictly:
    - `"background"` (ONLY Claude Code >= 2.1.310 is verified): run `waitCommand.argv` (or `waitCommand.sh` in POSIX shell) in background after delegating; do not call `black_gravity_wait`, `black_gravity_status`, `black_gravity_events` or group/multi-task variants while it runs. Pass Bash `timeout` (ms) and CLI `--timeout` (s) strictly below the host's background deadline (from tool schema/config; default 1800s if none) with a safety margin so it emits JSON before being killed.
@@ -57,7 +57,7 @@ Before delegating, confirm the `black_gravity_*` tools are exposed in this sessi
 - Read logs, patches and outputs by summary or page, never whole at once.
 - Run one test suite at a time; skip a suite that already passed on the same SHA.
 - Make no parallel bridge calls on the same copy.
-- Concurrency: one task at a time per project on any executor; `agy` runs one task at a time overall; OpenCode runs in parallel only across different projects, within `MAX_CONCURRENT_OPENCODE_TASKS`.
+- Concurrency: one task at a time per project on any executor (including group/peer turns); `agy` runs one task at a time overall; OpenCode runs in parallel only across different projects within `MAX_CONCURRENT_OPENCODE_TASKS`.
 - Never call `agy` directly from the shell.
 - When reporting progress, include your own token use if the host shows it.
 

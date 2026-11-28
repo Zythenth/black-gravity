@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -16,6 +16,8 @@ import type { TaskRecord } from '../src/types.js';
 import type { AcceptanceCriterion } from '../src/verification.js';
 import { readNativeReceipt, readNativeSandboxError } from '../src/native-tests.js';
 import { createProjectCopy, discardProjectCopy, integrateProjectCopy, listProjectFiles, previewProjectCopy } from '../src/isolation.js';
+import { canonicalWorkspacePaths } from '../src/workspace-paths.js';
+import { archiveDirectoryFor } from '../src/workspace-archive.js';
 
 const mockPath = fileURLToPath(new URL('../../tests/mock-agy.mjs', import.meta.url));
 const stateDirectories: string[] = [];
@@ -542,10 +544,10 @@ test('resume by taskId continues the conversation of that task in its own copy, 
     const first = await tasks.run({ prompt: 'write:test', workingDirectory: dir });
     const finished = await until(tasks, first.taskId, done);
     assert.equal(finished.status, 'completed');
-    // The mock reuses one conversation for every task, so a second copy proves that the taskId selects the copy.
-    const sibling = await until(tasks, (await tasks.run({ prompt: 'write:other', workingDirectory: dir })).taskId, done);
+    // The mock reuses one conversation for every task; both tasks share the canonical workspace path while retaining distinct archived checkpoints.
+    const sibling = await until(tasks, (await tasks.run({ prompt: 'write-many:other', workingDirectory: dir })).taskId, done);
     assert.equal(sibling.sessionId, finished.sessionId);
-    assert.notEqual(sibling.copyDirectory, finished.copyDirectory);
+    assert.equal(sibling.copyDirectory, finished.copyDirectory);
     const conversation = (taskId: string) => {
       const args = (tasks.readEvents(taskId).events.find(event => event.type === 'agent.started')!.data as { args: string[] }).args;
       return args[args.indexOf('--conversation') + 1];
@@ -579,16 +581,44 @@ test('resume by taskId continues the conversation of that task in its own copy, 
 test('resume refuses invalid selectors before any process, task or copy', async () => {
   const dir = await repository();
   const otherDir = await repository();
-  const { adapter, tasks } = setup();
+  const { adapter, tasks, config } = setup();
   const spawnTask = adapter.spawnTask.bind(adapter);
   let spawned = 0;
-  adapter.spawnTask = (...args) => { spawned += 1; return spawnTask(...args); };
-  // Test files run one at a time, so a copy that appears during a refused call came from that call.
+  let onNextSpawn: (() => void) | undefined;
+  const waitNextSpawn = () => new Promise<void>(resolve => { onNextSpawn = resolve; });
+  adapter.spawnTask = (...args) => {
+    spawned += 1;
+    const child = spawnTask(...args);
+    const notify = onNextSpawn;
+    onNextSpawn = undefined;
+    notify?.();
+    return child;
+  };
+  // Guard canonical workspace path and bytes, legacy temp copies, task count and spawn count across every refusal.
   const copies = async () => (await readdir(os.tmpdir())).filter(name => name.startsWith('black-gravity-copy-'));
+  const workspaceSnapshot = async (root: string) => {
+    const canonical = canonicalWorkspacePaths(config.stateDirectory, root);
+    if (!existsSync(canonical.copyDirectory)) return null;
+    const files: Array<[string, string]> = [];
+    const walk = async (current: string, prefix: string): Promise<void> => {
+      const entries = await readdir(current, { withFileTypes: true });
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
+        const full = path.join(current, entry.name);
+        if (entry.isDirectory()) await walk(full, rel);
+        else if (entry.isFile()) files.push([rel, (await readFile(full)).toString('base64')]);
+      }
+    };
+    await walk(canonical.copyDirectory, '');
+    return { path: canonical.copyDirectory, files };
+  };
   const refused = async (options: Parameters<TaskManager['resume']>[0], taskId: string | undefined, hidden: string[] = []) => {
     const tasksBefore = tasks.list().length;
     const spawnedBefore = spawned;
     const copiesBefore = new Set(await copies());
+    const dirBefore = await workspaceSnapshot(dir);
+    const otherBefore = await workspaceSnapshot(otherDir);
     await assert.rejects(tasks.resume(options, taskId), (error: Error & { code?: string }) => {
       assert.equal(error.code, 'INVALID_SESSION');
       assert.ok(error.message.includes('taskId') && error.message.includes('black_gravity_status'), error.message);
@@ -596,6 +626,8 @@ test('resume refuses invalid selectors before any process, task or copy', async 
       return true;
     });
     assert.deepEqual((await copies()).filter(name => !copiesBefore.has(name)), []);
+    assert.deepEqual(await workspaceSnapshot(dir), dirBefore);
+    assert.deepEqual(await workspaceSnapshot(otherDir), otherBefore);
     assert.equal(tasks.list().length, tasksBefore);
     assert.equal(spawned, spawnedBefore);
   };
@@ -615,7 +647,9 @@ test('resume refuses invalid selectors before any process, task or copy', async 
     await refused({ ...resume, sessionId: 'unknown-conversation' }, undefined, details(finished));
     await refused({ ...resume, sessionId: 'not valid!' }, undefined, details(finished));
 
+    const runningSpawned = waitNextSpawn();
     const running = await tasks.run({ prompt: 'cancel:test', workingDirectory: dir });
+    await runningSpawned;
     await refused(resume, running.taskId, [running.taskId]);
     await tasks.cancel(running.taskId);
     assert.equal((await until(tasks, running.taskId, done)).status, 'cancelled');
@@ -623,7 +657,13 @@ test('resume refuses invalid selectors before any process, task or copy', async 
 
     const failure = await until(tasks, (await tasks.run({ prompt: 'failure:test', workingDirectory: dir })).taskId, done);
     assert.equal(failure.status, 'failed');
-    await refused(resume, failure.taskId, [failure.taskId]);
+    const resumedFailure = await until(tasks, (await tasks.resume({ prompt: 'consult:resume-failed', workingDirectory: dir }, failure.taskId)).taskId, done);
+    assert.equal(resumedFailure.status, 'completed');
+    const corruptFailure = await until(tasks, (await tasks.run({ prompt: 'failure:corrupt', workingDirectory: dir })).taskId, done);
+    assert.equal(corruptFailure.status, 'failed');
+    await rm(archiveDirectoryFor(config.stateDirectory, corruptFailure.taskId), { recursive: true, force: true });
+    await refused(resume, corruptFailure.taskId, [corruptFailure.taskId]);
+    await tasks.discard(corruptFailure.taskId);
 
     const tested = await until(tasks, (await tasks.run({ prompt: 'write:test', workingDirectory: dir, acceptanceCriteria })).taskId, done);
     const testedPreview = await tasks.preview(tested.taskId);
@@ -634,12 +674,17 @@ test('resume refuses invalid selectors before any process, task or copy', async 
     assert.equal(repaired.status, 'completed');
     assert.equal(repaired.copyDirectory, tested.copyDirectory);
 
-    // A newer turn in the copy governs an older selector, exactly as it does for a sessionId.
+    // Active newer turn blocks resuming first.taskId; after verified cancellation, explicit cancelled ID stays refused while resuming first.taskId restores first.taskId's own bytes.
+    const continuationSpawned = waitNextSpawn();
     const continuation = await tasks.resume({ prompt: 'cancel:test', workingDirectory: dir }, first.taskId);
+    await continuationSpawned;
     await refused(resume, first.taskId, [first.taskId]);
     await tasks.cancel(continuation.taskId);
     await until(tasks, continuation.taskId, done);
-    await refused(resume, first.taskId, [first.taskId]);
+    await refused(resume, continuation.taskId, [continuation.taskId]);
+    const restoredAfterCancel = await until(tasks, (await tasks.resume({ prompt: 'consult:after-cancel', workingDirectory: dir }, first.taskId)).taskId, done);
+    assert.equal(restoredAfterCancel.status, 'completed');
+    assert.equal(await readFile(path.join(restoredAfterCancel.copyDirectory!, 'BLACK_GRAVITY_TEST.md'), 'utf8'), 'Antigravity MCP bridge test successful.');
 
     const discarded = await until(tasks, (await tasks.run({ prompt: 'write:other', workingDirectory: otherDir })).taskId, done);
     await tasks.discard(discarded.taskId);
@@ -742,13 +787,20 @@ test('cleanup discards every expired copy at startup and keeps copies still reta
     const expired = [];
     for (let index = 0; index < 3; index++) expired.push(await until(tasks, (await tasks.run({ prompt: 'test', workingDirectory: dir })).taskId, done));
     const lastExpired = Math.max(...expired.map(task => Date.parse(task.completedAt!)));
-    const retained = await until(tasks, (await tasks.run({ prompt: 'test', workingDirectory: dir })).taskId, done);
+    const retained = await until(tasks, (await tasks.run({ prompt: 'write:retained', workingDirectory: dir })).taskId, done);
     assert.ok(Date.parse(retained.completedAt!) > lastExpired);
+    assert.equal(retained.copyDirectory, expired[0]!.copyDirectory);
     const restarted = new TaskManager(adapter, config); managers.push(restarted);
     assert.deepEqual((await restarted.cleanup(lastExpired + 168 * 3600000)).discardedTaskIds.sort(), expired.map(task => task.taskId).sort());
-    for (const task of expired) await assert.rejects(readFile(path.join(task.copyDirectory!, 'source.txt')), { code: 'ENOENT' });
+    for (const task of expired) {
+      assert.ok(restarted.status(task.taskId).discardedAt);
+      assert.equal(existsSync(archiveDirectoryFor(config.stateDirectory, task.taskId)), false);
+      await assert.rejects(restarted.preview(task.taskId), { code: 'TASK_NOT_READY' });
+    }
     assert.equal(await readFile(path.join(retained.copyDirectory!, 'source.txt'), 'utf8'), 'source');
+    assert.equal(await readFile(path.join(retained.copyDirectory!, 'BLACK_GRAVITY_TEST.md'), 'utf8'), 'Antigravity MCP bridge test successful.');
     assert.equal(restarted.status(retained.taskId).discardedAt, undefined);
+    assert.equal((await restarted.preview(retained.taskId)).summary.added, 1);
   } finally { await tasks.shutdown(); await rm(dir, { recursive: true, force: true }); }
 });
 
